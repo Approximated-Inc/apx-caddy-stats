@@ -2,6 +2,7 @@ package apxstats
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -74,14 +75,15 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur)
+	h.record(r, wrapped, dur, servErr)
 	return servErr
 }
 
 // record reads context off the request after next.ServeHTTP returns.
-// vhost_id, country, ASN, and the reverse-proxy outcome placeholders are
-// all set by handlers earlier in the chain.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration) {
+// vhost_id, country, and ASN come from placeholders set by handlers
+// earlier in the chain. Origin uses servErr (the bubbled handler error)
+// to detect reverse_proxy failures — see classifyOrigin.
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
 	vhostID, ok := readVhostID(r)
 	if !ok {
 		// No vhost_id set — request didn't match a vhost route. Skip;
@@ -92,7 +94,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration) {
 
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	origin := classifyOrigin(repl, w.status)
+	origin := classifyOrigin(repl, servErr)
 	country := readCountry(repl)
 	asn := readASN(repl)
 	durationUs := uint64(dur.Microseconds())
@@ -101,7 +103,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration) {
 		TsUnixMin: uint32(time.Now().UTC().Unix() / 60),
 		VhostID:   vhostID,
 		Method:    methodOrUnknown(r.Method),
-		Status:    uint16(w.status),
+		Status:    finalStatus(w, servErr),
 		Origin:    origin,
 		Country:   country,
 		ASN:       asn,
@@ -138,39 +140,66 @@ func readVhostID(r *http.Request) (uint32, bool) {
 
 // classifyOrigin maps a finished request to one of three origin classes.
 //
-//   - upstream: reverse_proxy attempted AND its upstream status equals
-//     the final response status. Caddy passed the upstream response
-//     through without rewriting it.
-//   - cluster_proxy_error: reverse_proxy attempted but the final status
-//     differs from the upstream status. Caddy synthesized the response
-//     (timeout, connection refused, header rewrite, etc.).
+//   - upstream: reverse_proxy attempted and the upstream returned. Caddy
+//     passed the response through to the client.
+//   - cluster_proxy_error: reverse_proxy attempted but failed (dial
+//     refused, timeout, no upstream selected, etc.). Caddy synthesized
+//     the response (typically 502 / 504 / 503 / 499).
 //   - cluster: reverse_proxy was never reached. Caddy generated the
-//     response itself (404 from no matching route, redirect, error
-//     page, etc.).
+//     response itself (404 from no matching route, redirect, WAF block,
+//     rate limit, error page, etc.).
 //
-// `{http.reverse_proxy.upstream.address}` and
-// `{http.reverse_proxy.status_code}` are set by the stdlib reverse_proxy
-// handler when it runs. The address placeholder is set to a string and
-// the status_code placeholder is set to an int — we route both through
-// Replacer.GetString so the comparison is uniform.
-func classifyOrigin(repl *caddy.Replacer, finalStatus int) string {
-	if repl == nil {
+// Signal sources:
+//
+//   - `{http.reverse_proxy.upstream.address}` — set by reverse_proxy
+//     during upstream *selection*, before the dial attempt. Set even
+//     on dial failure. Absent ⇒ reverse_proxy never ran.
+//   - servErr — the error returned by next.ServeHTTP. When reverse_proxy
+//     fails, it returns a caddyhttp.HandlerError (502 by default, 504
+//     for timeouts, 499 for client cancel) which bubbles up the
+//     middleware chain to us. A `nil` error past the upstream-selection
+//     point means upstream actually responded.
+//
+// We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
+// it inside `handle_response` blocks, never for normal pass-through.
+func classifyOrigin(repl *caddy.Replacer, servErr error) string {
+	upstream := ""
+	if repl != nil {
+		upstream, _ = repl.GetString("http.reverse_proxy.upstream.address")
+	}
+	if upstream == "" {
 		return OriginCluster
 	}
-	upstream, ok := repl.GetString("http.reverse_proxy.upstream.address")
-	if !ok || upstream == "" {
-		return OriginCluster
-	}
-	upstreamStatus, ok := repl.GetString("http.reverse_proxy.status_code")
-	if !ok || upstreamStatus == "" {
-		// Reverse proxy was attempted but no status came back: connection
-		// error, dial timeout, etc. Caddy is what the client saw.
+	if servErr != nil && isHandlerError(servErr) {
 		return OriginClusterProxyError
 	}
-	if upstreamStatus == strconv.Itoa(finalStatus) {
-		return OriginUpstream
+	return OriginUpstream
+}
+
+// isHandlerError reports whether err (or anything it wraps) is a
+// caddyhttp.HandlerError. reverse_proxy returns one of these on dial
+// failure / timeout / client cancel, and the error bubbles up through
+// every middleware on the chain.
+func isHandlerError(err error) bool {
+	var he caddyhttp.HandlerError
+	return errors.As(err, &he)
+}
+
+// finalStatus returns the status code that will reach the client.
+// When a downstream handler wrote the response, our recorder captured
+// it. When a handler returned a HandlerError without writing (the
+// normal reverse_proxy dial-failure path), Caddy's server-level error
+// handler will write a status equal to the error's StatusCode AFTER our
+// outer handler has returned — so we read it from the error here.
+func finalStatus(w *recorder, servErr error) uint16 {
+	if w.wrote {
+		return uint16(w.status)
 	}
-	return OriginClusterProxyError
+	var he caddyhttp.HandlerError
+	if errors.As(servErr, &he) && he.StatusCode != 0 {
+		return uint16(he.StatusCode)
+	}
+	return uint16(w.status)
 }
 
 // readCountry returns the ISO 3166 alpha-2 country code from the

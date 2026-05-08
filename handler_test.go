@@ -2,6 +2,7 @@ package apxstats
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -58,17 +59,17 @@ func newRequestWithReplacer(method, target string, vhostID string, replEntries m
 	return r.WithContext(ctx)
 }
 
-// upstreamWithStatus simulates a reverse_proxy outcome by setting the
-// two placeholders the classifier reads.
-func upstreamWithStatus(addr string, status int) map[string]any {
-	m := map[string]any{}
-	if addr != "" {
-		m["http.reverse_proxy.upstream.address"] = addr
+// upstreamSelected simulates reverse_proxy selecting an upstream by
+// setting the address placeholder. Caddy sets this BEFORE the dial,
+// regardless of whether the dial then succeeds — so presence of the
+// placeholder alone means "reverse_proxy ran." Whether it succeeded is
+// determined by the error returned from next.ServeHTTP, not from
+// status_code (which Caddy doesn't set for normal pass-through).
+func upstreamSelected(addr string) map[string]any {
+	if addr == "" {
+		return nil
 	}
-	if status > 0 {
-		m["http.reverse_proxy.status_code"] = status
-	}
-	return m
+	return map[string]any{"http.reverse_proxy.upstream.address": addr}
 }
 
 func nextHandler(status int) caddyhttp.HandlerFunc {
@@ -79,11 +80,15 @@ func nextHandler(status int) caddyhttp.HandlerFunc {
 	}
 }
 
-func TestServeHTTP_ClassifiesUpstreamWhenStatusMatches(t *testing.T) {
+func TestServeHTTP_ClassifiesUpstreamWhenProxySucceeds(t *testing.T) {
 	app := &fakeApp{psID: 42}
 	h := &StatsHandler{app: app}
 
-	r := newRequestWithReplacer("GET", "/foo", "100", upstreamWithStatus("10.0.0.1:8080", 200))
+	// reverse_proxy ran (upstream.address set), no error bubbled up — the
+	// upstream responded and Caddy passed through. Caddy never sets
+	// {http.reverse_proxy.status_code} for pass-through, so we can't and
+	// don't try to compare upstream status to final status.
+	r := newRequestWithReplacer("GET", "/foo", "100", upstreamSelected("10.0.0.1:8080"))
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
 
@@ -95,10 +100,26 @@ func TestServeHTTP_ClassifiesUpstreamWhenStatusMatches(t *testing.T) {
 	require.Equal(t, uint16(200), recs[0].k.Status)
 }
 
+func TestServeHTTP_ClassifiesUpstreamWhenUpstreamReturns4xx(t *testing.T) {
+	// Customer's upstream returns 404 (or any 4xx/5xx). Caddy passes it
+	// through with no error. Origin must still be upstream — that's a
+	// real upstream response, not Caddy synthesizing.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(404)))
+
+	require.Equal(t, OriginUpstream, app.snapshot()[0].k.Origin)
+}
+
 func TestServeHTTP_ClassifiesClusterWhenNoUpstream(t *testing.T) {
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
+	// No upstream.address placeholder — reverse_proxy never ran. Could be
+	// a 404 from no-route-match, a redirect, a static_response, etc.
 	r := newRequestWithReplacer("GET", "/", "100", nil)
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(404)))
@@ -109,33 +130,55 @@ func TestServeHTTP_ClassifiesClusterWhenNoUpstream(t *testing.T) {
 	require.Equal(t, uint16(404), recs[0].k.Status)
 }
 
-func TestServeHTTP_ClassifiesClusterProxyErrorWhenStatusDiffers(t *testing.T) {
+func TestServeHTTP_ClassifiesClusterProxyErrorWhenReverseProxyFails(t *testing.T) {
+	// reverse_proxy failed its dial / timed out. It returned a
+	// HandlerError that bubbled up through subroute → us.
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
-	// Upstream returned 502 but Caddy synthesized a 503 (or vice versa).
-	r := newRequestWithReplacer("GET", "/", "100", upstreamWithStatus("10.0.0.1:8080", 502))
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
 	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(503)))
+	failingNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
+	})
+	err := h.ServeHTTP(w, r, failingNext)
+	require.Error(t, err)
 
-	recs := app.snapshot()
-	require.Equal(t, OriginClusterProxyError, recs[0].k.Origin)
+	require.Equal(t, OriginClusterProxyError, app.snapshot()[0].k.Origin)
 }
 
-func TestServeHTTP_ClassifiesClusterProxyErrorWhenUpstreamDialFailed(t *testing.T) {
+func TestServeHTTP_RecordsHandlerErrorStatusWhenResponseUnwritten(t *testing.T) {
+	// reverse_proxy returned HandlerError{502} without writing the
+	// response — Caddy will synthesize the 502 at the outer error
+	// handler. Our recorded status must reflect what the client sees,
+	// not the recorder's default of 200.
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
-	// Upstream address is set (proxy was attempted) but no status came
-	// back — classic dial-failed / connection-refused outcome.
-	r := newRequestWithReplacer("GET", "/", "100", map[string]any{
-		"http.reverse_proxy.upstream.address": "10.0.0.1:8080",
-	})
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
 	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(502)))
+	failingNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
+	})
+	_ = h.ServeHTTP(w, r, failingNext)
 
-	recs := app.snapshot()
-	require.Equal(t, OriginClusterProxyError, recs[0].k.Origin)
+	rec := app.snapshot()[0]
+	require.Equal(t, uint16(502), rec.k.Status, "must record the synthesized 502, not default 200")
+}
+
+func TestServeHTTP_ClassifiesClusterProxyErrorOnTimeoutGateway(t *testing.T) {
+	// 504 Gateway Timeout — the other common reverse_proxy failure mode.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	timeoutNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusGatewayTimeout, errors.New("upstream timeout"))
+	})
+	_ = h.ServeHTTP(w, r, timeoutNext)
+
+	require.Equal(t, OriginClusterProxyError, app.snapshot()[0].k.Origin)
 }
 
 func TestServeHTTP_ReadsCountryAndASN(t *testing.T) {
