@@ -174,13 +174,31 @@ func (a *StatsApp) Stop() error {
 func (a *StatsApp) ProxyServerID() uint32 { return a.ProxyServerIDValue }
 
 // Record adds delta to the counter at k, inserting a new entry if absent.
-// Hot path: existing key takes RLock + atomic adds, no allocation.
+//
+// The whole call is taken under a.mu. An earlier version released the
+// mutex before doing per-field atomic.Add on the *Counter, but that
+// raced with flushOnce: between the unlock and the atomic.Add a
+// concurrent flushOnce could swap the map and the encode loop could
+// read the field, so the late add landed on a *Counter that was no
+// longer reachable through the live map and had already been encoded
+// without it — the increment was lost. Plain field reads in the
+// encoder against atomic writes here was also a Go data race per the
+// memory model, which `go test -race` would catch.
+//
+// Holding the mutex through the increments closes both: any Record that
+// gets the lock before flushOnce completes its mutations before
+// flushOnce can swap; any Record that gets the lock after flushOnce
+// looks up from the new map. The "lock-free atomic add" was a premature
+// optimization — at any traffic this module sees per machine, an
+// uncontended mutex is sub-microsecond and dwarfed by the http-handler
+// chain around it.
 func (a *StatsApp) Record(k Key, delta CounterDelta) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	c, ok := a.counters[k]
 	if !ok {
 		if len(a.counters) >= a.cfg.maxBuffer {
-			a.mu.Unlock()
 			atomic.AddUint64(&a.overflow, 1)
 			metricBufferOverflow.Inc()
 			return
@@ -188,14 +206,13 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 		c = &Counter{}
 		a.counters[k] = c
 	}
-	a.mu.Unlock()
 
-	atomic.AddUint64(&c.RequestCount, 1)
-	atomic.AddUint64(&c.BytesIn, delta.BytesIn)
-	atomic.AddUint64(&c.BytesOut, delta.BytesOut)
-	atomic.AddUint64(&c.DurationUsSum, delta.DurationUs)
+	c.RequestCount++
+	c.BytesIn += delta.BytesIn
+	c.BytesOut += delta.BytesOut
+	c.DurationUsSum += delta.DurationUs
 	if i := delta.LatBucket; i >= 0 && i < HistogramBuckets {
-		atomic.AddUint64(&c.LatBuckets[i], 1)
+		c.LatBuckets[i]++
 	}
 }
 

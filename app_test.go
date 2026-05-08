@@ -91,6 +91,69 @@ func captureServer(t *testing.T, status int) (*httptest.Server, func() []capture
 	}
 }
 
+// TestRecord_ConcurrentWithFlush is the regression pin for the
+// pre-fix race where Record released the mutex before doing per-field
+// atomic.Add and flushOnce released the mutex before encoding. Counter
+// updates that landed between flush's swap and flush's encode were
+// silently dropped.
+//
+// We launch N goroutines hammering Record on the same key while a flush
+// loop snapshots in a tight loop. The total request_count seen across
+// all flushes plus what's left in the live map must exactly equal N.
+// `go test -race` would also flag the bug independently.
+func TestRecord_ConcurrentWithFlush(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.MaxBufferRows = 100
+	})
+
+	const total = 50_000
+	k := Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginUpstream}
+
+	stop := make(chan struct{})
+	flushDone := make(chan struct{})
+
+	go func() {
+		defer close(flushDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				a.flushOnce()
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		go func() {
+			defer wg.Done()
+			a.Record(k, CounterDelta{LatBucket: 0})
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-flushDone
+
+	// Drain whatever's left in the live map.
+	a.flushOnce()
+
+	var seen uint64
+	for _, post := range captured() {
+		for _, row := range post.rows {
+			if row["vhost_id"] == float64(1) {
+				seen += uint64(row["request_count"].(float64))
+			}
+		}
+	}
+
+	require.Equal(t, uint64(total), seen,
+		"request_count across all flushes must equal total Records issued (no drops between swap+encode)")
+}
+
 func TestRecord_DedupesIdenticalKeys(t *testing.T) {
 	srv, _ := captureServer(t, 204)
 	defer srv.Close()

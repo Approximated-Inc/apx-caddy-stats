@@ -57,14 +57,22 @@ func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return
 // ServeHTTP records one row's worth of stats per request. Hot path is
 // designed to avoid allocations beyond the wrapper struct.
 //
-// Approximated's own URL monitor probes carry an `apx-monitor` request
-// header. We don't record those — they're our health-check traffic and
-// would inflate every customer's request_count + skew the status mix
-// (a healthy vhost monitor is mostly 200s; an unhealthy one is mostly
-// 5xxs from us, not the customer's real users). Skip before any
-// wrapping work.
+// Approximated's own URL monitor probes carry an `apx-monitor: true`
+// request header. We don't record those — they're our health-check
+// traffic and would inflate every customer's request_count + skew the
+// status mix (a healthy vhost monitor is mostly 200s; an unhealthy one
+// is mostly 5xxs from us, not the customer's real users). Skip before
+// any wrapping work.
+//
+// Match against the exact "true" sentinel — same convention every
+// other apx-monitor check in the Phoenix app uses. An earlier version
+// matched any non-empty value as "defensive against the URL monitor
+// changing the sentinel," but that opened a counter-bypass for any
+// external client to mask their traffic from a customer's analytics
+// dashboard with a one-line header injection. The exact match closes
+// it.
 func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if r.Header.Get("apx-monitor") != "" {
+	if r.Header.Get("apx-monitor") == "true" {
 		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
 		return next.ServeHTTP(w, r)
 	}

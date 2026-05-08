@@ -337,19 +337,28 @@ func TestServeHTTP_SkipsApxMonitorRequests(t *testing.T) {
 	require.Len(t, app.snapshot(), 1, "non-monitor request should record")
 }
 
-func TestServeHTTP_SkipsApxMonitorAnyValue(t *testing.T) {
-	// Defensive: the URL monitor sets "true" today but we treat the
-	// presence of the header as the signal — any non-empty value skips.
+func TestServeHTTP_SkipsOnlyExactlyTrueApxMonitor(t *testing.T) {
+	// Match against the exact "true" sentinel — any other value MUST
+	// record. Otherwise an external client can hide their traffic from
+	// the customer's analytics by setting `apx-monitor: anything`.
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
-	for _, v := range []string{"true", "1", "yes", "monitor"} {
+	// "true" skips.
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	r.Header.Set("apx-monitor", "true")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+	require.Empty(t, app.snapshot(), "apx-monitor: true must skip recording")
+
+	// Other values DO record.
+	for _, v := range []string{"1", "yes", "monitor", "TRUE", "true ", " true"} {
 		r := newRequestWithReplacer("GET", "/", "100", nil)
 		r.Header.Set("apx-monitor", v)
 		w := httptest.NewRecorder()
 		require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
 	}
-	require.Empty(t, app.snapshot())
+	require.Len(t, app.snapshot(), 6, "non-exact apx-monitor values must record (no bypass)")
 }
 
 func TestServeHTTP_KeyIsMinuteAligned(t *testing.T) {
