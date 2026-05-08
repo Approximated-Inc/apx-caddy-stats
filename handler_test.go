@@ -221,7 +221,10 @@ func TestServeHTTP_DropsRowWhenVhostIDAbsent(t *testing.T) {
 	require.Empty(t, app.snapshot())
 }
 
-func TestServeHTTP_RecordsBytesOut(t *testing.T) {
+func TestServeHTTP_BytesOutIncludesBodyAndHeaders(t *testing.T) {
+	// "Bandwidth out" is request-line + headers + body, not just body.
+	// Most response variability is in the body; headers add a small
+	// constant per response.
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
@@ -233,10 +236,32 @@ func TestServeHTTP_RecordsBytesOut(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, h.ServeHTTP(w, r, next))
-	require.Equal(t, uint64(12345), app.snapshot()[0].d.BytesOut)
+	bytesOut := app.snapshot()[0].d.BytesOut
+	require.Greater(t, bytesOut, uint64(12345), "must include status line + headers, not just body")
+	// Loose upper bound — status line + a handful of headers shouldn't
+	// add more than a few hundred bytes on top of the body.
+	require.Less(t, bytesOut, uint64(12345+1024))
 }
 
-func TestServeHTTP_RecordsBytesInFromContentLength(t *testing.T) {
+func TestServeHTTP_BytesInIncludesHeadersEvenForGet(t *testing.T) {
+	// Bandwidth-in for a GET (no body) used to record 0. It should now
+	// reflect the request line + headers — the only inbound bytes a GET
+	// produces.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/some/path", "100", nil)
+	r.Header.Set("User-Agent", "Mozilla/5.0 (something)")
+	r.Header.Set("Accept", "text/html,application/xhtml+xml")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	bytesIn := app.snapshot()[0].d.BytesIn
+	require.Greater(t, bytesIn, uint64(0), "GET with no body must still record header bytes")
+}
+
+func TestServeHTTP_BytesInIncludesContentLengthForPost(t *testing.T) {
+	// POST body via Content-Length is added on top of headers.
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
 
@@ -244,7 +269,28 @@ func TestServeHTTP_RecordsBytesInFromContentLength(t *testing.T) {
 	r.ContentLength = 4096
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
-	require.Equal(t, uint64(4096), app.snapshot()[0].d.BytesIn)
+
+	bytesIn := app.snapshot()[0].d.BytesIn
+	require.GreaterOrEqual(t, bytesIn, uint64(4096), "must include body bytes")
+	// The headers contribute their own bytes too, so > 4096.
+	require.Greater(t, bytesIn, uint64(4096))
+}
+
+func TestServeHTTP_BytesOutZeroWhenResponseUnwritten(t *testing.T) {
+	// Reverse-proxy failure path: HandlerError bubbles up, Caddy
+	// synthesizes the response AFTER our outer handler returns. Our
+	// recorder never sees those bytes, so we record 0 for bytes_out.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	failingNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
+	})
+	_ = h.ServeHTTP(w, r, failingNext)
+
+	require.Equal(t, uint64(0), app.snapshot()[0].d.BytesOut)
 }
 
 func TestServeHTTP_BucketsLatency(t *testing.T) {

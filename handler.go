@@ -110,7 +110,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	}
 	d := CounterDelta{
 		BytesIn:    requestBytes(r),
-		BytesOut:   uint64(w.bytes),
+		BytesOut:   responseBytes(w),
 		DurationUs: durationUs,
 		LatBucket:  BucketForUs(durationUs),
 	}
@@ -260,15 +260,52 @@ func methodOrUnknown(m string) string {
 	return "OTHER"
 }
 
-// requestBytes estimates the request body size. We use Content-Length
-// when set; chunked / unknown-length bodies report 0. Counting actual
-// bytes off r.Body would require buffering the request stream, which
-// adds cost and complexity disproportionate to the value of the metric.
+// requestBytes approximates the inbound request size: request line +
+// headers + body. Body uses Content-Length when set (chunked or
+// unknown-length bodies contribute 0 from the body — counting actual
+// bytes off r.Body would require buffering the stream). Header sizes
+// are sums of `Name: Value\r\n` per entry. TLS framing and HTTP/2
+// HPACK compression aren't accounted for; this is a logical-message
+// size, useful for "how much data was the cluster shown" — not a wire
+// counter.
 func requestBytes(r *http.Request) uint64 {
-	if r.ContentLength > 0 {
-		return uint64(r.ContentLength)
+	// Request line: METHOD SP URI SP PROTO CRLF
+	n := uint64(len(r.Method)) + 1 + uint64(len(r.RequestURI)) + 1 + uint64(len(r.Proto)) + 2
+	for name, vals := range r.Header {
+		for _, v := range vals {
+			n += uint64(len(name)) + 2 + uint64(len(v)) + 2 // "Name: Value\r\n"
+		}
 	}
-	return 0
+	n += 2 // blank line terminating headers
+	if r.ContentLength > 0 {
+		n += uint64(r.ContentLength)
+	}
+	return n
+}
+
+// responseBytes approximates the outbound response size: status line +
+// headers + body. Body comes from the recorder's per-Write byte count,
+// which is exact. Headers are approximated the same way as the request
+// side. If the response was never written (HandlerError path; Caddy's
+// outer handler will write a synthesized status later), this returns
+// 0 — the synthesized response is small (~200 bytes) and outside our
+// observation point.
+func responseBytes(w *recorder) uint64 {
+	if !w.wrote {
+		return 0
+	}
+	// Status line: HTTP/1.1 NNN STATUS_TEXT CRLF — Proto isn't on the
+	// recorder so use a fixed-length approximation. The few-byte error
+	// is fine at the cluster-aggregate scale we care about.
+	n := uint64(len("HTTP/1.1 ")) + 3 + 1 + uint64(len(http.StatusText(w.status))) + 2
+	for name, vals := range w.Header() {
+		for _, v := range vals {
+			n += uint64(len(name)) + 2 + uint64(len(v)) + 2
+		}
+	}
+	n += 2 // blank line terminating headers
+	n += uint64(w.bytes)
+	return n
 }
 
 // recorder captures status + bytes-out while still streaming to w. Same
