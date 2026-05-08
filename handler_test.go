@@ -230,6 +230,39 @@ func TestServeHTTP_ClampsExoticMethodToOTHER(t *testing.T) {
 	require.Equal(t, "OTHER", app.snapshot()[0].k.Method)
 }
 
+func TestServeHTTP_SkipsApxMonitorRequests(t *testing.T) {
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	// URL monitor probe — carries apx-monitor: true. Must not record.
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	r.Header.Set("apx-monitor", "true")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+	require.Empty(t, app.snapshot(), "monitor requests must not be recorded")
+
+	// Normal request still records.
+	r2 := newRequestWithReplacer("GET", "/", "100", nil)
+	w2 := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w2, r2, nextHandler(200)))
+	require.Len(t, app.snapshot(), 1, "non-monitor request should record")
+}
+
+func TestServeHTTP_SkipsApxMonitorAnyValue(t *testing.T) {
+	// Defensive: the URL monitor sets "true" today but we treat the
+	// presence of the header as the signal — any non-empty value skips.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	for _, v := range []string{"true", "1", "yes", "monitor"} {
+		r := newRequestWithReplacer("GET", "/", "100", nil)
+		r.Header.Set("apx-monitor", v)
+		w := httptest.NewRecorder()
+		require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+	}
+	require.Empty(t, app.snapshot())
+}
+
 func TestServeHTTP_KeyIsMinuteAligned(t *testing.T) {
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}

@@ -55,7 +55,19 @@ func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return
 
 // ServeHTTP records one row's worth of stats per request. Hot path is
 // designed to avoid allocations beyond the wrapper struct.
+//
+// Approximated's own URL monitor probes carry an `apx-monitor` request
+// header. We don't record those — they're our health-check traffic and
+// would inflate every customer's request_count + skew the status mix
+// (a healthy vhost monitor is mostly 200s; an unhealthy one is mostly
+// 5xxs from us, not the customer's real users). Skip before any
+// wrapping work.
 func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.Header.Get("apx-monitor") != "" {
+		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
+		return next.ServeHTTP(w, r)
+	}
+
 	start := time.Now()
 
 	wrapped := &recorder{ResponseWriter: w, status: 200}
