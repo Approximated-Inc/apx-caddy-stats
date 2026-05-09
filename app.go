@@ -88,8 +88,9 @@ type StatsApp struct {
 	mu       sync.Mutex
 	counters map[Key]*Counter
 
-	overflow uint64 // count of distinct new keys dropped due to MaxBufferRows
-	dropped  uint64 // count of rows dropped after retry exhaustion
+	overflow         uint64    // count of distinct new keys dropped due to MaxBufferRows
+	overflowLoggedAt time.Time // first-overflow log throttle (zero = never logged)
+	dropped          uint64    // count of rows dropped after retry exhaustion
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -201,6 +202,7 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 		if len(a.counters) >= a.cfg.maxBuffer {
 			atomic.AddUint64(&a.overflow, 1)
 			metricBufferOverflow.Inc()
+			a.maybeLogOverflow()
 			return
 		}
 		c = &Counter{}
@@ -213,6 +215,26 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 	c.DurationUsSum += delta.DurationUs
 	if i := delta.LatBucket; i >= 0 && i < HistogramBuckets {
 		c.LatBuckets[i]++
+	}
+}
+
+// maybeLogOverflow emits a single zap.Warn the first time the buffer
+// hits its cap, and at most once per minute thereafter. Without this,
+// overflow showed up only as a Prometheus counter — useful for graphs
+// but invisible during incident response when an operator is reading
+// logs. Called under a.mu (Record holds it through this path).
+func (a *StatsApp) maybeLogOverflow() {
+	now := time.Now()
+	if !a.overflowLoggedAt.IsZero() && now.Sub(a.overflowLoggedAt) < time.Minute {
+		return
+	}
+	a.overflowLoggedAt = now
+
+	if a.logger != nil {
+		a.logger.Warn("apx_stats: buffer overflow — dropping new counter keys",
+			zap.Int("max_buffer_rows", a.cfg.maxBuffer),
+			zap.Uint64("overflow_total", a.overflow),
+		)
 	}
 }
 
