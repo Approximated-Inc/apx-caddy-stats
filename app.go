@@ -27,6 +27,12 @@ type AppRef interface {
 	// Record adds the given counter delta to the entry identified by k.
 	// Lock-free on the hot path once k is in the map.
 	Record(k Key, delta CounterDelta)
+	// RecordUnique adds a hashed client identifier to the per-(vhost,minute)
+	// set used by the unique-clients metric. No-op if HashSalt is empty.
+	RecordUnique(tsUnixMin, vhostID uint32, hash uint64)
+	// HashSalt returns the deployment salt for hashing client identifiers.
+	// Empty string disables the unique-clients tracking entirely.
+	HashSalt() string
 	// ProxyServerID returns the cluster id this Caddy instance serves.
 	ProxyServerID() uint32
 }
@@ -76,17 +82,25 @@ type StatsApp struct {
 	// kept here for log/metric labels.
 	MachineID string `json:"machine_id,omitempty"`
 
+	// HashSaltEnvVar names the env var to source the per-deployment salt
+	// from for client-identifier hashing. Default: APX_HASH_SALT.
+	// If unset and the env var is empty, the unique-clients tracking
+	// silently disables (no hashes computed, no rows emitted).
+	HashSaltEnvVar string `json:"hash_salt_env_var,omitempty"`
+
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
 
-	logger *zap.Logger
-	secret string
-	client *http.Client
+	logger   *zap.Logger
+	secret   string
+	hashSalt string
+	client   *http.Client
 
 	cfg ingestRuntime // resolved from Ingest with defaults applied
 
 	mu       sync.Mutex
 	counters map[Key]*Counter
+	uniques  map[uniqueKey]map[uint64]struct{}
 
 	overflow         uint64    // count of distinct new keys dropped due to MaxBufferRows
 	overflowLoggedAt time.Time // first-overflow log throttle (zero = never logged)
@@ -136,6 +150,16 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats app: %s env var is empty", envVar)
 	}
 
+	saltEnvVar := a.HashSaltEnvVar
+	if saltEnvVar == "" {
+		saltEnvVar = "APX_HASH_SALT"
+	}
+	// Hash salt is OPTIONAL — if unset, unique-client tracking silently
+	// disables. This lets the module be deployed before the operator has
+	// provisioned the salt, without crashing Caddy. Once the salt is set
+	// and Caddy is restarted/reconfigured, hashing turns on.
+	a.hashSalt = os.Getenv(saltEnvVar)
+
 	a.cfg = ingestRuntime{
 		url:           a.Ingest.URL,
 		authHeader:    firstNonEmpty(a.Ingest.AuthHeader, "apx-key"),
@@ -153,6 +177,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		},
 	}
 	a.counters = make(map[Key]*Counter, a.cfg.maxBuffer/8)
+	a.uniques = make(map[uniqueKey]map[uint64]struct{})
 	a.stopCh = make(chan struct{})
 	return nil
 }
@@ -173,6 +198,38 @@ func (a *StatsApp) Stop() error {
 
 // ProxyServerID exposes the cluster id to handlers.
 func (a *StatsApp) ProxyServerID() uint32 { return a.ProxyServerIDValue }
+
+// HashSalt exposes the deployment salt for hashing client identifiers.
+// Empty string disables unique-clients tracking — handlers should skip
+// computing the hash when this returns "".
+func (a *StatsApp) HashSalt() string { return a.hashSalt }
+
+// RecordUnique adds a hashed client identifier to the per-(vhost,minute)
+// set. Called once per request from the handler. No-op when the salt is
+// unset (HashSalt() == "") so an unconfigured deployment doesn't waste
+// memory accumulating sets it can't ship.
+//
+// Held under a.mu alongside Record's counter updates — same lock so
+// flushOnce gets a coherent snapshot of both maps. Map allocation for
+// new (vhost, minute) keys is amortized by `len(uniques)` staying small
+// (~one entry per active vhost per minute).
+func (a *StatsApp) RecordUnique(tsUnixMin, vhostID uint32, hash uint64) {
+	if a.hashSalt == "" {
+		return
+	}
+
+	k := uniqueKey{TsUnixMin: tsUnixMin, VhostID: vhostID}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	set, ok := a.uniques[k]
+	if !ok {
+		set = make(map[uint64]struct{}, 16)
+		a.uniques[k] = set
+	}
+	set[hash] = struct{}{}
+}
 
 // Record adds delta to the counter at k, inserting a new entry if absent.
 //
@@ -256,24 +313,30 @@ func (a *StatsApp) flushLoop() {
 	}
 }
 
-// flushOnce swaps the live counter map for a fresh one, encodes the
-// snapshot as gzipped NDJSON, and POSTs it.
+// flushOnce swaps the live counter and uniques maps for fresh ones,
+// encodes both snapshots into a single gzipped NDJSON body, and POSTs
+// it. Counter and uniques rows ride the same wire — the app-side
+// ingest controller distinguishes by row shape (presence of
+// `client_hashes`).
 func (a *StatsApp) flushOnce() {
 	a.mu.Lock()
-	if len(a.counters) == 0 {
+	if len(a.counters) == 0 && len(a.uniques) == 0 {
 		a.mu.Unlock()
 		return
 	}
 	snap := a.counters
+	uniqSnap := a.uniques
 	a.counters = make(map[Key]*Counter, a.cfg.maxBuffer/8)
+	a.uniques = make(map[uniqueKey]map[uint64]struct{})
 	a.mu.Unlock()
 
-	metricBufferSize.Set(float64(len(snap)))
+	rowCount := len(snap) + len(uniqSnap)
+	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, snap)
+	body, err := encodeBatch(a.ProxyServerIDValue, snap, uniqSnap)
 	if err != nil {
-		atomic.AddUint64(&a.dropped, uint64(len(snap)))
-		metricDroppedRows.Add(float64(len(snap)))
+		atomic.AddUint64(&a.dropped, uint64(rowCount))
+		metricDroppedRows.Add(float64(rowCount))
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: encode batch failed", zap.Error(err))
 		}
@@ -281,11 +344,11 @@ func (a *StatsApp) flushOnce() {
 	}
 
 	if err := a.shipWithRetry(body); err != nil {
-		atomic.AddUint64(&a.dropped, uint64(len(snap)))
-		metricDroppedRows.Add(float64(len(snap)))
+		atomic.AddUint64(&a.dropped, uint64(rowCount))
+		metricDroppedRows.Add(float64(rowCount))
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: ship failed; dropping batch",
-				zap.Int("rows", len(snap)),
+				zap.Int("rows", rowCount),
 				zap.Error(err),
 			)
 		}
@@ -361,9 +424,12 @@ func isPermanent(err error) bool {
 }
 
 // encodeBatch builds the gzipped NDJSON body for a snapshot. One JSON
-// object per line. Histogram buckets are emitted sparsely — buckets with
-// zero counts are omitted to keep the wire small.
-func encodeBatch(proxyServerID uint32, snap map[Key]*Counter) ([]byte, error) {
+// object per line. Counter rows have the existing dimension+counter
+// fields; uniques rows carry `client_hashes` and only the
+// (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
+// emitted sparsely — buckets with zero counts are omitted to keep the
+// wire small.
+func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -371,10 +437,47 @@ func encodeBatch(proxyServerID uint32, snap map[Key]*Counter) ([]byte, error) {
 			return nil, err
 		}
 	}
+	for uk, set := range uniqSnap {
+		if err := encodeUniquesRow(gz, proxyServerID, uk, set); err != nil {
+			return nil, err
+		}
+	}
 	if err := gz.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// encodeUniquesRow writes one NDJSON line for a uniques entry. Format:
+//
+//	{"ts": "...", "proxy_server_id": N, "vhost_id": N, "client_hashes": [h1, h2, ...]}
+//
+// The app-side controller routes rows with `client_hashes` to the
+// uniques buffer rather than the counter buffer.
+func encodeUniquesRow(w *gzip.Writer, ps uint32, uk uniqueKey, set map[uint64]struct{}) error {
+	if len(set) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.Grow(64 + 12*len(set))
+	b.WriteByte('{')
+	writeString(&b, "ts", formatTs(uk.TsUnixMin))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeUint32(&b, "vhost_id", uk.VhostID)
+	b.WriteString(`,"client_hashes":[`)
+	first := true
+	for h := range set {
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteString(strconv.FormatUint(h, 10))
+	}
+	b.WriteString("]}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
 }
 
 // encodeRow writes one NDJSON line. Hand-rolled to avoid encoding/json

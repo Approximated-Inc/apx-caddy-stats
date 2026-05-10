@@ -44,6 +44,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	a.counters = make(map[Key]*Counter)
+	a.uniques = make(map[uniqueKey]map[uint64]struct{})
 	a.stopCh = make(chan struct{})
 	return a
 }
@@ -348,6 +349,98 @@ func TestFlushOnce_DropsAfterRetryExhaustion(t *testing.T) {
 	a.Record(Key{VhostID: 2, Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
 	a.flushOnce()
 	require.Equal(t, uint64(2), a.Dropped(), "both rows should be dropped")
+}
+
+func TestRecordUnique_DedupesAndShipsArrayRow(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	a.hashSalt = "test-salt"
+
+	a.RecordUnique(100, 7, 0xAAAA)
+	a.RecordUnique(100, 7, 0xBBBB)
+	a.RecordUnique(100, 7, 0xAAAA) // duplicate of the first; should dedupe
+	a.RecordUnique(100, 8, 0xCCCC) // different vhost; separate row
+
+	a.flushOnce()
+	posts := captured()
+	require.Len(t, posts, 1)
+
+	// Two rows: vhost 7 has {AAAA, BBBB}, vhost 8 has {CCCC}.
+	// Order isn't guaranteed across map iteration; group by vhost_id.
+	byVhost := map[float64]map[string]any{}
+	for _, r := range posts[0].rows {
+		if _, ok := r["client_hashes"]; !ok {
+			continue
+		}
+		byVhost[r["vhost_id"].(float64)] = r
+	}
+	require.Len(t, byVhost, 2)
+
+	require.ElementsMatch(t,
+		[]uint64{0xAAAA, 0xBBBB},
+		hashesAsUint64(byVhost[7]["client_hashes"]),
+	)
+	require.Equal(t,
+		[]uint64{0xCCCC},
+		hashesAsUint64(byVhost[8]["client_hashes"]),
+	)
+}
+
+func TestRecordUnique_NoSaltIsNoop(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	// hashSalt left empty by default — feature is disabled
+	require.Empty(t, a.HashSalt())
+
+	a.RecordUnique(100, 7, 0xAAAA)
+	require.Empty(t, a.uniques)
+
+	// flush with both maps empty is a no-op (no POST issued)
+	a.flushOnce()
+	require.Empty(t, captured())
+}
+
+func TestRecordUnique_FlushesWithCountersInSameBatch(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	a.hashSalt = "test-salt"
+
+	a.Record(Key{TsUnixMin: 100, VhostID: 7, Method: "GET", Status: 200, Origin: OriginUpstream},
+		CounterDelta{BytesIn: 100, BytesOut: 200})
+	a.RecordUnique(100, 7, 0xDEADBEEF)
+
+	a.flushOnce()
+	posts := captured()
+	require.Len(t, posts, 1)
+
+	// Single batch carries both row kinds. Counter row has request_count;
+	// uniques row has client_hashes.
+	var counterRows, uniquesRows int
+	for _, r := range posts[0].rows {
+		if _, ok := r["client_hashes"]; ok {
+			uniquesRows++
+		} else if _, ok := r["request_count"]; ok {
+			counterRows++
+		}
+	}
+	require.Equal(t, 1, counterRows)
+	require.Equal(t, 1, uniquesRows)
+}
+
+// hashesAsUint64 converts the JSON-decoded `client_hashes` array (a
+// []any of float64) into a []uint64 for comparison. JSON numbers fit
+// uint64 precision losslessly only up to 2^53, but our test fixtures
+// stay well below that.
+func hashesAsUint64(v any) []uint64 {
+	arr, _ := v.([]any)
+	out := make([]uint64, 0, len(arr))
+	for _, x := range arr {
+		out = append(out, uint64(x.(float64)))
+	}
+	return out
 }
 
 func TestFormatTs_RoundTripsViaIngest(t *testing.T) {

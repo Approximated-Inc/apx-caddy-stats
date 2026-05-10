@@ -17,7 +17,9 @@ import (
 type fakeApp struct {
 	mu       sync.Mutex
 	records  []recorded
+	uniques  []recordedUnique
 	psID     uint32
+	hashSalt string
 }
 
 type recorded struct {
@@ -25,11 +27,25 @@ type recorded struct {
 	d CounterDelta
 }
 
+type recordedUnique struct {
+	tsUnixMin uint32
+	vhostID   uint32
+	hash      uint64
+}
+
 func (f *fakeApp) Record(k Key, d CounterDelta) {
 	f.mu.Lock()
 	f.records = append(f.records, recorded{k, d})
 	f.mu.Unlock()
 }
+
+func (f *fakeApp) RecordUnique(tsUnixMin, vhostID uint32, hash uint64) {
+	f.mu.Lock()
+	f.uniques = append(f.uniques, recordedUnique{tsUnixMin, vhostID, hash})
+	f.mu.Unlock()
+}
+
+func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
 

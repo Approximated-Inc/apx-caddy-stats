@@ -125,6 +125,53 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
+
+	// Unique-clients tracking. Skipped entirely when the salt isn't
+	// configured (returns "" — see StatsApp.HashSalt). Hash inputs:
+	// client IP + user-agent + salt. Best-effort identity — same UA
+	// from the same IP behind a NAT will collapse, mobile clients
+	// rotating IPs will split. Good enough for "rough number of
+	// distinct clients in this window."
+	if salt := h.app.HashSalt(); salt != "" {
+		hash := ClientHash(clientIP(r), r.UserAgent(), salt)
+		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
+	}
+}
+
+// clientIP returns the best-guess client IP for hashing purposes. Prefers
+// the rightmost X-Forwarded-For entry (the request came in through a
+// trusted proxy chain) but falls back to RemoteAddr when no XFF header
+// is set. Strictly used for hashing — not for any access decision — so
+// trust assumptions are looser than for security-sensitive callers.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Last entry is the client closest to the trusted proxy boundary.
+		// Find the last comma; the bit after it (trimmed) is the IP.
+		if i := lastIndexByte(xff, ','); i >= 0 {
+			return trimSpace(xff[i+1:])
+		}
+		return trimSpace(xff)
+	}
+	return r.RemoteAddr
+}
+
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func trimSpace(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 // readVhostID reads `http.vars.vhost_id` set by the per-vhost vars

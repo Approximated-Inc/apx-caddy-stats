@@ -29,6 +29,15 @@ type Key struct {
 	ASN       uint32 // 0 if unknown
 }
 
+// uniqueKey identifies a per-(vhost, minute) set of hashed client
+// identifiers. Coarser than Key — uniques are aggregated only by time
+// bucket and vhost, not by method/status/origin/country/asn — because
+// "unique clients" is a single global count per vhost-minute.
+type uniqueKey struct {
+	TsUnixMin uint32
+	VhostID   uint32
+}
+
 // Counter holds the aggregated values for one Key. All fields are summed
 // element-wise across requests with the same Key.
 //
