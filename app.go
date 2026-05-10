@@ -82,11 +82,18 @@ type StatsApp struct {
 	// kept here for log/metric labels.
 	MachineID string `json:"machine_id,omitempty"`
 
-	// HashSaltEnvVar names the env var to source the per-deployment salt
-	// from for client-identifier hashing. Default: APX_HASH_SALT.
-	// If unset and the env var is empty, the unique-clients tracking
-	// silently disables (no hashes computed, no rows emitted).
-	HashSaltEnvVar string `json:"hash_salt_env_var,omitempty"`
+	// HashSaltValue is the per-deployment salt for hashing client
+	// identifiers. Stamped into the Caddy config by the app's
+	// `caddy_config_files.ex` rather than read from an env var on the
+	// Caddy machine — that lets the operator rotate the salt by
+	// regenerating the config (which propagates to all Caddy machines
+	// via the existing config-check pull) instead of pushing new Fly
+	// secrets and restarting machines.
+	//
+	// Empty string disables unique-clients tracking entirely (handlers
+	// skip the hash, flush emits no uniques rows). Lets the module be
+	// deployed before the operator has provisioned a salt.
+	HashSaltValue string `json:"hash_salt,omitempty"`
 
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
@@ -150,15 +157,10 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats app: %s env var is empty", envVar)
 	}
 
-	saltEnvVar := a.HashSaltEnvVar
-	if saltEnvVar == "" {
-		saltEnvVar = "APX_HASH_SALT"
-	}
-	// Hash salt is OPTIONAL — if unset, unique-client tracking silently
-	// disables. This lets the module be deployed before the operator has
-	// provisioned the salt, without crashing Caddy. Once the salt is set
-	// and Caddy is restarted/reconfigured, hashing turns on.
-	a.hashSalt = os.Getenv(saltEnvVar)
+	// Hash salt comes from the config blob directly (not an env var) so
+	// the operator can rotate it by regenerating Caddy config. Optional —
+	// empty disables unique-clients tracking without crashing Caddy.
+	a.hashSalt = a.HashSaltValue
 
 	a.cfg = ingestRuntime{
 		url:           a.Ingest.URL,
