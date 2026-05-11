@@ -193,19 +193,27 @@ func readVhostID(r *http.Request) (uint32, bool) {
 	return uint32(n), true
 }
 
-// classifyOrigin maps a finished request to one of three origin classes.
+// classifyOrigin maps a finished request to one of four origin classes.
 //
 //   - upstream: reverse_proxy attempted and the upstream returned. Caddy
 //     passed the response through to the client.
 //   - cluster_proxy_error: reverse_proxy attempted but failed (dial
 //     refused, timeout, no upstream selected, etc.). Caddy synthesized
 //     the response (typically 502 / 504 / 503 / 499).
-//   - cluster: reverse_proxy was never reached. Caddy generated the
-//     response itself (404 from no matching route, redirect, WAF block,
-//     rate limit, error page, etc.).
+//   - cluster_blocked: Caddy deliberately blocked the request before
+//     reaching upstream — WAF block, rate-limit reject, etc. Detected
+//     via the `apx_block_reason` request var set by the blocking
+//     handler. Distinct from `cluster` so customer-facing dashboards
+//     don't surface WAF spikes as "cluster failures."
+//   - cluster: reverse_proxy was never reached and we didn't see a
+//     block reason. Caddy generated the response itself (404 from no
+//     matching route, redirect, error page, etc.).
 //
 // Signal sources:
 //
+//   - `{http.vars.apx_block_reason}` — set by WAF / rate-limit /
+//     similar handlers when they actively block a request. Presence
+//     (any non-empty value) classifies the row as `cluster_blocked`.
 //   - `{http.reverse_proxy.upstream.address}` — set by reverse_proxy
 //     during upstream *selection*, before the dial attempt. Set even
 //     on dial failure. Absent ⇒ reverse_proxy never ran.
@@ -218,6 +226,12 @@ func readVhostID(r *http.Request) (uint32, bool) {
 // We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
 // it inside `handle_response` blocks, never for normal pass-through.
 func classifyOrigin(repl *caddy.Replacer, servErr error) string {
+	if repl != nil {
+		if reason, _ := repl.GetString("http.vars.apx_block_reason"); reason != "" {
+			return OriginClusterBlocked
+		}
+	}
+
 	upstream := ""
 	if repl != nil {
 		upstream, _ = repl.GetString("http.reverse_proxy.upstream.address")
@@ -345,8 +359,16 @@ func requestBytes(r *http.Request) uint64 {
 // outer handler will write a synthesized status later), this returns
 // 0 — the synthesized response is small (~200 bytes) and outside our
 // observation point.
+//
+// Hijacked connections (WebSocket upgrades, raw-TCP via reverse_proxy)
+// also return 0: at the time of Hijack() the upgrade response hadn't
+// been written yet via our recorder, and post-hijack bytes pass through
+// the bare net.Conn we don't see. Counting status-line + headers from
+// `w.Header()` on a hijacked connection would fabricate ~100-200 bytes
+// per upgrade — observed inflation on customers using a lot of
+// WebSocket traffic. Return 0 to be honest.
 func responseBytes(w *recorder) uint64 {
-	if !w.wrote {
+	if !w.wrote || w.hijacked {
 		return 0
 	}
 	// Status line: HTTP/1.1 NNN STATUS_TEXT CRLF — Proto isn't on the

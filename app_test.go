@@ -36,15 +36,20 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.secret = secret
 	a.cfg = ingestRuntime{
-		url:           a.Ingest.URL,
-		authHeader:    "apx-key",
-		flushInterval: time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
-		maxBuffer:     a.Ingest.MaxBufferRows,
-		maxRetries:    a.Ingest.MaxRetries,
+		url:             a.Ingest.URL,
+		authHeader:      "apx-key",
+		flushInterval:   time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
+		maxBuffer:       a.Ingest.MaxBufferRows,
+		maxUniqueHashes: intDefault(a.Ingest.MaxUniqueHashes, 500_000),
+		maxRetries:      a.Ingest.MaxRetries,
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
-	a.counters = make(map[Key]*Counter)
-	a.uniques = make(map[uniqueKey]map[uint64]struct{})
+	for i := range a.shards {
+		a.shards[i] = &counterShard{
+			counters: make(map[Key]*Counter),
+			uniques:  make(map[uniqueKey]map[uint64]struct{}),
+		}
+	}
 	a.stopCh = make(chan struct{})
 	return a
 }
@@ -181,8 +186,9 @@ func TestRecord_DedupesIdenticalKeys(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Len(t, a.counters, 1, "all N inserts must collapse to one map entry")
-	c := a.counters[k]
+	require.Equal(t, 1, a.counterCount(), "all N inserts must collapse to one map entry")
+	c, ok := a.counterFor(k)
+	require.True(t, ok)
 	require.Equal(t, uint64(N), c.RequestCount)
 	require.Equal(t, uint64(N*100), c.BytesIn)
 	require.Equal(t, uint64(N*200), c.BytesOut)
@@ -201,35 +207,59 @@ func TestRecord_DistinctKeysGetSeparateRows(t *testing.T) {
 	a.Record(Key{VhostID: 1, Method: "POST", Status: 200}, CounterDelta{LatBucket: 0})
 	a.Record(Key{VhostID: 1, Method: "GET", Status: 500}, CounterDelta{LatBucket: 0})
 
-	require.Len(t, a.counters, 4)
+	require.Equal(t, 4, a.counterCount())
 }
 
 func TestRecord_MaxBufferRowsCapDropsNewKeys(t *testing.T) {
 	srv, _ := captureServer(t, 204)
 	defer srv.Close()
+	// MaxBufferRows is the GLOBAL cap. With shardCount shards, each shard
+	// gets MaxBufferRows/shardCount. Pick MaxBufferRows = shardCount*3
+	// so each shard's cap is 3 and the total cap is shardCount*3. Then
+	// insert keys that all land in the same shard (so we can deterministically
+	// test the cap behavior) — easiest: same VhostID, Method, Status,
+	// vary only an "internal" field we'll spread artificially.
 	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
-		a.Ingest.MaxBufferRows = 3
+		a.Ingest.MaxBufferRows = shardCount * 3
 	})
 
-	for i := 0; i < 10; i++ {
-		a.Record(Key{VhostID: uint32(i), Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
+	// Insert 10 distinct keys that all hash to the same shard by sharing
+	// the high-cardinality fields. They differ only in ASN which is
+	// hashed into the shard selection, so they may scatter. Instead,
+	// insert 10 × shardCount keys spread across shards uniformly — at
+	// 3 per shard cap, we'll fill exactly 3*shardCount = 30 and drop 0
+	// in the symmetric case. The clearer test is to fill ONE shard
+	// past its cap. We use VhostID values such that shardForKey lands
+	// them in the same shard, picked by trial.
+	target := a.shardForKey(Key{VhostID: 0, Method: "GET", Status: 200})
+
+	var inserted int
+	v := uint32(0)
+	for inserted < 10 && v < 10_000 {
+		k := Key{VhostID: v, Method: "GET", Status: 200}
+		if a.shardForKey(k) == target {
+			a.Record(k, CounterDelta{LatBucket: 0})
+			inserted++
+		}
+		v++
 	}
-	require.Len(t, a.counters, 3)
+
+	snap := a.countersSnapshot()
+	require.Equal(t, 3, len(snap), "shard cap (3) caps inserts in this shard")
 	require.Equal(t, uint64(7), a.Overflow())
 
 	// Existing keys still count.
 	for i := 0; i < 5; i++ {
-		// Pick whichever 3 ended up in the map.
-		for k := range a.counters {
+		for k := range snap {
 			a.Record(k, CounterDelta{LatBucket: 0})
 			break
 		}
 	}
 	var total uint64
-	for _, c := range a.counters {
+	for _, c := range a.countersSnapshot() {
 		total += c.RequestCount
 	}
-	require.GreaterOrEqual(t, total, uint64(8)) // 3 originals + 5 re-records
+	require.GreaterOrEqual(t, total, uint64(8))
 }
 
 func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
@@ -387,6 +417,52 @@ func TestRecordUnique_DedupesAndShipsArrayRow(t *testing.T) {
 	)
 }
 
+func TestRecordUnique_CapsTotalHashes(t *testing.T) {
+	srv, _ := captureServer(t, 204)
+	defer srv.Close()
+
+	// Cap is GLOBAL across shards; per-shard cap = MaxUniqueHashes / shardCount.
+	// Pick MaxUniqueHashes = 3 * shardCount so per-shard cap = 3, then drive
+	// all inserts into one shard by picking (ts, vhost) values that hash there.
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.MaxUniqueHashes = 3 * shardCount
+	})
+	a.cfg.maxUniqueHashes = 3 * shardCount
+	a.hashSalt = "test-salt"
+
+	// Find two (ts, vhost) pairs that land in the same shard.
+	targetShard := a.shardForUnique(100, 1)
+	var altV uint32
+	for v := uint32(2); v < 10_000; v++ {
+		if a.shardForUnique(100, v) == targetShard {
+			altV = v
+			break
+		}
+	}
+	require.NotZero(t, altV, "couldn't find two same-shard vhosts")
+
+	// First three inserts (all in target shard) succeed
+	a.RecordUnique(100, 1, 0xA1)
+	a.RecordUnique(100, 1, 0xA2)
+	a.RecordUnique(100, altV, 0xB1)
+
+	require.Equal(t, uint64(3), a.uniqueHashTotal())
+	require.Equal(t, uint64(0), a.uniquesOverflow)
+
+	// Fourth distinct hash in this shard overflows
+	a.RecordUnique(100, altV, 0xB2)
+	require.Equal(t, uint64(3), a.uniqueHashTotal(), "no new entry past per-shard cap")
+	require.Equal(t, uint64(1), a.uniquesOverflow, "overflow counter bumped")
+
+	// Duplicate of an existing hash doesn't bump overflow (idempotent)
+	a.RecordUnique(100, 1, 0xA1)
+	require.Equal(t, uint64(1), a.uniquesOverflow, "dup is silent, not overflow")
+
+	// Flush resets the running count
+	a.flushOnce()
+	require.Equal(t, uint64(0), a.uniqueHashTotal())
+}
+
 func TestRecordUnique_NoSaltIsNoop(t *testing.T) {
 	srv, captured := captureServer(t, 204)
 	defer srv.Close()
@@ -395,7 +471,7 @@ func TestRecordUnique_NoSaltIsNoop(t *testing.T) {
 	require.Empty(t, a.HashSalt())
 
 	a.RecordUnique(100, 7, 0xAAAA)
-	require.Empty(t, a.uniques)
+	require.True(t, a.uniquesEmpty())
 
 	// flush with both maps empty is a no-op (no POST issued)
 	a.flushOnce()

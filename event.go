@@ -9,7 +9,8 @@ import (
 // Mirrors the Elixir-side `origin` LowCardinality(String) column.
 const (
 	OriginUpstream          = "upstream"            // upstream returned and Caddy passed it through
-	OriginCluster           = "cluster"             // Caddy generated the response (no upstream attempted)
+	OriginCluster           = "cluster"             // Caddy generated the response (no upstream attempted; redirects, default-target 404s, error pages)
+	OriginClusterBlocked    = "cluster_blocked"     // Caddy deliberately blocked the request (WAF, rate limit) — set via {http.vars.apx_block_reason} from the blocking handler
 	OriginClusterProxyError = "cluster_proxy_error" // upstream attempted, Caddy synthesized the final response
 )
 

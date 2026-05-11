@@ -35,6 +35,17 @@ var metricBufferOverflow = promauto.NewCounter(
 	},
 )
 
+// metricUniquesOverflow counts unique-hash inserts dropped because
+// MaxUniqueHashes was hit. Existing per-(vhost,minute) sets keep their
+// already-recorded distinct clients; this only fires when total unique
+// hash entries exceeds the cap inside one flush window.
+var metricUniquesOverflow = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_stats_uniques_overflow_total",
+		Help: "apx-caddy-stats unique hashes dropped due to MaxUniqueHashes cap",
+	},
+)
+
 // metricShipAttempts counts ingest POST attempts.
 //
 //	result = "ok" | "transient" | "permanent"

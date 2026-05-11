@@ -53,20 +53,38 @@ type IngestConfig struct {
 	// URL is the absolute URL of the app endpoint that ingests batches.
 	URL string `json:"url,omitempty"`
 	// AuthEnvVar names the env var to source the shared secret from.
-	// Default: APX_INTERNAL_KEY.
+	// Default: APX_INTERNAL_KEY. The secret is sent as a plaintext
+	// bearer in the AuthHeader on every POST — there is no HMAC,
+	// no timestamp, no replay protection. Security relies on the
+	// private mesh transport between Caddy machines and the
+	// Approximated app, and on rotating APX_INTERNAL_KEY periodically.
 	AuthEnvVar string `json:"auth_env_var,omitempty"`
-	// AuthHeader is the HTTP header the secret rides on. Default: apx-key.
+	// AuthHeader is the HTTP header the shared-secret bearer rides on.
+	// Default: apx-key.
 	AuthHeader string `json:"auth_header,omitempty"`
 	// FlushIntervalMs controls the periodic drain. Default 30000ms.
 	FlushIntervalMs int `json:"flush_interval_ms,omitempty"`
 	// MaxBufferRows caps the live counter map. New keys are dropped at the
 	// cap; existing keys keep counting. Default 50000.
 	MaxBufferRows int `json:"max_buffer_rows,omitempty"`
+	// MaxUniqueHashes caps the total entries in the per-(vhost, minute)
+	// unique-clients hash sets. Beyond the cap, new hashes are dropped
+	// (existing ones remain — overflow doesn't lose accuracy on already-
+	// tracked sets). Default 500000. Tune lower on memory-tight hosts;
+	// higher on hosts with high traffic + many unique clients (NAT churn,
+	// CDN backplane, scanners).
+	MaxUniqueHashes int `json:"max_unique_hashes,omitempty"`
 	// TimeoutMs bounds each POST. Default 10000ms.
 	TimeoutMs int `json:"timeout_ms,omitempty"`
 	// MaxRetries is the number of retries on POST failure before dropping
 	// the batch. Default 3.
 	MaxRetries int `json:"max_retries,omitempty"`
+	// ShutdownMaxRetries is the retry budget used during the final flush
+	// at Stop() (graceful shutdown / hot-reload). Higher than MaxRetries
+	// because a brief ingest blip coinciding with a fleet-wide config
+	// regen would otherwise lose data on every Caddy machine
+	// simultaneously. Default 7.
+	ShutdownMaxRetries int `json:"shutdown_max_retries,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -105,25 +123,55 @@ type StatsApp struct {
 
 	cfg ingestRuntime // resolved from Ingest with defaults applied
 
-	mu       sync.Mutex
-	counters map[Key]*Counter
-	uniques  map[uniqueKey]map[uint64]struct{}
+	// State is sharded across `shardCount` shards. Each shard owns its
+	// own mutex + counters/uniques maps + counts; Record/RecordUnique
+	// pick a shard by hashing the row's identifying fields so traffic
+	// spreads across shards under contention. flushOnce snapshots every
+	// shard in turn and ships the combined result.
+	//
+	// Sharding reduces the single-mutex contention point the original
+	// design had at thousands of RPS/machine. Per-machine cardinality
+	// for our typical cluster easily fits within one shard, but the
+	// hot path (incrementing an existing counter) now contends with
+	// 1/shardCount of the other goroutines on average.
+	shards [shardCount]*counterShard
 
-	overflow         uint64    // count of distinct new keys dropped due to MaxBufferRows
-	overflowLoggedAt time.Time // first-overflow log throttle (zero = never logged)
-	dropped          uint64    // count of rows dropped after retry exhaustion
+	overflow         uint64     // count of distinct new keys dropped due to MaxBufferRows
+	overflowLogMu    sync.Mutex // guards overflowLoggedAt (cross-shard)
+	overflowLoggedAt time.Time  // first-overflow log throttle (zero = never logged)
+	uniquesOverflow  uint64     // count of unique-hash inserts dropped due to MaxUniqueHashes
+	dropped          uint64     // count of rows dropped after retry exhaustion
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
+// shardCount controls how many independent (mutex, counters, uniques)
+// triplets the StatsApp maintains. A power of two so we can use bitmask
+// indexing on the hash output. 16 gives a comfortable ratio of
+// contention reduction to memory overhead — at 64-byte average key
+// payload × ~1000 active keys per shard, we're a few hundred KB per
+// shard. Tune up if profiling shows per-shard contention on a
+// dominantly-single-vhost workload.
+const shardCount = 16
+const shardMask = shardCount - 1
+
+type counterShard struct {
+	mu              sync.Mutex
+	counters        map[Key]*Counter
+	uniques         map[uniqueKey]map[uint64]struct{}
+	uniqueHashCount uint64
+}
+
 type ingestRuntime struct {
-	url           string
-	authHeader    string
-	flushInterval time.Duration
-	maxBuffer     int
-	maxRetries    int
+	url                string
+	authHeader         string
+	flushInterval      time.Duration
+	maxBuffer          int
+	maxUniqueHashes    int
+	maxRetries         int
+	shutdownMaxRetries int
 }
 
 // CaddyModule registers the app at root ID "apx_stats".
@@ -134,8 +182,10 @@ func (*StatsApp) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision validates config, reads the shared secret, builds the HTTP
-// client, and initializes the counter map. Called by Caddy before Start.
+// Provision validates config, reads the shared-secret bearer token,
+// builds the HTTP client, and initializes the counter map. Called by
+// Caddy before Start. The secret is plaintext bearer auth — no HMAC,
+// no replay protection — see IngestConfig.AuthEnvVar.
 func (a *StatsApp) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	if a.Ingest == nil {
@@ -163,11 +213,13 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	a.hashSalt = a.HashSaltValue
 
 	a.cfg = ingestRuntime{
-		url:           a.Ingest.URL,
-		authHeader:    firstNonEmpty(a.Ingest.AuthHeader, "apx-key"),
-		flushInterval: durationMs(a.Ingest.FlushIntervalMs, 30_000),
-		maxBuffer:     intDefault(a.Ingest.MaxBufferRows, 50_000),
-		maxRetries:    intDefault(a.Ingest.MaxRetries, 3),
+		url:                a.Ingest.URL,
+		authHeader:         firstNonEmpty(a.Ingest.AuthHeader, "apx-key"),
+		flushInterval:      durationMs(a.Ingest.FlushIntervalMs, 30_000),
+		maxBuffer:          intDefault(a.Ingest.MaxBufferRows, 50_000),
+		maxUniqueHashes:    intDefault(a.Ingest.MaxUniqueHashes, 500_000),
+		maxRetries:         intDefault(a.Ingest.MaxRetries, 3),
+		shutdownMaxRetries: intDefault(a.Ingest.ShutdownMaxRetries, 7),
 	}
 
 	a.client = &http.Client{
@@ -178,10 +230,71 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	a.counters = make(map[Key]*Counter, a.cfg.maxBuffer/8)
-	a.uniques = make(map[uniqueKey]map[uint64]struct{})
+	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
+	if perShardInitialCap < 8 {
+		perShardInitialCap = 8
+	}
+	for i := range a.shards {
+		a.shards[i] = &counterShard{
+			counters: make(map[Key]*Counter, perShardInitialCap),
+			uniques:  make(map[uniqueKey]map[uint64]struct{}),
+		}
+	}
 	a.stopCh = make(chan struct{})
 	return nil
+}
+
+// shardForKey maps a Key to its owning shard. Uses an FNV-1a 64-bit
+// hash over the variable-cardinality fields (TsUnixMin omitted since
+// it's near-constant during a flush window — would cluster traffic in
+// one shard).
+func (a *StatsApp) shardForKey(k Key) *counterShard {
+	h := uint64(14695981039346656037) // fnv1a offset basis
+	h = mixUint32(h, k.VhostID)
+	h = mixUint16(h, k.Status)
+	h = mixString(h, k.Method)
+	h = mixString(h, k.Origin)
+	h = mixString(h, k.Country)
+	h = mixUint32(h, k.ASN)
+	return a.shards[h&shardMask]
+}
+
+// shardForUnique mirrors the per-(vhost, minute) split. The TsUnixMin
+// here is intentionally part of the key (different from shardForKey)
+// because uniques accumulate per minute and we want them spread across
+// shards as time advances.
+func (a *StatsApp) shardForUnique(t, v uint32) *counterShard {
+	h := uint64(14695981039346656037)
+	h = mixUint32(h, t)
+	h = mixUint32(h, v)
+	return a.shards[h&shardMask]
+}
+
+// FNV-1a mixers — each byte XORed in, then multiplied by FNV prime.
+const fnv1aPrime = 1099511628211
+
+func mixUint32(h uint64, v uint32) uint64 {
+	for i := 0; i < 4; i++ {
+		h ^= uint64(byte(v >> (i * 8)))
+		h *= fnv1aPrime
+	}
+	return h
+}
+
+func mixUint16(h uint64, v uint16) uint64 {
+	h ^= uint64(byte(v))
+	h *= fnv1aPrime
+	h ^= uint64(byte(v >> 8))
+	h *= fnv1aPrime
+	return h
+}
+
+func mixString(h uint64, s string) uint64 {
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= fnv1aPrime
+	}
+	return h
 }
 
 // Start launches the periodic flush goroutine.
@@ -201,6 +314,62 @@ func (a *StatsApp) Stop() error {
 // ProxyServerID exposes the cluster id to handlers.
 func (a *StatsApp) ProxyServerID() uint32 { return a.ProxyServerIDValue }
 
+// Test-only accessors. The counters / uniques maps are sharded for
+// contention reduction; tests want to peek at aggregate state without
+// caring which shard owns a given key.
+
+func (a *StatsApp) counterCount() int {
+	total := 0
+	for _, s := range a.shards {
+		s.mu.Lock()
+		total += len(s.counters)
+		s.mu.Unlock()
+	}
+	return total
+}
+
+func (a *StatsApp) counterFor(k Key) (*Counter, bool) {
+	s := a.shardForKey(k)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.counters[k]
+	return c, ok
+}
+
+func (a *StatsApp) countersSnapshot() map[Key]*Counter {
+	out := make(map[Key]*Counter)
+	for _, s := range a.shards {
+		s.mu.Lock()
+		for k, c := range s.counters {
+			out[k] = c
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
+func (a *StatsApp) uniqueHashTotal() uint64 {
+	var total uint64
+	for _, s := range a.shards {
+		s.mu.Lock()
+		total += s.uniqueHashCount
+		s.mu.Unlock()
+	}
+	return total
+}
+
+func (a *StatsApp) uniquesEmpty() bool {
+	for _, s := range a.shards {
+		s.mu.Lock()
+		empty := len(s.uniques) == 0
+		s.mu.Unlock()
+		if !empty {
+			return false
+		}
+	}
+	return true
+}
+
 // HashSalt exposes the deployment salt for hashing client identifiers.
 // Empty string disables unique-clients tracking — handlers should skip
 // computing the hash when this returns "".
@@ -211,61 +380,93 @@ func (a *StatsApp) HashSalt() string { return a.hashSalt }
 // unset (HashSalt() == "") so an unconfigured deployment doesn't waste
 // memory accumulating sets it can't ship.
 //
-// Held under a.mu alongside Record's counter updates — same lock so
-// flushOnce gets a coherent snapshot of both maps. Map allocation for
-// new (vhost, minute) keys is amortized by `len(uniques)` staying small
-// (~one entry per active vhost per minute).
+// Sharded the same way Record is — shardForUnique(tsUnixMin, vhostID)
+// picks the owning shard, only that shard's mutex is held. Map
+// allocation for new (vhost, minute) keys is amortized by per-shard
+// `len(uniques)` staying small (~one entry per active vhost per minute
+// per shard).
 func (a *StatsApp) RecordUnique(tsUnixMin, vhostID uint32, hash uint64) {
 	if a.hashSalt == "" {
 		return
 	}
 
 	k := uniqueKey{TsUnixMin: tsUnixMin, VhostID: vhostID}
+	s := a.shardForUnique(tsUnixMin, vhostID)
+	// Per-shard cap so each shard gets a fair slice of the global
+	// budget. Picks shard count as the divisor so the SUM of shard caps
+	// equals the configured global cap.
+	perShardCap := uint64(a.cfg.maxUniqueHashes / shardCount)
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	set, ok := a.uniques[k]
+	set, ok := s.uniques[k]
 	if !ok {
+		// New (vhost, minute) key: also bounded by per-shard cap —
+		// if we're already at the cap, drop the row entirely rather
+		// than allocate a new set.
+		if s.uniqueHashCount >= perShardCap {
+			atomic.AddUint64(&a.uniquesOverflow, 1)
+			metricUniquesOverflow.Inc()
+			return
+		}
 		set = make(map[uint64]struct{}, 16)
-		a.uniques[k] = set
+		s.uniques[k] = set
+	}
+
+	// Existing-set insert: drop the hash if shard count is at cap.
+	// Sets that already contain a value can't grow further, but they
+	// still count their existing entries against the cap. During
+	// overflow we keep existing distinct-clients but stop discovering
+	// new ones — preferable to losing the row entirely.
+	if _, exists := set[hash]; exists {
+		return
+	}
+	if s.uniqueHashCount >= perShardCap {
+		atomic.AddUint64(&a.uniquesOverflow, 1)
+		metricUniquesOverflow.Inc()
+		return
 	}
 	set[hash] = struct{}{}
+	s.uniqueHashCount++
 }
 
 // Record adds delta to the counter at k, inserting a new entry if absent.
 //
-// The whole call is taken under a.mu. An earlier version released the
-// mutex before doing per-field atomic.Add on the *Counter, but that
-// raced with flushOnce: between the unlock and the atomic.Add a
-// concurrent flushOnce could swap the map and the encode loop could
-// read the field, so the late add landed on a *Counter that was no
-// longer reachable through the live map and had already been encoded
-// without it — the increment was lost. Plain field reads in the
-// encoder against atomic writes here was also a Go data race per the
-// memory model, which `go test -race` would catch.
+// Takes the per-shard mutex through the increments. An earlier version
+// released the mutex before doing per-field atomic.Add on the
+// *Counter, but that raced with flushOnce: between the unlock and the
+// atomic.Add a concurrent flushOnce could swap the map and the encode
+// loop could read the field, so the late add landed on a *Counter that
+// was no longer reachable through the live map and had already been
+// encoded without it — the increment was lost. Plain field reads in
+// the encoder against atomic writes here was also a Go data race per
+// the memory model, which `go test -race` would catch.
 //
-// Holding the mutex through the increments closes both: any Record that
-// gets the lock before flushOnce completes its mutations before
-// flushOnce can swap; any Record that gets the lock after flushOnce
-// looks up from the new map. The "lock-free atomic add" was a premature
-// optimization — at any traffic this module sees per machine, an
-// uncontended mutex is sub-microsecond and dwarfed by the http-handler
+// Holding the shard mutex through the increments closes both: any
+// Record that gets the lock before flushOnce completes its mutations
+// before flushOnce can swap; any Record that gets the lock after
+// flushOnce looks up from the new map. Sharding reduces contention by
+// spreading writers across shardCount independent locks; the
+// per-shard work is otherwise identical to the pre-sharding version.
 // chain around it.
 func (a *StatsApp) Record(k Key, delta CounterDelta) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	s := a.shardForKey(k)
+	perShardCap := a.cfg.maxBuffer / shardCount
 
-	c, ok := a.counters[k]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.counters[k]
 	if !ok {
-		if len(a.counters) >= a.cfg.maxBuffer {
+		if len(s.counters) >= perShardCap {
 			atomic.AddUint64(&a.overflow, 1)
 			metricBufferOverflow.Inc()
 			a.maybeLogOverflow()
 			return
 		}
 		c = &Counter{}
-		a.counters[k] = c
+		s.counters[k] = c
 	}
 
 	c.RequestCount++
@@ -281,18 +482,23 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 // hits its cap, and at most once per minute thereafter. Without this,
 // overflow showed up only as a Prometheus counter — useful for graphs
 // but invisible during incident response when an operator is reading
-// logs. Called under a.mu (Record holds it through this path).
+// logs. Uses overflowLogMu (cross-shard) since multiple shards can hit
+// overflow concurrently.
 func (a *StatsApp) maybeLogOverflow() {
 	now := time.Now()
+
+	a.overflowLogMu.Lock()
 	if !a.overflowLoggedAt.IsZero() && now.Sub(a.overflowLoggedAt) < time.Minute {
+		a.overflowLogMu.Unlock()
 		return
 	}
 	a.overflowLoggedAt = now
+	a.overflowLogMu.Unlock()
 
 	if a.logger != nil {
 		a.logger.Warn("apx_stats: buffer overflow — dropping new counter keys",
 			zap.Int("max_buffer_rows", a.cfg.maxBuffer),
-			zap.Uint64("overflow_total", a.overflow),
+			zap.Uint64("overflow_total", atomic.LoadUint64(&a.overflow)),
 		)
 	}
 }
@@ -309,28 +515,72 @@ func (a *StatsApp) flushLoop() {
 		case <-t.C:
 			a.flushOnce()
 		case <-a.stopCh:
-			a.flushOnce()
+			// Shutdown flush gets a wider retry budget than a steady-
+			// state tick: Caddy hot-reloads create a new App instance
+			// and call Stop() on the old one. If the old App's final
+			// flush fails after the normal 3-retry budget (~3.4s), the
+			// buffer is dropped — and on a cluster with per-minute
+			// config_regen_immediate, a brief ingest hiccup can lose
+			// fleet-wide data simultaneously. Up to 7 retries (~30s
+			// total backoff) gives more leeway, still well under Fly's
+			// 60s graceful-shutdown SIGKILL window.
+			a.flushOnceWithRetries(a.cfg.shutdownMaxRetries)
 			return
 		}
 	}
 }
 
-// flushOnce swaps the live counter and uniques maps for fresh ones,
-// encodes both snapshots into a single gzipped NDJSON body, and POSTs
-// it. Counter and uniques rows ride the same wire — the app-side
-// ingest controller distinguishes by row shape (presence of
-// `client_hashes`).
+// flushOnceWithRetries is `flushOnce` with a temporary retry budget
+// override. Used by the shutdown path so a Stop() coinciding with an
+// ingest blip has more chances to deliver before dropping the buffer.
+func (a *StatsApp) flushOnceWithRetries(retries int) {
+	original := a.cfg.maxRetries
+	a.cfg.maxRetries = retries
+	a.flushOnce()
+	a.cfg.maxRetries = original
+}
+
+// flushOnce drains every shard's counter + uniques maps into one
+// combined snapshot, encodes both as gzipped NDJSON, and POSTs it.
+// Counter and uniques rows ride the same wire — the app-side ingest
+// controller distinguishes by row shape (presence of `client_hashes`).
+//
+// Locks each shard in turn (not all-at-once) so a request hitting an
+// already-drained shard isn't blocked on the rest of the drain. The
+// trade-off: a request landing during the drain may write to either
+// the old (about-to-be-shipped) snapshot or the fresh map depending on
+// timing, but either way its data ships within the next flush
+// interval. No data loss.
 func (a *StatsApp) flushOnce() {
-	a.mu.Lock()
-	if len(a.counters) == 0 && len(a.uniques) == 0 {
-		a.mu.Unlock()
+	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
+	if perShardInitialCap < 8 {
+		perShardInitialCap = 8
+	}
+
+	snap := make(map[Key]*Counter)
+	uniqSnap := make(map[uniqueKey]map[uint64]struct{})
+
+	for _, s := range a.shards {
+		s.mu.Lock()
+		if len(s.counters) == 0 && len(s.uniques) == 0 {
+			s.mu.Unlock()
+			continue
+		}
+		for k, c := range s.counters {
+			snap[k] = c
+		}
+		for k, set := range s.uniques {
+			uniqSnap[k] = set
+		}
+		s.counters = make(map[Key]*Counter, perShardInitialCap)
+		s.uniques = make(map[uniqueKey]map[uint64]struct{})
+		s.uniqueHashCount = 0
+		s.mu.Unlock()
+	}
+
+	if len(snap) == 0 && len(uniqSnap) == 0 {
 		return
 	}
-	snap := a.counters
-	uniqSnap := a.uniques
-	a.counters = make(map[Key]*Counter, a.cfg.maxBuffer/8)
-	a.uniques = make(map[uniqueKey]map[uint64]struct{})
-	a.mu.Unlock()
 
 	rowCount := len(snap) + len(uniqSnap)
 	metricBufferSize.Set(float64(rowCount))
@@ -396,6 +646,10 @@ func (a *StatsApp) shipOnce(body []byte) error {
 	if err != nil {
 		return permanentErr{err}
 	}
+	// Plaintext shared-secret bearer (NOT HMAC). The Approximated app
+	// verifies via the ApxKeyAuth plug. Anyone with this secret can
+	// forge a batch; rotate APX_INTERNAL_KEY + config-regen Caddy to
+	// invalidate stolen secrets.
 	req.Header.Set(a.cfg.authHeader, a.secret)
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("Content-Encoding", "gzip")

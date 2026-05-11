@@ -146,6 +146,42 @@ func TestServeHTTP_ClassifiesClusterWhenNoUpstream(t *testing.T) {
 	require.Equal(t, uint16(404), recs[0].k.Status)
 }
 
+func TestServeHTTP_ClassifiesClusterBlockedWhenBlockReasonSet(t *testing.T) {
+	// Some upstream-of-apx_stats handler (WAF, rate limit) blocked the
+	// request and set `http.vars.apx_block_reason` to mark it. We
+	// classify those as cluster_blocked, not cluster, so dashboards
+	// distinguish "Caddy deliberately blocked" from "Caddy handled it
+	// itself (redirect / 404)."
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", map[string]any{
+		"http.vars.apx_block_reason": "waf",
+	})
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	recs := app.snapshot()
+	require.Len(t, recs, 1)
+	require.Equal(t, OriginClusterBlocked, recs[0].k.Origin)
+	require.Equal(t, uint16(403), recs[0].k.Status)
+}
+
+func TestServeHTTP_BlockedClassificationBeatsClusterEvenWhenNoUpstream(t *testing.T) {
+	// Belt-and-suspenders: when both signals indicate "no upstream", the
+	// block-reason variant wins so we see it in the stats.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", map[string]any{
+		"http.vars.apx_block_reason": "rate_limit",
+	})
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(429)))
+
+	require.Equal(t, OriginClusterBlocked, app.snapshot()[0].k.Origin)
+}
+
 func TestServeHTTP_ClassifiesClusterProxyErrorWhenReverseProxyFails(t *testing.T) {
 	// reverse_proxy failed its dial / timed out. It returned a
 	// HandlerError that bubbled up through subroute → us.
@@ -235,6 +271,22 @@ func TestServeHTTP_DropsRowWhenVhostIDAbsent(t *testing.T) {
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
 	require.Empty(t, app.snapshot())
+}
+
+func TestResponseBytes_ZeroOnHijackedConnection(t *testing.T) {
+	// WebSocket upgrades and raw-TCP proxy: handler hijacks the
+	// connection and writes the upgrade response post-hijack on a bare
+	// net.Conn that we can't see. Counting bytes-out via w.Header() at
+	// that point would fabricate ~100-200 bytes per upgrade — observed
+	// inflation on WebSocket-heavy customers. Verify responseBytes
+	// returns 0 when the recorder is hijacked.
+	rec := &recorder{
+		ResponseWriter: httptest.NewRecorder(),
+		status:         200,
+		wrote:          true,
+		hijacked:       true,
+	}
+	require.Equal(t, uint64(0), responseBytes(rec))
 }
 
 func TestServeHTTP_BytesOutIncludesBodyAndHeaders(t *testing.T) {
