@@ -680,8 +680,11 @@ func isPermanent(err error) bool {
 }
 
 // encodeBatch builds the gzipped NDJSON body for a snapshot. One JSON
-// object per line. Counter rows have the existing dimension+counter
-// fields; uniques rows carry `client_hashes` and only the
+// object per line. Each row carries a `_type` discriminator
+// (`"counter"`, `"uniques"`, and eventually `"event"`) so the app-side
+// ingest controller can dispatch on type rather than infer from
+// shape. Counter rows have the existing dimension+counter fields;
+// uniques rows carry `client_hashes` and only the
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
@@ -706,10 +709,10 @@ func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqu
 
 // encodeUniquesRow writes one NDJSON line for a uniques entry. Format:
 //
-//	{"ts": "...", "proxy_server_id": N, "vhost_id": N, "client_hashes": [h1, h2, ...]}
+//	{"_type": "uniques", "ts": "...", "proxy_server_id": N, "vhost_id": N, "client_hashes": [h1, h2, ...]}
 //
-// The app-side controller routes rows with `client_hashes` to the
-// uniques buffer rather than the counter buffer.
+// The app-side controller dispatches on `_type` so future row kinds
+// (e.g., "event") can be added without inferring from shape.
 func encodeUniquesRow(w *gzip.Writer, ps uint32, uk uniqueKey, set map[uint64]struct{}) error {
 	if len(set) == 0 {
 		return nil
@@ -717,6 +720,8 @@ func encodeUniquesRow(w *gzip.Writer, ps uint32, uk uniqueKey, set map[uint64]st
 	var b strings.Builder
 	b.Grow(64 + 12*len(set))
 	b.WriteByte('{')
+	writeString(&b, "_type", "uniques")
+	b.WriteByte(',')
 	writeString(&b, "ts", formatTs(uk.TsUnixMin))
 	b.WriteByte(',')
 	writeUint32(&b, "proxy_server_id", ps)
@@ -744,6 +749,8 @@ func encodeRow(w *gzip.Writer, ps uint32, k Key, c *Counter) error {
 	b.Grow(256)
 	b.WriteByte('{')
 
+	writeString(&b, "_type", "counter")
+	b.WriteByte(',')
 	writeString(&b, "ts", formatTs(k.TsUnixMin))
 	b.WriteByte(',')
 	writeUint32(&b, "proxy_server_id", ps)

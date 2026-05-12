@@ -287,6 +287,10 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 
 	require.Len(t, posts[0].rows, 1)
 	row := posts[0].rows[0]
+	// `_type` discriminator pins the row kind so the app-side ingest
+	// controller dispatches without inferring from shape. Future row
+	// kinds ("event", challenge decisions, etc.) extend this set.
+	require.Equal(t, "counter", row["_type"])
 	require.Equal(t, float64(42), row["proxy_server_id"])
 	require.Equal(t, float64(100), row["vhost_id"])
 	require.Equal(t, "GET", row["method"])
@@ -398,11 +402,14 @@ func TestRecordUnique_DedupesAndShipsArrayRow(t *testing.T) {
 
 	// Two rows: vhost 7 has {AAAA, BBBB}, vhost 8 has {CCCC}.
 	// Order isn't guaranteed across map iteration; group by vhost_id.
+	// Every uniques row also carries _type: "uniques" so the app-side
+	// controller can dispatch without inferring from shape.
 	byVhost := map[float64]map[string]any{}
 	for _, r := range posts[0].rows {
 		if _, ok := r["client_hashes"]; !ok {
 			continue
 		}
+		require.Equal(t, "uniques", r["_type"], "uniques rows carry _type discriminator")
 		byVhost[r["vhost_id"].(float64)] = r
 	}
 	require.Len(t, byVhost, 2)
