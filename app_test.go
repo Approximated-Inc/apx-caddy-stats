@@ -127,7 +127,7 @@ func TestRecord_ConcurrentWithFlush(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				a.flushOnce()
+				a.flushOnce(a.cfg.maxRetries)
 			}
 		}
 	}()
@@ -145,7 +145,7 @@ func TestRecord_ConcurrentWithFlush(t *testing.T) {
 	<-flushDone
 
 	// Drain whatever's left in the live map.
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 
 	var seen uint64
 	for _, post := range captured() {
@@ -277,7 +277,7 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 		ASN:       13335,
 	}, CounterDelta{BytesIn: 1024, BytesOut: 8192, DurationUs: 25_000, LatBucket: 4})
 
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 
 	posts := captured()
 	require.Len(t, posts, 1)
@@ -316,11 +316,11 @@ func TestFlushOnce_ResetsCountersBetweenFlushes(t *testing.T) {
 
 	k := Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}
 	a.Record(k, CounterDelta{LatBucket: 0})
-	a.flushOnce()
-	a.flushOnce() // empty, no-op
+	a.flushOnce(a.cfg.maxRetries)
+	a.flushOnce(a.cfg.maxRetries) // empty, no-op
 	a.Record(k, CounterDelta{LatBucket: 0})
 	a.Record(k, CounterDelta{LatBucket: 0})
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 
 	posts := captured()
 	require.Len(t, posts, 2)
@@ -344,7 +344,7 @@ func TestFlushOnce_RetriesOnTransientError(t *testing.T) {
 	})
 
 	a.Record(Key{VhostID: 1, Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	require.Equal(t, int32(3), atomic.LoadInt32(&attempts), "should have retried until success")
 	require.Equal(t, uint64(0), a.Dropped())
 }
@@ -361,7 +361,7 @@ func TestFlushOnce_DropsOnPermanent4xx(t *testing.T) {
 	})
 
 	a.Record(Key{VhostID: 1, Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	require.Equal(t, int32(1), atomic.LoadInt32(&attempts), "4xx should not be retried")
 	require.Equal(t, uint64(1), a.Dropped())
 }
@@ -377,7 +377,7 @@ func TestFlushOnce_DropsAfterRetryExhaustion(t *testing.T) {
 
 	a.Record(Key{VhostID: 1, Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
 	a.Record(Key{VhostID: 2, Method: "GET", Status: 200}, CounterDelta{LatBucket: 0})
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	require.Equal(t, uint64(2), a.Dropped(), "both rows should be dropped")
 }
 
@@ -392,7 +392,7 @@ func TestRecordUnique_DedupesAndShipsArrayRow(t *testing.T) {
 	a.RecordUnique(100, 7, 0xAAAA) // duplicate of the first; should dedupe
 	a.RecordUnique(100, 8, 0xCCCC) // different vhost; separate row
 
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	posts := captured()
 	require.Len(t, posts, 1)
 
@@ -459,7 +459,7 @@ func TestRecordUnique_CapsTotalHashes(t *testing.T) {
 	require.Equal(t, uint64(1), a.uniquesOverflow, "dup is silent, not overflow")
 
 	// Flush resets the running count
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	require.Equal(t, uint64(0), a.uniqueHashTotal())
 }
 
@@ -474,7 +474,7 @@ func TestRecordUnique_NoSaltIsNoop(t *testing.T) {
 	require.True(t, a.uniquesEmpty())
 
 	// flush with both maps empty is a no-op (no POST issued)
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	require.Empty(t, captured())
 }
 
@@ -488,7 +488,7 @@ func TestRecordUnique_FlushesWithCountersInSameBatch(t *testing.T) {
 		CounterDelta{BytesIn: 100, BytesOut: 200})
 	a.RecordUnique(100, 7, 0xDEADBEEF)
 
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 	posts := captured()
 	require.Len(t, posts, 1)
 
@@ -528,7 +528,7 @@ func TestFormatTs_RoundTripsViaIngest(t *testing.T) {
 	unixMin := uint32(now.Unix() / 60)
 	a.Record(Key{TsUnixMin: unixMin, VhostID: 1, Method: "GET", Status: 200, Origin: OriginUpstream},
 		CounterDelta{LatBucket: 0})
-	a.flushOnce()
+	a.flushOnce(a.cfg.maxRetries)
 
 	posts := captured()
 	require.Len(t, posts, 1)

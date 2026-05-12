@@ -513,7 +513,7 @@ func (a *StatsApp) flushLoop() {
 	for {
 		select {
 		case <-t.C:
-			a.flushOnce()
+			a.flushOnce(a.cfg.maxRetries)
 		case <-a.stopCh:
 			// Shutdown flush gets a wider retry budget than a steady-
 			// state tick: Caddy hot-reloads create a new App instance
@@ -524,26 +524,17 @@ func (a *StatsApp) flushLoop() {
 			// fleet-wide data simultaneously. Up to 7 retries (~30s
 			// total backoff) gives more leeway, still well under Fly's
 			// 60s graceful-shutdown SIGKILL window.
-			a.flushOnceWithRetries(a.cfg.shutdownMaxRetries)
+			a.flushOnce(a.cfg.shutdownMaxRetries)
 			return
 		}
 	}
 }
 
-// flushOnceWithRetries is `flushOnce` with a temporary retry budget
-// override. Used by the shutdown path so a Stop() coinciding with an
-// ingest blip has more chances to deliver before dropping the buffer.
-func (a *StatsApp) flushOnceWithRetries(retries int) {
-	original := a.cfg.maxRetries
-	a.cfg.maxRetries = retries
-	a.flushOnce()
-	a.cfg.maxRetries = original
-}
-
 // flushOnce drains every shard's counter + uniques maps into one
-// combined snapshot, encodes both as gzipped NDJSON, and POSTs it.
-// Counter and uniques rows ride the same wire — the app-side ingest
-// controller distinguishes by row shape (presence of `client_hashes`).
+// combined snapshot, encodes both as gzipped NDJSON, and POSTs it
+// with `maxRetries` retries. Counter and uniques rows ride the same
+// wire — the app-side ingest controller distinguishes by row shape
+// (presence of `client_hashes`).
 //
 // Locks each shard in turn (not all-at-once) so a request hitting an
 // already-drained shard isn't blocked on the rest of the drain. The
@@ -551,7 +542,7 @@ func (a *StatsApp) flushOnceWithRetries(retries int) {
 // the old (about-to-be-shipped) snapshot or the fresh map depending on
 // timing, but either way its data ships within the next flush
 // interval. No data loss.
-func (a *StatsApp) flushOnce() {
+func (a *StatsApp) flushOnce(maxRetries int) {
 	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
 	if perShardInitialCap < 8 {
 		perShardInitialCap = 8
@@ -595,7 +586,7 @@ func (a *StatsApp) flushOnce() {
 		return
 	}
 
-	if err := a.shipWithRetry(body); err != nil {
+	if err := a.shipWithRetryN(body, maxRetries); err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
 		if a.logger != nil {
@@ -611,8 +602,17 @@ func (a *StatsApp) flushOnce() {
 // short exponential backoff. 4xx responses are NOT retried — they
 // indicate a wire-format/auth problem that retries won't fix.
 func (a *StatsApp) shipWithRetry(body []byte) error {
+	return a.shipWithRetryN(body, a.cfg.maxRetries)
+}
+
+// shipWithRetryN is like shipWithRetry but takes the retry budget as a
+// parameter — used by the shutdown path so a Stop() coinciding with an
+// ingest blip can use a wider retry window without temporarily mutating
+// `a.cfg` (which would be a goroutine-safety hazard if any other flush
+// path were ever to run concurrently).
+func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
 	var lastErr error
-	for attempt := 0; attempt <= a.cfg.maxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(backoff(attempt))
 		}
