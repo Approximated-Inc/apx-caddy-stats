@@ -85,6 +85,19 @@ type IngestConfig struct {
 	// regen would otherwise lose data on every Caddy machine
 	// simultaneously. Default 7.
 	ShutdownMaxRetries int `json:"shutdown_max_retries,omitempty"`
+
+	// L4SniMaxKeys caps the number of distinct SNIs the L4 SNI counter
+	// map holds per machine per minute. Set by Approximated's
+	// caddy_config_files.ex to 2 × the cluster's configured vhost count —
+	// generous enough that legitimate traffic never overflows; tight
+	// enough that an attacker spraying random SNIs hits the cap and rolls
+	// into the L4SniOverflowSNI sentinel rather than ballooning the map.
+	//
+	// 0 / unset disables L4 SNI tracking entirely; an L4 handler can be
+	// wired into the Caddy config but produces no rows until this field
+	// is populated. Lets the module roll out before the operator has
+	// provisioned the cap.
+	L4SniMaxKeys int `json:"l4_sni_max_keys,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -142,6 +155,19 @@ type StatsApp struct {
 	uniquesOverflow  uint64     // count of unique-hash inserts dropped due to MaxUniqueHashes
 	dropped          uint64     // count of rows dropped after retry exhaustion
 
+	// L4 SNI counters live in a single mutexed map (no sharding) because
+	// the cardinality is low — per cluster per minute, even under attack,
+	// we expect at most low-thousands of distinct SNIs. A single mutex
+	// across hundreds of cluster machines doesn't contend meaningfully
+	// at L4-connection rates (which are an order of magnitude below
+	// HTTP-request rates). Cap is a per-machine bound; the
+	// L4SniOverflowSNI sentinel captures dropped increments so the
+	// "overflow happened" signal isn't lost even when individual SNIs
+	// are.
+	l4SniMu       sync.Mutex
+	l4SniMap      map[L4SniKey]*l4SniCounter
+	l4SniOverflow uint64 // dropped-due-to-cap count for the current minute window
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -172,6 +198,10 @@ type ingestRuntime struct {
 	maxUniqueHashes    int
 	maxRetries         int
 	shutdownMaxRetries int
+	// l4SniMaxKeys is the per-minute cap on distinct SNIs in the L4 SNI
+	// counter map. 0 disables L4 SNI tracking; the handler still runs
+	// but RecordL4Sni is a no-op so no map memory is allocated.
+	l4SniMaxKeys int
 }
 
 // CaddyModule registers the app at root ID "apx_stats".
@@ -220,6 +250,12 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		maxUniqueHashes:    intDefault(a.Ingest.MaxUniqueHashes, 500_000),
 		maxRetries:         intDefault(a.Ingest.MaxRetries, 3),
 		shutdownMaxRetries: intDefault(a.Ingest.ShutdownMaxRetries, 7),
+		// L4 SNI cap: no default fallback. 0 means "disabled"; the
+		// Approximated control plane sets this explicitly via the
+		// `l4_sni_max_keys` config field based on the cluster's vhost
+		// count. Leaving it 0 in dev / before Phoenix wires it through
+		// is fine — RecordL4Sni becomes a no-op.
+		l4SniMaxKeys: a.Ingest.L4SniMaxKeys,
 	}
 
 	a.client = &http.Client{
@@ -240,6 +276,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 			uniques:  make(map[uniqueKey]map[uint64]struct{}),
 		}
 	}
+	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.stopCh = make(chan struct{})
 	return nil
 }
@@ -478,6 +515,94 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 	}
 }
 
+// RecordL4Sni increments the L4 SNI counter for the given SNI in the
+// current minute bucket. Called once per accepted L4 connection from the
+// `apx_l4_stats` handler.
+//
+// If the per-machine cap (`L4SniMaxKeys`) is set and the map is at the
+// cap with a new SNI key, the increment rolls into the
+// L4SniOverflowSNI sentinel counter — keeps the "overflow happened"
+// signal observable even when individual SNIs are dropped.
+//
+// `cap <= 0` disables tracking entirely (no-op). Empty `sni` collapses
+// to the `__empty__` sentinel so absence-of-SNI is distinguishable from
+// dropped-by-cap.
+func (a *StatsApp) RecordL4Sni(sni string) {
+	if a.cfg.l4SniMaxKeys <= 0 {
+		return
+	}
+	if sni == "" {
+		sni = L4SniEmptySNI
+	}
+
+	k := L4SniKey{
+		TsUnixMin: uint32(time.Now().Unix() / 60),
+		SNI:       sni,
+	}
+
+	a.l4SniMu.Lock()
+	defer a.l4SniMu.Unlock()
+
+	if c, ok := a.l4SniMap[k]; ok {
+		c.ConnectionCount++
+		return
+	}
+
+	if len(a.l4SniMap) >= a.cfg.l4SniMaxKeys {
+		// New key at cap — count toward the overflow sentinel for this
+		// minute. The sentinel itself is a real map entry once any
+		// overflow has happened.
+		overflowKey := L4SniKey{TsUnixMin: k.TsUnixMin, SNI: L4SniOverflowSNI}
+		if c, ok := a.l4SniMap[overflowKey]; ok {
+			c.ConnectionCount++
+		} else {
+			a.l4SniMap[overflowKey] = &l4SniCounter{ConnectionCount: 1}
+		}
+		atomic.AddUint64(&a.l4SniOverflow, 1)
+		return
+	}
+
+	a.l4SniMap[k] = &l4SniCounter{ConnectionCount: 1}
+}
+
+// l4SniSnapshot atomically swaps the in-memory L4 SNI map and returns
+// the previous contents. Called from flushOnce.
+func (a *StatsApp) l4SniSnapshot() map[L4SniKey]*l4SniCounter {
+	a.l4SniMu.Lock()
+	defer a.l4SniMu.Unlock()
+	if len(a.l4SniMap) == 0 {
+		return nil
+	}
+	snap := a.l4SniMap
+	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	return snap
+}
+
+// drainL4SniRows snapshots and renders rows for shipping. Rows with
+// `ConnectionCount <= 1` are dropped (single-occurrence SNIs dominate
+// the long tail under attack and have zero relevance to the auto-block
+// threshold — keeping them would multiply ingest volume by 10-100×).
+// The L4SniOverflowSNI sentinel row is always shipped if present —
+// losing visibility on cap-hit events would be worse than keeping a
+// 1-count overflow row.
+func (a *StatsApp) drainL4SniRows() map[L4SniKey]*l4SniCounter {
+	snap := a.l4SniSnapshot()
+	if snap == nil {
+		return nil
+	}
+	out := make(map[L4SniKey]*l4SniCounter, len(snap))
+	for k, c := range snap {
+		if c.ConnectionCount <= 1 && k.SNI != L4SniOverflowSNI {
+			continue
+		}
+		out[k] = c
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // maybeLogOverflow emits a single zap.Warn the first time the buffer
 // hits its cap, and at most once per minute thereafter. Without this,
 // overflow showed up only as a Prometheus counter — useful for graphs
@@ -569,14 +694,16 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		s.mu.Unlock()
 	}
 
-	if len(snap) == 0 && len(uniqSnap) == 0 {
+	l4SniSnap := a.drainL4SniRows()
+
+	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 {
 		return
 	}
 
-	rowCount := len(snap) + len(uniqSnap)
+	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, snap, uniqSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, snap, uniqSnap, l4SniSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -688,7 +815,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -701,10 +828,41 @@ func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqu
 			return nil, err
 		}
 	}
+	for k, c := range l4SniSnap {
+		if err := encodeL4SniRow(gz, proxyServerID, k, c); err != nil {
+			return nil, err
+		}
+	}
 	if err := gz.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// encodeL4SniRow writes one NDJSON line for an L4 SNI counter entry.
+// Format:
+//
+//	{"_type":"l4_sni","ts":"...","proxy_server_id":N,"sni":"...","connection_count":N}
+//
+// Matches the contract in
+// `lib/approximated_web/controllers/analytics_ingest_controller.ex` —
+// the `normalize_l4_sni_row/1` clause.
+func encodeL4SniRow(w *gzip.Writer, ps uint32, k L4SniKey, c *l4SniCounter) error {
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteByte('{')
+	writeString(&b, "_type", "l4_sni")
+	b.WriteByte(',')
+	writeString(&b, "ts", formatTs(k.TsUnixMin))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeString(&b, "sni", k.SNI)
+	b.WriteByte(',')
+	writeUint64(&b, "connection_count", c.ConnectionCount)
+	b.WriteString("}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
 }
 
 // encodeUniquesRow writes one NDJSON line for a uniques entry. Format:
