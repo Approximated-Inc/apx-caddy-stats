@@ -530,7 +530,7 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 func (a *StatsApp) RecordL4Sni(sni string) {
 	if a.cfg.l4SniMaxKeys <= 0 {
 		if a.logger != nil {
-			a.logger.Info("apx_stats: RecordL4Sni called but l4SniMaxKeys is 0 — skipping",
+			a.logger.Debug("apx_stats: RecordL4Sni called but l4SniMaxKeys is 0 — skipping",
 				zap.String("sni", sni))
 		}
 		return
@@ -540,7 +540,7 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	}
 
 	if a.logger != nil {
-		a.logger.Info("apx_stats: RecordL4Sni",
+		a.logger.Debug("apx_stats: RecordL4Sni",
 			zap.String("sni", sni),
 			zap.Int("cap", a.cfg.l4SniMaxKeys))
 	}
@@ -599,7 +599,7 @@ func (a *StatsApp) drainL4SniRows() map[L4SniKey]*l4SniCounter {
 	snap := a.l4SniSnapshot()
 	if snap == nil {
 		if a.logger != nil {
-			a.logger.Info("apx_stats: drainL4SniRows — l4SniMap was empty")
+			a.logger.Debug("apx_stats: drainL4SniRows — l4SniMap was empty")
 		}
 		return nil
 	}
@@ -613,7 +613,7 @@ func (a *StatsApp) drainL4SniRows() map[L4SniKey]*l4SniCounter {
 		out[k] = c
 	}
 	if a.logger != nil {
-		a.logger.Info("apx_stats: drainL4SniRows",
+		a.logger.Debug("apx_stats: drainL4SniRows",
 			zap.Int("pre_filter_keys", len(snap)),
 			zap.Int("dropped_count_le_1", dropped),
 			zap.Int("kept_keys", len(out)))
@@ -718,7 +718,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	l4SniSnap := a.drainL4SniRows()
 
 	if a.logger != nil {
-		a.logger.Info("apx_stats: flushOnce summary",
+		a.logger.Debug("apx_stats: flushOnce summary",
 			zap.Int("http_counter_rows", len(snap)),
 			zap.Int("uniques_rows", len(uniqSnap)),
 			zap.Int("l4_sni_rows_after_filter", len(l4SniSnap)))
