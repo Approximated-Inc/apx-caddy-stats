@@ -628,6 +628,15 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	if ip == "" {
 		return
 	}
+	// Canonicalize at entry so the same logical IP keys consistently
+	// across TopK, sampled set, prefix map, and (IP, SNI) breakdown.
+	// Unparseable inputs drop silently — caller is L4Handler, which
+	// already canonicalizes from cx.RemoteAddr(), so this is mostly
+	// belt-and-braces.
+	canonical, prefix, prefixLen, ok := canonicalIPAndPrefix(ip)
+	if !ok {
+		return
+	}
 	if sni == "" {
 		sni = L4SniEmptySNI
 	}
@@ -639,24 +648,22 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	// bounded epsilon but never under-counts — fine for threshold-
 	// based auto-block decisions downstream.
 	if a.l4IpTopk != nil {
-		a.l4IpTopk.Incr(ip)
+		a.l4IpTopk.Incr(canonical)
 	}
 
 	// Sampled-IPs set: hash-based 1-in-N sampling, deterministic per
 	// IP so the same IP across adjacent minutes lands the same way.
-	if sampleIP(ip) {
-		a.l4IpSampled[ip] = struct{}{}
+	if sampleIP(canonical) {
+		a.l4IpSampled[canonical] = struct{}{}
 	}
 
-	// Prefix counter. Compute the prefix at insert time — cheap and
-	// keeps the key compact.
-	if _, prefix, prefixLen, ok := canonicalIPAndPrefix(ip); ok {
-		pk := l4IpPrefixKeyString(prefix, prefixLen)
-		if _, exists := a.l4IpPrefix[pk]; exists || len(a.l4IpPrefix) < ipPrefixMapCap {
-			a.l4IpPrefix[pk]++
-		} else {
-			a.maybeLogL4IpOverflow("prefix")
-		}
+	// Prefix counter. Computed at insert via canonicalIPAndPrefix —
+	// cheap and keeps the key compact.
+	pk := l4IpPrefixKeyString(prefix, prefixLen)
+	if _, exists := a.l4IpPrefix[pk]; exists || len(a.l4IpPrefix) < ipPrefixMapCap {
+		a.l4IpPrefix[pk]++
+	} else {
+		a.maybeLogL4IpOverflow("prefix")
 	}
 
 	// (IP, SNI, outcome) breakdown. When an IP exceeds maxSnisPerIp
@@ -665,21 +672,21 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	// the map's per-IP fan-out.
 	outcome := L4IpOutcomeAllowed
 	effectiveSni := sni
-	count := a.l4IpSniPerIp[ip]
-	primaryKey := l4IpSniKeyString(ip, sni, outcome)
+	count := a.l4IpSniPerIp[canonical]
+	primaryKey := l4IpSniKeyString(canonical, sni, outcome)
 	if _, exists := a.l4IpSni[primaryKey]; !exists {
 		if count >= maxSnisPerIp {
 			// Per-IP cap hit. Fold into the overflow sentinel.
 			effectiveSni = L4IpOverflowSNI
 		} else {
 			// New (IP, SNI) under the per-IP cap.
-			a.l4IpSniPerIp[ip] = count + 1
+			a.l4IpSniPerIp[canonical] = count + 1
 		}
 	}
 
 	key := primaryKey
 	if effectiveSni != sni {
-		key = l4IpSniKeyString(ip, effectiveSni, outcome)
+		key = l4IpSniKeyString(canonical, effectiveSni, outcome)
 	}
 
 	if _, exists := a.l4IpSni[key]; exists || len(a.l4IpSni) < ipSniMapCap {
