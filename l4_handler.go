@@ -64,7 +64,41 @@ func (h *L4Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return ni
 func (h *L4Handler) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	sni := readSNIFromCx(cx)
 	h.app.RecordL4Sni(sni)
+
+	// Per-IP tracking (Phase 2). cx.RemoteAddr() returns the
+	// post-PROXY-protocol decoded client address — the Caddy config
+	// wires the proxy_protocol matcher strictly before this handler,
+	// so we don't need to re-parse PP headers here.
+	//
+	// Empty / unparseable IPs are dropped silently by RecordL4Ip
+	// (indicates a misconfigured route, not a workload signal).
+	ip := readClientIPFromCx(cx)
+	h.app.RecordL4Ip(ip, sni)
+
 	return next.Handle(cx)
+}
+
+// readClientIPFromCx pulls the canonical client IP string from
+// cx.RemoteAddr(). The address is "host:port" for TCP and
+// "[v6]:port" for IPv6 — canonicalIPAndPrefix handles the strip.
+// Returns "" if RemoteAddr is nil or the result is empty.
+func readClientIPFromCx(cx *layer4.Connection) string {
+	if cx == nil {
+		return ""
+	}
+	addr := cx.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	s := addr.String()
+	if s == "" {
+		return ""
+	}
+	canonical, _, _, ok := canonicalIPAndPrefix(s)
+	if !ok {
+		return ""
+	}
+	return canonical
 }
 
 // readSNIFromCx pulls the SNI from the Caddy replacer where

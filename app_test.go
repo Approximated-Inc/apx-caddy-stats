@@ -52,6 +52,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return a
 }

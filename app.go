@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/keilerkonzept/topk"
 	"go.uber.org/zap"
 )
 
@@ -168,6 +169,25 @@ type StatsApp struct {
 	l4SniMap      map[L4SniKey]*l4SniCounter
 	l4SniOverflow uint64 // dropped-due-to-cap count for the current minute window
 
+	// L4 per-IP tracking lives under one mutex separate from the L4 SNI
+	// mutex above. Same handler tick updates both — the L4 SNI path was
+	// kept on its own mutex to preserve Phase 1 behaviour under load and
+	// because the SNI map (size ~ vhost count) and the per-IP structures
+	// (size ~ unique-attacker count) tend to grow on different traffic
+	// shapes. Splitting locks lets each path stay tight.
+	//
+	// All four per-IP structures share l4IpMu so reads at flush see a
+	// consistent snapshot (the flush would otherwise interleave a TopK
+	// snapshot with a stale prefix map snapshot).
+	l4IpMu         sync.Mutex
+	l4IpTopk       *topk.Sketch       // heavy-hitter IPs; nil until provisioned
+	l4IpSampled    map[string]struct{} // sampled IPs (key: canonical IP string)
+	l4IpPrefix     map[string]uint64   // per-(prefix, prefix_len) counters
+	l4IpSni        map[string]uint64   // per-(IP, SNI, outcome) counters
+	l4IpSniPerIp   map[string]uint16   // distinct-SNI count per IP (cap = maxSnisPerIp)
+	l4IpOverflowLogMu sync.Mutex       // throttles per-IP overflow log
+	l4IpOverflowLoggedAt time.Time
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -277,8 +297,20 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return nil
+}
+
+// initL4IpState builds the four per-IP tracking structures. Split out
+// so tests + Provision share the same construction logic, and so the
+// post-flush reset can reuse it.
+func (a *StatsApp) initL4IpState() {
+	a.l4IpTopk = topk.New(topkSize)
+	a.l4IpSampled = make(map[string]struct{})
+	a.l4IpPrefix = make(map[string]uint64)
+	a.l4IpSni = make(map[string]uint64)
+	a.l4IpSniPerIp = make(map[string]uint16)
 }
 
 // shardForKey maps a Key to its owning shard. Uses an FNV-1a 64-bit
@@ -575,6 +607,161 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	a.l4SniMap[k] = &l4SniCounter{ConnectionCount: 1}
 }
 
+// RecordL4Ip updates the four per-IP tracking structures for one
+// accepted L4 connection. Called from the same handler tick as
+// RecordL4Sni — ip is the canonical post-PROXY-protocol client IP
+// pulled from cx.RemoteAddr().
+//
+// Empty / unparseable IPs are dropped silently — they indicate a
+// misconfigured route (handler wired before the proxy_protocol
+// matcher) and shouldn't pollute the per-IP signal with synthetic
+// rows. The Phase 1 SNI map already captures the "connection accepted
+// but no SNI/IP info" case via the L4SniEmptySNI sentinel.
+//
+// Gated by the same `l4SniMaxKeys > 0` check as RecordL4Sni — the
+// per-IP track and the per-SNI track ship together (or not at all).
+// No separate config knob per Phase 2 spec.
+func (a *StatsApp) RecordL4Ip(ip, sni string) {
+	if a.cfg.l4SniMaxKeys <= 0 {
+		return
+	}
+	if ip == "" {
+		return
+	}
+	if sni == "" {
+		sni = L4SniEmptySNI
+	}
+
+	a.l4IpMu.Lock()
+	defer a.l4IpMu.Unlock()
+
+	// TopK heavy-hitter sketch: always update. CMS over-counts by
+	// bounded epsilon but never under-counts — fine for threshold-
+	// based auto-block decisions downstream.
+	if a.l4IpTopk != nil {
+		a.l4IpTopk.Incr(ip)
+	}
+
+	// Sampled-IPs set: hash-based 1-in-N sampling, deterministic per
+	// IP so the same IP across adjacent minutes lands the same way.
+	if sampleIP(ip) {
+		a.l4IpSampled[ip] = struct{}{}
+	}
+
+	// Prefix counter. Compute the prefix at insert time — cheap and
+	// keeps the key compact.
+	if _, prefix, prefixLen, ok := canonicalIPAndPrefix(ip); ok {
+		pk := l4IpPrefixKeyString(prefix, prefixLen)
+		if _, exists := a.l4IpPrefix[pk]; exists || len(a.l4IpPrefix) < ipPrefixMapCap {
+			a.l4IpPrefix[pk]++
+		} else {
+			a.maybeLogL4IpOverflow("prefix")
+		}
+	}
+
+	// (IP, SNI, outcome) breakdown. When an IP exceeds maxSnisPerIp
+	// distinct SNIs, fold further SNIs into the per-IP overflow
+	// sentinel — keeps the (IP, outcome) signal intact while bounding
+	// the map's per-IP fan-out.
+	outcome := L4IpOutcomeAllowed
+	effectiveSni := sni
+	count := a.l4IpSniPerIp[ip]
+	primaryKey := l4IpSniKeyString(ip, sni, outcome)
+	if _, exists := a.l4IpSni[primaryKey]; !exists {
+		if count >= maxSnisPerIp {
+			// Per-IP cap hit. Fold into the overflow sentinel.
+			effectiveSni = L4IpOverflowSNI
+		} else {
+			// New (IP, SNI) under the per-IP cap.
+			a.l4IpSniPerIp[ip] = count + 1
+		}
+	}
+
+	key := primaryKey
+	if effectiveSni != sni {
+		key = l4IpSniKeyString(ip, effectiveSni, outcome)
+	}
+
+	if _, exists := a.l4IpSni[key]; exists || len(a.l4IpSni) < ipSniMapCap {
+		a.l4IpSni[key]++
+	} else {
+		a.maybeLogL4IpOverflow("ip_sni")
+	}
+}
+
+// maybeLogL4IpOverflow throttles per-IP overflow log lines — only one
+// log per minute per overflow kind, so an adversarial workload can't
+// flood the log even when both maps simultaneously cap out.
+func (a *StatsApp) maybeLogL4IpOverflow(kind string) {
+	now := time.Now()
+
+	a.l4IpOverflowLogMu.Lock()
+	if !a.l4IpOverflowLoggedAt.IsZero() && now.Sub(a.l4IpOverflowLoggedAt) < time.Minute {
+		a.l4IpOverflowLogMu.Unlock()
+		return
+	}
+	a.l4IpOverflowLoggedAt = now
+	a.l4IpOverflowLogMu.Unlock()
+
+	if a.logger != nil {
+		a.logger.Warn("apx_stats: per-IP map at cap — dropping new keys",
+			zap.String("map", kind),
+			zap.Int("ip_prefix_cap", ipPrefixMapCap),
+			zap.Int("ip_sni_cap", ipSniMapCap))
+	}
+}
+
+// l4IpSnapshot atomically captures all four per-IP structures and
+// resets them. Mirrors l4SniSnapshot — one critical section so the
+// shipped rows are a consistent point-in-time view.
+type l4IpSnap struct {
+	topkRows  []topkRow
+	sampled   map[string]struct{}
+	prefix    map[string]uint64
+	ipSni     map[string]uint64
+}
+
+type topkRow struct {
+	IP    string
+	Count uint64
+}
+
+func (a *StatsApp) l4IpSnapshot() l4IpSnap {
+	a.l4IpMu.Lock()
+	defer a.l4IpMu.Unlock()
+
+	var snap l4IpSnap
+	if a.l4IpTopk != nil {
+		sorted := a.l4IpTopk.SortedSlice()
+		if len(sorted) > 0 {
+			snap.topkRows = make([]topkRow, 0, len(sorted))
+			for _, it := range sorted {
+				if it.Count == 0 {
+					continue
+				}
+				snap.topkRows = append(snap.topkRows, topkRow{IP: it.Item, Count: uint64(it.Count)})
+			}
+		}
+		a.l4IpTopk.Reset()
+	}
+
+	snap.sampled = a.l4IpSampled
+	snap.prefix = a.l4IpPrefix
+	snap.ipSni = a.l4IpSni
+
+	a.l4IpSampled = make(map[string]struct{})
+	a.l4IpPrefix = make(map[string]uint64)
+	a.l4IpSni = make(map[string]uint64)
+	a.l4IpSniPerIp = make(map[string]uint16)
+
+	return snap
+}
+
+// l4IpSnapshot variants below are convenience-wrappers used by tests +
+// flushOnce. The flush emits four NDJSON `_type` row kinds:
+// l4_ip_topk, l4_ip_uniques_raw, l4_ip_prefix, l4_ip_sni — see
+// encoders below.
+
 // l4SniSnapshot atomically swaps the in-memory L4 SNI map and returns
 // the previous contents. Called from flushOnce.
 func (a *StatsApp) l4SniSnapshot() map[L4SniKey]*l4SniCounter {
@@ -716,22 +903,32 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	}
 
 	l4SniSnap := a.drainL4SniRows()
+	l4IpSnap := a.l4IpSnapshot()
+	flushTs := uint32(time.Now().Unix() / 60)
 
 	if a.logger != nil {
 		a.logger.Debug("apx_stats: flushOnce summary",
 			zap.Int("http_counter_rows", len(snap)),
 			zap.Int("uniques_rows", len(uniqSnap)),
-			zap.Int("l4_sni_rows_after_filter", len(l4SniSnap)))
+			zap.Int("l4_sni_rows_after_filter", len(l4SniSnap)),
+			zap.Int("l4_ip_topk_rows", len(l4IpSnap.topkRows)),
+			zap.Int("l4_ip_uniques_raw_rows", len(l4IpSnap.sampled)),
+			zap.Int("l4_ip_prefix_rows", len(l4IpSnap.prefix)),
+			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)))
 	}
 
-	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 {
+	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
+		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
+		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 {
 		return
 	}
 
-	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap)
+	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
+		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
+		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, snap, uniqSnap, l4SniSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -843,7 +1040,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -861,10 +1058,161 @@ func encodeBatch(proxyServerID uint32, snap map[Key]*Counter, uniqSnap map[uniqu
 			return nil, err
 		}
 	}
+	for _, r := range ipSnap.topkRows {
+		if err := encodeL4IpTopkRow(gz, proxyServerID, flushTs, r.IP, r.Count); err != nil {
+			return nil, err
+		}
+	}
+	for ip := range ipSnap.sampled {
+		if err := encodeL4IpUniquesRawRow(gz, proxyServerID, flushTs, ip); err != nil {
+			return nil, err
+		}
+	}
+	for k, count := range ipSnap.prefix {
+		prefix, prefixLen, ok := splitPrefixKey(k)
+		if !ok {
+			continue
+		}
+		if err := encodeL4IpPrefixRow(gz, proxyServerID, flushTs, prefix, prefixLen, count); err != nil {
+			return nil, err
+		}
+	}
+	for k, count := range ipSnap.ipSni {
+		ip, sni, outcome, ok := splitIpSniKey(k)
+		if !ok {
+			continue
+		}
+		if err := encodeL4IpSniRow(gz, proxyServerID, flushTs, ip, sni, outcome, count); err != nil {
+			return nil, err
+		}
+	}
 	if err := gz.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// splitPrefixKey reverses l4IpPrefixKeyString. Returns ok=false on
+// malformed inputs (shouldn't happen — they're built by code in this
+// package — but defensive).
+func splitPrefixKey(k string) (prefix string, prefixLen uint8, ok bool) {
+	i := strings.LastIndexByte(k, '|')
+	if i < 0 {
+		return "", 0, false
+	}
+	n, err := strconv.ParseUint(k[i+1:], 10, 8)
+	if err != nil {
+		return "", 0, false
+	}
+	return k[:i], uint8(n), true
+}
+
+// splitIpSniKey reverses l4IpSniKeyString. Same defensive parsing as
+// splitPrefixKey. Format: "ip|sni|outcome" — split on the last two
+// pipes (outcome and sni are ASCII-clean enum/hostname values, ip
+// never contains '|').
+func splitIpSniKey(k string) (ip, sni, outcome string, ok bool) {
+	last := strings.LastIndexByte(k, '|')
+	if last < 0 {
+		return "", "", "", false
+	}
+	prefix := k[:last]
+	outcome = k[last+1:]
+	mid := strings.LastIndexByte(prefix, '|')
+	if mid < 0 {
+		return "", "", "", false
+	}
+	return prefix[:mid], prefix[mid+1:], outcome, true
+}
+
+// encodeL4IpTopkRow emits one `_type: "l4_ip_topk"` NDJSON row. Format:
+//
+//	{"_type":"l4_ip_topk","ts":"...","proxy_server_id":N,"ip":"...","connection_count":N}
+func encodeL4IpTopkRow(w *gzip.Writer, ps, ts uint32, ip string, count uint64) error {
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteByte('{')
+	writeString(&b, "_type", "l4_ip_topk")
+	b.WriteByte(',')
+	writeString(&b, "ts", formatTs(ts))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeString(&b, "ip", ip)
+	b.WriteByte(',')
+	writeUint64(&b, "connection_count", count)
+	b.WriteString("}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
+}
+
+// encodeL4IpUniquesRawRow emits one `_type: "l4_ip_uniques_raw"` NDJSON
+// row — Phoenix builds the HLL approximation by scaling these sampled
+// uniques back up by sampleDenom.
+//
+//	{"_type":"l4_ip_uniques_raw","ts":"...","proxy_server_id":N,"ip":"..."}
+func encodeL4IpUniquesRawRow(w *gzip.Writer, ps, ts uint32, ip string) error {
+	var b strings.Builder
+	b.Grow(96)
+	b.WriteByte('{')
+	writeString(&b, "_type", "l4_ip_uniques_raw")
+	b.WriteByte(',')
+	writeString(&b, "ts", formatTs(ts))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeString(&b, "ip", ip)
+	b.WriteString("}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
+}
+
+// encodeL4IpPrefixRow emits one `_type: "l4_ip_prefix"` NDJSON row.
+//
+//	{"_type":"l4_ip_prefix","ts":"...","proxy_server_id":N,"prefix":"...","prefix_len":24|56,"connection_count":N}
+func encodeL4IpPrefixRow(w *gzip.Writer, ps, ts uint32, prefix string, prefixLen uint8, count uint64) error {
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteByte('{')
+	writeString(&b, "_type", "l4_ip_prefix")
+	b.WriteByte(',')
+	writeString(&b, "ts", formatTs(ts))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeString(&b, "prefix", prefix)
+	b.WriteByte(',')
+	writeUint16(&b, "prefix_len", uint16(prefixLen))
+	b.WriteByte(',')
+	writeUint64(&b, "connection_count", count)
+	b.WriteString("}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
+}
+
+// encodeL4IpSniRow emits one `_type: "l4_ip_sni"` NDJSON row.
+//
+//	{"_type":"l4_ip_sni","ts":"...","proxy_server_id":N,"ip":"...","sni":"...","outcome":"allowed","connection_count":N}
+func encodeL4IpSniRow(w *gzip.Writer, ps, ts uint32, ip, sni, outcome string, count uint64) error {
+	var b strings.Builder
+	b.Grow(160)
+	b.WriteByte('{')
+	writeString(&b, "_type", "l4_ip_sni")
+	b.WriteByte(',')
+	writeString(&b, "ts", formatTs(ts))
+	b.WriteByte(',')
+	writeUint32(&b, "proxy_server_id", ps)
+	b.WriteByte(',')
+	writeString(&b, "ip", ip)
+	b.WriteByte(',')
+	writeString(&b, "sni", sni)
+	b.WriteByte(',')
+	writeString(&b, "outcome", outcome)
+	b.WriteByte(',')
+	writeUint64(&b, "connection_count", count)
+	b.WriteString("}\n")
+	_, err := w.Write([]byte(b.String()))
+	return err
 }
 
 // encodeL4SniRow writes one NDJSON line for an L4 SNI counter entry.
