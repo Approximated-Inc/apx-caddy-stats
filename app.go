@@ -895,6 +895,34 @@ func (a *StatsApp) drainL4SniRows() map[L4SniKey]*l4SniCounter {
 	return out
 }
 
+// fingerprintSnapshot atomically takes and resets the (ja3,ja4,outcome)
+// map. Unlike drainL4SniRows it keeps EVERY key (count >= 1): the 3d
+// auto-block worker uses threshold=1, so a single known-bad observation
+// must ship.
+func (a *StatsApp) fingerprintSnapshot() map[fingerprintKey]*fingerprintCounter {
+	a.fpMu.Lock()
+	defer a.fpMu.Unlock()
+	if len(a.fpMap) == 0 {
+		return nil
+	}
+	out := a.fpMap
+	a.fpMap = make(map[fingerprintKey]*fingerprintCounter)
+	return out
+}
+
+// fingerprintIpSnapshot atomically takes and resets the (ja4,ip) map,
+// keeping every key (count >= 1) — same rationale as fingerprintSnapshot.
+func (a *StatsApp) fingerprintIpSnapshot() map[fingerprintIpKey]*fingerprintCounter {
+	a.fpMu.Lock()
+	defer a.fpMu.Unlock()
+	if len(a.fpIpMap) == 0 {
+		return nil
+	}
+	out := a.fpIpMap
+	a.fpIpMap = make(map[fingerprintIpKey]*fingerprintCounter)
+	return out
+}
+
 // maybeLogOverflow emits a single zap.Warn the first time the buffer
 // hits its cap, and at most once per minute thereafter. Without this,
 // overflow showed up only as a Prometheus counter — useful for graphs
@@ -988,6 +1016,8 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 
 	l4SniSnap := a.drainL4SniRows()
 	l4IpSnap := a.l4IpSnapshot()
+	fpSnap := a.fingerprintSnapshot()
+	fpIpSnap := a.fingerprintIpSnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
 
 	if a.logger != nil {
@@ -998,21 +1028,25 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_ip_topk_rows", len(l4IpSnap.topkRows)),
 			zap.Int("l4_ip_uniques_raw_rows", len(l4IpSnap.sampled)),
 			zap.Int("l4_ip_prefix_rows", len(l4IpSnap.prefix)),
-			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)))
+			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)),
+			zap.Int("l4_fingerprint_rows", len(fpSnap)),
+			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)))
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
-		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 {
+		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
+		len(fpSnap) == 0 && len(fpIpSnap) == 0 {
 		return
 	}
 
 	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
-		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni)
+		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
+		len(fpSnap) + len(fpIpSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1124,7 +1158,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1167,6 +1201,19 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 			continue
 		}
 		if err := encodeL4IpSniRow(gz, proxyServerID, flushTs, ip, sni, outcome, count); err != nil {
+			return nil, err
+		}
+	}
+	for k, c := range fpSnap {
+		// Each fingerprint key carries its own TsUnixMin (record-time
+		// minute); pass it, not flushTs, so minute-boundary connections
+		// bucket correctly.
+		if err := encodeL4FingerprintRow(gz, proxyServerID, k.TsUnixMin, k.JA3, k.JA4, k.Outcome, c.ConnectionCount); err != nil {
+			return nil, err
+		}
+	}
+	for k, c := range fpIpSnap {
+		if err := encodeL4FingerprintIpRow(gz, proxyServerID, k.TsUnixMin, k.JA4, k.IP, c.ConnectionCount); err != nil {
 			return nil, err
 		}
 	}

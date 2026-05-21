@@ -113,3 +113,56 @@ func TestRecordFingerprint_emptyIPSkipsIPMap(t *testing.T) {
 		t.Errorf("fpIpMap size = %d, want 0 (empty IP must skip the join row)", nip)
 	}
 }
+
+func TestFingerprintSnapshot_shipsAllCountGE1(t *testing.T) {
+	a := newTestAppWithFP(5000, 10000)
+	ja4 := "t13d1516h2_8daaf6152771_e5627efa2ab1"
+	ja3a := "0123456789abcdef0123456789abcdef"
+	ja3b := "fedcba9876543210fedcba9876543210"
+	// One key seen twice (count 2) and a distinct key seen once (count 1):
+	// the count-1 key must NOT be dropped (unlike drainL4SniRows).
+	a.RecordFingerprint(ja3a, ja4, "1.2.3.4")
+	a.RecordFingerprint(ja3a, ja4, "1.2.3.4")
+	a.RecordFingerprint(ja3b, ja4, "1.2.3.4")
+	snap := a.fingerprintSnapshot()
+	if len(snap) != 2 {
+		t.Fatalf("snapshot size = %d, want 2 (count==1 key must NOT be dropped)", len(snap))
+	}
+	min := timeNowUnixMin()
+	if c := snap[fingerprintKey{TsUnixMin: min, JA3: ja3a, JA4: ja4, Outcome: FingerprintOutcomeAllowed}]; c == nil || c.ConnectionCount != 2 {
+		t.Errorf("count-2 key = %+v, want ConnectionCount 2", c)
+	}
+	if c := snap[fingerprintKey{TsUnixMin: min, JA3: ja3b, JA4: ja4, Outcome: FingerprintOutcomeAllowed}]; c == nil || c.ConnectionCount != 1 {
+		t.Errorf("count-1 key = %+v, want ConnectionCount 1 (must ship)", c)
+	}
+	// map reset after snapshot
+	a.fpMu.Lock()
+	n := len(a.fpMap)
+	a.fpMu.Unlock()
+	if n != 0 {
+		t.Errorf("fpMap not reset after snapshot: %d", n)
+	}
+}
+
+func TestFingerprintIpSnapshot_resetsAndKeepsCount1(t *testing.T) {
+	a := newTestAppWithFP(5000, 10000)
+	ja4 := "t13d1516h2_8daaf6152771_e5627efa2ab1"
+	a.RecordFingerprint("0123456789abcdef0123456789abcdef", ja4, "1.2.3.4") // records one (ja4, ip) pair
+	snap := a.fingerprintIpSnapshot()
+	if len(snap) != 1 {
+		t.Fatalf("fingerprintIpSnapshot size = %d, want 1 (count==1 must NOT be dropped)", len(snap))
+	}
+	// verify the single entry has count 1
+	for _, c := range snap {
+		if c.ConnectionCount != 1 {
+			t.Errorf("ConnectionCount = %d, want 1", c.ConnectionCount)
+		}
+	}
+	// map reset after snapshot
+	a.fpMu.Lock()
+	n := len(a.fpIpMap)
+	a.fpMu.Unlock()
+	if n != 0 {
+		t.Errorf("fpIpMap not reset after snapshot: %d", n)
+	}
+}
