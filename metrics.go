@@ -74,3 +74,21 @@ var metricDroppedRows = promauto.NewCounter(
 		Help: "apx-caddy-stats rows dropped due to retry exhaustion",
 	},
 )
+
+// metricFingerprintOverflows counts new (ja3,ja4,outcome) keys dropped
+// because the per-minute fingerprint map was at cap.
+var metricFingerprintOverflows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_l4_fingerprint_bounded_map_overflows_total",
+		Help: "Distinct (ja3,ja4,outcome) keys dropped because the per-minute fingerprint map was at cap.",
+	},
+)
+
+// metricFingerprintIpOverflows counts new (ja4,ip) keys dropped
+// because the per-minute fingerprint-ip map was at cap.
+var metricFingerprintIpOverflows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_l4_fingerprint_ip_bounded_map_overflows_total",
+		Help: "Distinct (ja4,ip) keys dropped because the per-minute fingerprint-ip map was at cap.",
+	},
+)

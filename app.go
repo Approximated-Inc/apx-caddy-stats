@@ -43,10 +43,10 @@ type AppRef interface {
 // recorded as the bucket index that fires (LatBucket); we don't pass a
 // 16-element array per request — only one bucket is ever non-zero.
 type CounterDelta struct {
-	BytesIn       uint64
-	BytesOut      uint64
-	DurationUs    uint64
-	LatBucket     int // 0..HistogramBuckets-1
+	BytesIn    uint64
+	BytesOut   uint64
+	DurationUs uint64
+	LatBucket  int // 0..HistogramBuckets-1
 }
 
 // IngestConfig describes where the app POSTs counter batches.
@@ -99,6 +99,12 @@ type IngestConfig struct {
 	// is populated. Lets the module roll out before the operator has
 	// provisioned the cap.
 	L4SniMaxKeys int `json:"l4_sni_max_keys,omitempty"`
+
+	// FingerprintMaxKeys / FingerprintIpMaxKeys cap distinct keys per machine
+	// per minute for the two fingerprint maps. 0 disables the track (no-op
+	// RecordFingerprint, no map allocation) — the per-cluster kill switch.
+	FingerprintMaxKeys   int `json:"fingerprint_max_keys,omitempty"`
+	FingerprintIpMaxKeys int `json:"fingerprint_ip_max_keys,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -179,14 +185,23 @@ type StatsApp struct {
 	// All four per-IP structures share l4IpMu so reads at flush see a
 	// consistent snapshot (the flush would otherwise interleave a TopK
 	// snapshot with a stale prefix map snapshot).
-	l4IpMu         sync.Mutex
-	l4IpTopk       *topk.Sketch       // heavy-hitter IPs; nil until provisioned
-	l4IpSampled    map[string]struct{} // sampled IPs (key: canonical IP string)
-	l4IpPrefix     map[string]uint64   // per-(prefix, prefix_len) counters
-	l4IpSni        map[string]uint64   // per-(IP, SNI, outcome) counters
-	l4IpSniPerIp   map[string]uint16   // distinct-SNI count per IP (cap = maxSnisPerIp)
-	l4IpOverflowLogMu sync.Mutex       // throttles per-IP overflow log
+	l4IpMu               sync.Mutex
+	l4IpTopk             *topk.Sketch        // heavy-hitter IPs; nil until provisioned
+	l4IpSampled          map[string]struct{} // sampled IPs (key: canonical IP string)
+	l4IpPrefix           map[string]uint64   // per-(prefix, prefix_len) counters
+	l4IpSni              map[string]uint64   // per-(IP, SNI, outcome) counters
+	l4IpSniPerIp         map[string]uint16   // distinct-SNI count per IP (cap = maxSnisPerIp)
+	l4IpOverflowLogMu    sync.Mutex          // throttles per-IP overflow log
 	l4IpOverflowLoggedAt time.Time
+
+	// Fingerprint maps: (ja3, ja4, outcome) traffic and (ja4, ip) join.
+	// Both share a single mutex (fpMu) — cardinality is low (bounded by
+	// FingerprintMaxKeys/FingerprintIpMaxKeys), so one lock is fine.
+	fpMu         sync.Mutex
+	fpMap        map[fingerprintKey]*fingerprintCounter
+	fpIpMap      map[fingerprintIpKey]*fingerprintCounter
+	fpOverflow   uint64 // dropped distinct (ja3,ja4,outcome) keys at cap
+	fpIpOverflow uint64 // dropped distinct (ja4,ip) keys at cap
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -222,6 +237,11 @@ type ingestRuntime struct {
 	// counter map. 0 disables L4 SNI tracking; the handler still runs
 	// but RecordL4Sni is a no-op so no map memory is allocated.
 	l4SniMaxKeys int
+	// fingerprintMaxKeys / fingerprintIpMaxKeys are the per-minute caps
+	// on distinct keys in the two fingerprint maps. 0 disables the
+	// respective track; RecordFingerprint is a no-op per map when 0.
+	fingerprintMaxKeys   int
+	fingerprintIpMaxKeys int
 }
 
 // CaddyModule registers the app at root ID "apx_stats".
@@ -276,6 +296,11 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		// count. Leaving it 0 in dev / before Phoenix wires it through
 		// is fine — RecordL4Sni becomes a no-op.
 		l4SniMaxKeys: a.Ingest.L4SniMaxKeys,
+		// Fingerprint caps: same convention as l4SniMaxKeys — no default
+		// fallback, 0 means "disabled". The control plane sets these
+		// explicitly via fingerprint_max_keys / fingerprint_ip_max_keys.
+		fingerprintMaxKeys:   a.Ingest.FingerprintMaxKeys,
+		fingerprintIpMaxKeys: a.Ingest.FingerprintIpMaxKeys,
 	}
 
 	a.client = &http.Client{
@@ -298,6 +323,12 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.initL4IpState()
+	if a.cfg.fingerprintMaxKeys > 0 {
+		a.fpMap = make(map[fingerprintKey]*fingerprintCounter)
+	}
+	if a.cfg.fingerprintIpMaxKeys > 0 {
+		a.fpIpMap = make(map[fingerprintIpKey]*fingerprintCounter)
+	}
 	a.stopCh = make(chan struct{})
 	return nil
 }
@@ -547,6 +578,11 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 	}
 }
 
+// timeNowUnixMin returns the current Unix time truncated to the minute.
+// Used by RecordL4Sni, RecordFingerprint, and their tests to pin minute
+// buckets deterministically.
+func timeNowUnixMin() uint32 { return uint32(time.Now().Unix() / 60) }
+
 // RecordL4Sni increments the L4 SNI counter for the given SNI in the
 // current minute bucket. Called once per accepted L4 connection from the
 // `apx_l4_stats` handler.
@@ -578,7 +614,7 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	}
 
 	k := L4SniKey{
-		TsUnixMin: uint32(time.Now().Unix() / 60),
+		TsUnixMin: timeNowUnixMin(),
 		SNI:       sni,
 	}
 
@@ -696,6 +732,47 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	}
 }
 
+// RecordFingerprint counts one accepted L4 TLS connection into both
+// fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
+// connection from the FingerprintHandler hot path.
+//
+// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja3/ja4
+// or ip are dropped per-map. Caps are enforced at insert; new keys past
+// the cap are dropped + counted in the overflow metric (NO sentinel row).
+func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
+	tsMin := timeNowUnixMin()
+
+	// --- (ja3, ja4, outcome) traffic map ---
+	if a.cfg.fingerprintMaxKeys > 0 && ja3 != "" && ja4 != "" {
+		k := fingerprintKey{TsUnixMin: tsMin, JA3: ja3, JA4: ja4, Outcome: FingerprintOutcomeAllowed}
+		a.fpMu.Lock()
+		if c, ok := a.fpMap[k]; ok {
+			c.ConnectionCount++
+		} else if len(a.fpMap) >= a.cfg.fingerprintMaxKeys {
+			a.fpOverflow++
+			metricFingerprintOverflows.Inc()
+		} else {
+			a.fpMap[k] = &fingerprintCounter{ConnectionCount: 1}
+		}
+		a.fpMu.Unlock()
+	}
+
+	// --- (ja4, ip) join map ---
+	if a.cfg.fingerprintIpMaxKeys > 0 && ja4 != "" && ip != "" {
+		k := fingerprintIpKey{TsUnixMin: tsMin, JA4: ja4, IP: ip}
+		a.fpMu.Lock()
+		if c, ok := a.fpIpMap[k]; ok {
+			c.ConnectionCount++
+		} else if len(a.fpIpMap) >= a.cfg.fingerprintIpMaxKeys {
+			a.fpIpOverflow++
+			metricFingerprintIpOverflows.Inc()
+		} else {
+			a.fpIpMap[k] = &fingerprintCounter{ConnectionCount: 1}
+		}
+		a.fpMu.Unlock()
+	}
+}
+
 // maybeLogL4IpOverflow throttles per-IP overflow log lines — only one
 // log per minute per overflow kind, so an adversarial workload can't
 // flood the log even when both maps simultaneously cap out.
@@ -722,10 +799,10 @@ func (a *StatsApp) maybeLogL4IpOverflow(kind string) {
 // resets them. Mirrors l4SniSnapshot — one critical section so the
 // shipped rows are a consistent point-in-time view.
 type l4IpSnap struct {
-	topkRows  []topkRow
-	sampled   map[string]struct{}
-	prefix    map[string]uint64
-	ipSni     map[string]uint64
+	topkRows []topkRow
+	sampled  map[string]struct{}
+	prefix   map[string]uint64
+	ipSni    map[string]uint64
 }
 
 type topkRow struct {
