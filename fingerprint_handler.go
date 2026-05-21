@@ -57,7 +57,31 @@ func (h *FingerprintHandler) Provision(ctx caddy.Context) error {
 func (h *FingerprintHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
 
 func (h *FingerprintHandler) Handle(cx *layer4.Connection, next layer4.Handler) error {
-	return next.Handle(cx) // recording added in 3c.5
+	ja3 := cxVarString(cx, TLSJA3Var)
+	ja4 := cxVarString(cx, TLSJA4Var)
+
+	// D4: no fingerprint vars — connection didn't traverse l4tls.MatchTLS; skip.
+	if ja3 == "" || ja4 == "" {
+		if h.logger != nil {
+			h.logger.Debug("apx_l4_fingerprint_stats: no tls_ja3/tls_ja4 on connection — skipping")
+		}
+		return next.Handle(cx)
+	}
+
+	ip := readClientIPFromCx(cx) // reuse l4_handler.go helper (D3); "" if unparseable
+	h.app.RecordFingerprint(ja3, ja4, ip)
+
+	return next.Handle(cx)
+}
+
+// cxVarString reads a string cx var set by l4tls.MatchTLS (Chunk 3b).
+// cx.GetVar returns any; nil (var unset) asserts to "" cleanly.
+func cxVarString(cx *layer4.Connection, name string) string {
+	if cx == nil {
+		return ""
+	}
+	s, _ := cx.GetVar(name).(string)
+	return s
 }
 
 // Interface guards.
