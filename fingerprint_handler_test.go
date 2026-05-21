@@ -4,6 +4,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/mholt/caddy-l4/layer4"
 	"go.uber.org/zap"
 )
@@ -120,5 +121,15 @@ func TestFingerprintHandler_skipsWhenOnlyJA3(t *testing.T) {
 	a.fpMu.Unlock()
 	if n != 0 {
 		t.Errorf("recorded %d rows when only ja3 was set; want 0 (either empty => skip)", n)
+	}
+}
+
+func TestFingerprintHandler_registered(t *testing.T) {
+	m, err := caddy.GetModule("layer4.handlers.apx_l4_fingerprint_stats")
+	if err != nil {
+		t.Fatalf("module not registered: %v", err)
+	}
+	if _, ok := m.New().(*FingerprintHandler); !ok {
+		t.Errorf("registered module is not *FingerprintHandler")
 	}
 }
