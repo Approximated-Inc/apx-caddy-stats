@@ -105,6 +105,13 @@ type IngestConfig struct {
 	// RecordFingerprint, no map allocation) — the per-cluster kill switch.
 	FingerprintMaxKeys   int `json:"fingerprint_max_keys,omitempty"`
 	FingerprintIpMaxKeys int `json:"fingerprint_ip_max_keys,omitempty"`
+
+	// CorazaMaxEvents caps the raw per-(request, rule) WAF detection slice
+	// per flush window. 0 / unset falls back to CorazaMaxEventsDefault
+	// (this track does NOT disable on 0 — the WAF config's
+	// `SecAuditLogType apx_stats` is what gates recording). Events beyond
+	// the cap are dropped and counted in corazaOverflow.
+	CorazaMaxEvents int `json:"coraza_max_events,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -203,6 +210,16 @@ type StatsApp struct {
 	fpOverflow   uint64 // dropped distinct (ja3,ja4,outcome) keys at cap
 	fpIpOverflow uint64 // dropped distinct (ja4,ip) keys at cap
 
+	// Coraza WAF detections. Unlike the fingerprint track (which
+	// AGGREGATES into a counter map), detections are RAW per-(request,
+	// rule) events — each fired rule on each request is its own row. The
+	// store is therefore a capped append-only SLICE, drained at flush.
+	// Overflow drops the new event and counts it (matching the
+	// fingerprint overflow accounting, but for a slice not a counter map).
+	corazaMu       sync.Mutex
+	corazaEvents   []corazaDetection
+	corazaOverflow uint64 // dropped events because the slice was at cap
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -242,6 +259,9 @@ type ingestRuntime struct {
 	// respective track; RecordFingerprint is a no-op per map when 0.
 	fingerprintMaxKeys   int
 	fingerprintIpMaxKeys int
+	// corazaMaxEvents caps the raw detection slice per flush window.
+	// Always non-zero after Provision (defaults to CorazaMaxEventsDefault).
+	corazaMaxEvents int
 }
 
 // CaddyModule registers the app at root ID "apx_stats".
@@ -301,6 +321,10 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		// explicitly via fingerprint_max_keys / fingerprint_ip_max_keys.
 		fingerprintMaxKeys:   a.Ingest.FingerprintMaxKeys,
 		fingerprintIpMaxKeys: a.Ingest.FingerprintIpMaxKeys,
+		// Coraza detection slice cap: unlike the fingerprint caps, 0 does
+		// NOT disable — it falls back to the default. Recording is gated by
+		// the WAF config selecting the apx_stats audit writer, not by this.
+		corazaMaxEvents: intDefault(a.Ingest.CorazaMaxEvents, CorazaMaxEventsDefault),
 	}
 
 	a.client = &http.Client{
@@ -330,6 +354,11 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		a.fpIpMap = make(map[fingerprintIpKey]*fingerprintCounter)
 	}
 	a.stopCh = make(chan struct{})
+
+	// Publish this app to the global Coraza audit-log writer. The writer
+	// is registered by a package init() with no app handle, so it loads
+	// the live app from here. Set last, after all state is initialized.
+	corazaApp.Store(a)
 	return nil
 }
 
@@ -406,6 +435,11 @@ func (a *StatsApp) Start() error {
 
 // Stop signals the flush goroutine to drain once more and exit.
 func (a *StatsApp) Stop() error {
+	// Detach from the Coraza audit-log writer first so in-flight Write
+	// calls no-op rather than record into an app that's draining. Only
+	// clear if we're still the published app (a hot-reload may have
+	// already swapped in the replacement app's pointer at its Provision).
+	corazaApp.CompareAndSwap(a, nil)
 	a.stopOnce.Do(func() { close(a.stopCh) })
 	a.wg.Wait()
 	return nil
@@ -923,6 +957,37 @@ func (a *StatsApp) fingerprintIpSnapshot() map[fingerprintIpKey]*fingerprintCoun
 	return out
 }
 
+// RecordCorazaDetection appends one raw per-(request, rule) WAF detection
+// event to the capped slice. Called by the Coraza audit-log writer once
+// per fired rule per transaction. NOT aggregated — every call adds a row.
+// At the cap the event is dropped and counted (corazaOverflow + metric),
+// mirroring the fingerprint overflow accounting but for a slice.
+func (a *StatsApp) RecordCorazaDetection(ev corazaDetection) {
+	a.corazaMu.Lock()
+	if a.cfg.corazaMaxEvents > 0 && len(a.corazaEvents) >= a.cfg.corazaMaxEvents {
+		a.corazaOverflow++
+		a.corazaMu.Unlock()
+		metricCorazaOverflows.Inc()
+		return
+	}
+	a.corazaEvents = append(a.corazaEvents, ev)
+	a.corazaMu.Unlock()
+}
+
+// corazaSnapshot atomically takes and resets the detection slice. Returns
+// nil when empty so flushOnce can cheaply skip the track. The returned
+// slice is owned by the caller (the app starts a fresh one).
+func (a *StatsApp) corazaSnapshot() []corazaDetection {
+	a.corazaMu.Lock()
+	defer a.corazaMu.Unlock()
+	if len(a.corazaEvents) == 0 {
+		return nil
+	}
+	out := a.corazaEvents
+	a.corazaEvents = nil
+	return out
+}
+
 // maybeLogOverflow emits a single zap.Warn the first time the buffer
 // hits its cap, and at most once per minute thereafter. Without this,
 // overflow showed up only as a Prometheus counter — useful for graphs
@@ -1018,6 +1083,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	l4IpSnap := a.l4IpSnapshot()
 	fpSnap := a.fingerprintSnapshot()
 	fpIpSnap := a.fingerprintIpSnapshot()
+	corazaSnap := a.corazaSnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
 
 	if a.logger != nil {
@@ -1030,23 +1096,24 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_ip_prefix_rows", len(l4IpSnap.prefix)),
 			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)),
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
-			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)))
+			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
+			zap.Int("coraza_detection_rows", len(corazaSnap)))
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
-		len(fpSnap) == 0 && len(fpIpSnap) == 0 {
+		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 {
 		return
 	}
 
 	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
-		len(fpSnap) + len(fpIpSnap)
+		len(fpSnap) + len(fpIpSnap) + len(corazaSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1158,7 +1225,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1214,6 +1281,12 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	}
 	for k, c := range fpIpSnap {
 		if err := encodeL4FingerprintIpRow(gz, proxyServerID, k.TsUnixMin, k.JA4, k.IP, c.ConnectionCount); err != nil {
+			return nil, err
+		}
+	}
+	for i := range corazaSnap {
+		// Raw per-(request, rule) events — one row each, no aggregation.
+		if err := encodeCorazaDetectionRow(gz, corazaSnap[i], proxyServerID); err != nil {
 			return nil, err
 		}
 	}

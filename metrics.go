@@ -92,3 +92,12 @@ var metricFingerprintIpOverflows = promauto.NewCounter(
 		Help: "Distinct (ja4,ip) keys dropped because the per-minute fingerprint-ip map was at cap.",
 	},
 )
+
+// metricCorazaOverflows counts raw WAF detection events dropped because
+// the per-flush-window detection slice was at its cap.
+var metricCorazaOverflows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_coraza_detection_slice_overflows_total",
+		Help: "Raw Coraza detection events dropped because the per-flush detection slice was at cap.",
+	},
+)
