@@ -39,6 +39,7 @@ type corazaDetection struct {
 	RequestURI    string
 	RequestMethod string
 	RequestHost   string
+	ClientIP      string // audit-log Transaction().ClientIP() — real PROXY-derived client IP (NOT XFF)
 	MatchData     string // truncated to corazaMatchDataMaxBytes
 	WasBlocked    bool
 }
@@ -101,10 +102,10 @@ func truncateBytes(s string, max int) string {
 //	{"_type":"coraza_detection","ts":"...","proxy_server_id":N,"vhost_id":N,
 //	 "rule_id":N,"severity":"...","rule_msg":"...","tags":[...],"tx_id":"...",
 //	 "request_uri":"...","request_method":"...","request_host":"...",
-//	 "match_data":"...","was_blocked":N}
+//	 "client_ip":"...","match_data":"...","was_blocked":N}
 func encodeCorazaDetectionRow(w *gzip.Writer, ev corazaDetection, proxyServerID uint32) error {
 	var b strings.Builder
-	b.Grow(384)
+	b.Grow(448)
 	b.WriteByte('{')
 	writeString(&b, "_type", "coraza_detection")
 	b.WriteByte(',')
@@ -129,6 +130,8 @@ func encodeCorazaDetectionRow(w *gzip.Writer, ev corazaDetection, proxyServerID 
 	writeString(&b, "request_method", ev.RequestMethod)
 	b.WriteByte(',')
 	writeString(&b, "request_host", ev.RequestHost)
+	b.WriteByte(',')
+	writeString(&b, "client_ip", ev.ClientIP)
 	b.WriteByte(',')
 	writeString(&b, "match_data", ev.MatchData)
 	b.WriteByte(',')

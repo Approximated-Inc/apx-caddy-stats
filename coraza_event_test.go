@@ -25,6 +25,7 @@ func TestEncodeCorazaDetectionRow(t *testing.T) {
 		RequestURI:    "/login?id=1",
 		RequestMethod: "POST",
 		RequestHost:   "example.com",
+		ClientIP:      "203.0.113.7",
 		MatchData:     "Matched Data: ' OR 1=1",
 		WasBlocked:    true,
 	}
@@ -37,9 +38,13 @@ func TestEncodeCorazaDetectionRow(t *testing.T) {
 		`","proxy_server_id":89,"vhost_id":7,"rule_id":942100,"severity":"CRITICAL",` +
 		`"rule_msg":"SQL Injection Attack Detected","tags":["application-multi","attack-sqli"],` +
 		`"tx_id":"abc123","request_uri":"/login?id=1","request_method":"POST",` +
-		`"request_host":"example.com","match_data":"Matched Data: ' OR 1=1","was_blocked":1}` + "\n"
+		`"request_host":"example.com","client_ip":"203.0.113.7",` +
+		`"match_data":"Matched Data: ' OR 1=1","was_blocked":1}` + "\n"
 	if got != want {
 		t.Errorf("row =\n  %q\nwant\n  %q", got, want)
+	}
+	if !strings.Contains(got, `"client_ip":"203.0.113.7"`) {
+		t.Errorf("expected client_ip in row, got %q", got)
 	}
 }
 
@@ -67,6 +72,9 @@ func TestEncodeCorazaDetectionRow_emptyTagsAndNotBlocked(t *testing.T) {
 	}
 	if !strings.Contains(got, `"vhost_id":0`) {
 		t.Errorf("expected vhost_id 0, got %q", got)
+	}
+	if !strings.Contains(got, `"client_ip":""`) {
+		t.Errorf("expected empty client_ip, got %q", got)
 	}
 }
 

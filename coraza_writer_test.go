@@ -24,6 +24,7 @@ type fakeTx struct {
 	id          string
 	serverID    string
 	interrupted bool
+	clientIP    string
 	req         corazaReqView
 }
 
@@ -31,6 +32,7 @@ func (t *fakeTx) UnixTimestamp() int64   { return t.unixTs }
 func (t *fakeTx) ID() string             { return t.id }
 func (t *fakeTx) ServerID() string       { return t.serverID }
 func (t *fakeTx) IsInterrupted() bool    { return t.interrupted }
+func (t *fakeTx) ClientIP() string       { return t.clientIP }
 func (t *fakeTx) Request() corazaReqView { return t.req }
 
 type fakeReq struct {
@@ -186,6 +188,35 @@ func TestBuildCorazaEvents_wasBlockedFalse(t *testing.T) {
 	evs := buildCorazaEvents(al)
 	if evs[0].WasBlocked {
 		t.Errorf("WasBlocked = true, want false (not interrupted)")
+	}
+}
+
+func TestBuildCorazaEvents_clientIPFromTxNotXFF(t *testing.T) {
+	// R12: the event's ClientIP must come from the audit-log transaction's
+	// ClientIP() (PROXY-derived), NEVER from the X-Forwarded-For header,
+	// which an attacker can forge. Set tx.ClientIP to a known value and
+	// carry a DIFFERENT poison XFF on the request; the event must reflect
+	// the tx value, proving XFF is never consulted.
+	al := &fakeAuditLog{
+		tx: &fakeTx{
+			unixTs:   1_700_000_000_000_000_000,
+			id:       "txIP",
+			serverID: "example.com",
+			clientIP: "198.51.100.9",
+			req: &fakeReq{
+				method:  "POST",
+				uri:     "/x",
+				headers: map[string][]string{"X-Forwarded-For": {"1.2.3.4"}},
+			},
+		},
+		messages: []corazaMsgView{&fakeMsg{data: &fakeMsgData{id: 1, severity: types.RuleSeverityWarning}}},
+	}
+	evs := buildCorazaEvents(al)
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if evs[0].ClientIP != "198.51.100.9" {
+		t.Errorf("ClientIP = %q, want 198.51.100.9 (tx IP, not XFF)", evs[0].ClientIP)
 	}
 }
 

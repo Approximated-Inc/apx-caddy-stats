@@ -57,6 +57,7 @@ type (
 		ID() string
 		ServerID() string
 		IsInterrupted() bool
+		ClientIP() string
 		Request() corazaReqView
 	}
 	corazaReqView interface {
@@ -112,6 +113,7 @@ func (t txAdapter) UnixTimestamp() int64 { return t.tx.UnixTimestamp() }
 func (t txAdapter) ID() string           { return t.tx.ID() }
 func (t txAdapter) ServerID() string     { return t.tx.ServerID() }
 func (t txAdapter) IsInterrupted() bool  { return t.tx.IsInterrupted() }
+func (t txAdapter) ClientIP() string     { return t.tx.ClientIP() }
 func (t txAdapter) Request() corazaReqView {
 	req := t.tx.Request()
 	if req == nil {
@@ -169,6 +171,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	wasBlocked := tx.IsInterrupted()
 	txID := tx.ID()
 	host := tx.ServerID()
+	clientIP := tx.ClientIP()
 
 	var method, uri string
 	var vhostID uint32
@@ -202,6 +205,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			RequestURI:    uri,
 			RequestMethod: method,
 			RequestHost:   host,
+			ClientIP:      clientIP,
 			MatchData:     truncateBytes(d.Data(), corazaMatchDataMaxBytes),
 			WasBlocked:    wasBlocked,
 		})
