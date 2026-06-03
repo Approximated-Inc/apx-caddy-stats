@@ -31,6 +31,10 @@ type AppRef interface {
 	// RecordUnique adds a hashed client identifier to the per-(vhost,minute)
 	// set used by the unique-clients metric. No-op if HashSalt is empty.
 	RecordUnique(tsUnixMin, vhostID uint32, hash uint64)
+	// RecordL7Httpversion increments the per-(vhost, http_version,
+	// status_bucket) counter for the current minute. No-op when the L7
+	// track is disabled (gated internally).
+	RecordL7Httpversion(vhostID uint32, httpVersion string, statusBucket uint8)
 	// HashSalt returns the deployment salt for hashing client identifiers.
 	// Empty string disables the unique-clients tracking entirely.
 	HashSalt() string
@@ -112,6 +116,21 @@ type IngestConfig struct {
 	// `SecAuditLogType apx_stats` is what gates recording). Events beyond
 	// the cap are dropped and counted in corazaOverflow.
 	CorazaMaxEvents int `json:"coraza_max_events,omitempty"`
+
+	// L7 gates the per-request HTTP-version track (l7_httpversion rows).
+	// Phase 4a's Phoenix control plane emits only `{enabled:true}` when the
+	// l7stats feature is on; absent / `{enabled:false}` keeps the track OFF
+	// (RecordL7Httpversion is a no-op, no map memory). MaxKeys is reserved
+	// for 4b knobs and defaults generously here — see
+	// L7HttpversionMaxKeysDefault.
+	L7 *L7Config `json:"l7,omitempty"`
+}
+
+// L7Config gates and bounds the L7 HTTP-version track. 4a Phoenix emits
+// only `{enabled:true}`; MaxKeys is a reserved 4b knob (0 → default).
+type L7Config struct {
+	Enabled bool `json:"enabled,omitempty"`
+	MaxKeys int  `json:"max_keys,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -220,6 +239,17 @@ type StatsApp struct {
 	corazaEvents   []corazaDetection
 	corazaOverflow uint64 // dropped events because the slice was at cap
 
+	// L7 HTTP-version counters live in a single mutexed map (no sharding) —
+	// same low-cardinality rationale as the l4SniMap block: distinct keys
+	// per machine per minute are bounded by active-vhosts × ~4 versions ×
+	// ~6 status buckets, which a single mutex handles fine at HTTP-request
+	// rates spread across the existing per-request work. At cap a new key
+	// is DROPPED and counted in l7HvOverflow (no sentinel row — see
+	// RecordL7Httpversion).
+	l7HvMu       sync.Mutex
+	l7HvMap      map[L7HttpversionKey]*l7HttpversionCounter
+	l7HvOverflow uint64 // dropped-due-to-cap count for the current minute window
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -262,7 +292,23 @@ type ingestRuntime struct {
 	// corazaMaxEvents caps the raw detection slice per flush window.
 	// Always non-zero after Provision (defaults to CorazaMaxEventsDefault).
 	corazaMaxEvents int
+	// l7Enabled gates the L7 HTTP-version track. False → RecordL7Httpversion
+	// is a no-op (no map memory). Set from ingest.l7.enabled (default OFF).
+	l7Enabled bool
+	// l7HvMaxKeys is the per-machine-per-minute cap on distinct keys in the
+	// L7 HTTP-version map. Always positive when l7Enabled (defaults to
+	// L7HttpversionMaxKeysDefault).
+	l7HvMaxKeys int
 }
+
+// L7HttpversionMaxKeysDefault is a per-machine-per-minute OOM backstop for
+// the L7 HTTP-version map — NOT the real cardinality bound. Distinct keys
+// per minute ≈ the machine's active vhosts × ~4 HTTP versions × ~6 status
+// buckets; the row shape is low-per-vhost, so this is sized generously and
+// a legitimate fleet never approaches it. The Phoenix-side
+// L7HttpversionBuffer ETS buffer is the aggregate backstop; keep this in
+// sync with that rationale.
+const L7HttpversionMaxKeysDefault = 100_000
 
 // CaddyModule registers the app at root ID "apx_stats".
 func (*StatsApp) CaddyModule() caddy.ModuleInfo {
@@ -325,6 +371,10 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		// NOT disable — it falls back to the default. Recording is gated by
 		// the WAF config selecting the apx_stats audit writer, not by this.
 		corazaMaxEvents: intDefault(a.Ingest.CorazaMaxEvents, CorazaMaxEventsDefault),
+		// L7 HTTP-version track: gated by ingest.l7.enabled (default OFF).
+		// MaxKeys is a generous OOM backstop, not the real bound (0 → default).
+		l7Enabled:   a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
+		l7HvMaxKeys: intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
 	}
 
 	a.client = &http.Client{
@@ -346,6 +396,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
 	a.initL4IpState()
 	if a.cfg.fingerprintMaxKeys > 0 {
 		a.fpMap = make(map[fingerprintKey]*fingerprintCounter)
@@ -675,6 +726,61 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	}
 
 	a.l4SniMap[k] = &l4SniCounter{ConnectionCount: 1}
+}
+
+// RecordL7Httpversion increments the per-(vhost, http_version,
+// status_bucket) counter for the current minute bucket. Called once per
+// recorded HTTP request from the StatsHandler (see handler.record). The
+// call is internally gated, so it's a cheap no-op when the L7 track is off.
+//
+// No-op when `!l7Enabled` or the cap is non-positive. At the cap with a
+// new key, the row is DROPPED and counted in l7HvOverflow — deliberately
+// NO `__overflow__` sentinel row (this models RecordFingerprint, not
+// RecordL4Sni). The Phoenix `normalize_l7_httpversion_row` whitelist is
+// `http_version in ~w(1.1 2 3 other)`, so a sentinel http_version would be
+// rejected at ingest — silent loss plus wasted bytes. Do NOT "fix" this
+// into a sentinel.
+func (a *StatsApp) RecordL7Httpversion(vhostID uint32, httpVersion string, statusBucket uint8) {
+	if !a.cfg.l7Enabled || a.cfg.l7HvMaxKeys <= 0 {
+		return
+	}
+
+	k := L7HttpversionKey{
+		TsUnixMin:    timeNowUnixMin(),
+		VhostID:      vhostID,
+		HttpVersion:  httpVersion,
+		StatusBucket: statusBucket,
+	}
+
+	a.l7HvMu.Lock()
+	defer a.l7HvMu.Unlock()
+
+	if c, ok := a.l7HvMap[k]; ok {
+		c.RequestCount++
+		return
+	}
+
+	if len(a.l7HvMap) >= a.cfg.l7HvMaxKeys {
+		// New key at cap — drop + count (fingerprint model, no sentinel).
+		atomic.AddUint64(&a.l7HvOverflow, 1)
+		return
+	}
+
+	a.l7HvMap[k] = &l7HttpversionCounter{RequestCount: 1}
+}
+
+// l7HvSnapshot atomically swaps the in-memory L7 HTTP-version map and
+// returns the previous contents. Mirrors l4SniSnapshot. Called from
+// flushOnce; returns nil when empty so the flush can cheaply skip the track.
+func (a *StatsApp) l7HvSnapshot() map[L7HttpversionKey]*l7HttpversionCounter {
+	a.l7HvMu.Lock()
+	defer a.l7HvMu.Unlock()
+	if len(a.l7HvMap) == 0 {
+		return nil
+	}
+	snap := a.l7HvMap
+	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
+	return snap
 }
 
 // RecordL4Ip updates the four per-IP tracking structures for one
@@ -1084,6 +1190,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	fpSnap := a.fingerprintSnapshot()
 	fpIpSnap := a.fingerprintIpSnapshot()
 	corazaSnap := a.corazaSnapshot()
+	l7HvSnap := a.l7HvSnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
 
 	if a.logger != nil {
@@ -1097,23 +1204,25 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)),
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
 			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
-			zap.Int("coraza_detection_rows", len(corazaSnap)))
+			zap.Int("coraza_detection_rows", len(corazaSnap)),
+			zap.Int("l7_httpversion_rows", len(l7HvSnap)))
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
-		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 {
+		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
+		len(l7HvSnap) == 0 {
 		return
 	}
 
 	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
-		len(fpSnap) + len(fpIpSnap) + len(corazaSnap)
+		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) + len(l7HvSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, l7HvSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1225,7 +1334,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, l7HvSnap map[L7HttpversionKey]*l7HttpversionCounter) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1287,6 +1396,11 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	for i := range corazaSnap {
 		// Raw per-(request, rule) events — one row each, no aggregation.
 		if err := encodeCorazaDetectionRow(gz, corazaSnap[i], proxyServerID); err != nil {
+			return nil, err
+		}
+	}
+	for k, c := range l7HvSnap {
+		if err := encodeL7HttpversionRow(gz, proxyServerID, k, c); err != nil {
 			return nil, err
 		}
 	}
@@ -1621,6 +1735,15 @@ func intDefault(n, def int) int {
 		return n
 	}
 	return def
+}
+
+// l7MaxKeysFromConfig pulls the L7 MaxKeys knob, returning 0 when the L7
+// block is absent so intDefault falls back to L7HttpversionMaxKeysDefault.
+func l7MaxKeysFromConfig(c *L7Config) int {
+	if c == nil {
+		return 0
+	}
+	return c.MaxKeys
 }
 
 func durationMs(n, def int) time.Duration {

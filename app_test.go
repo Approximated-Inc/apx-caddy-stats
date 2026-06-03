@@ -43,6 +43,8 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		maxUniqueHashes: intDefault(a.Ingest.MaxUniqueHashes, 500_000),
 		maxRetries:      a.Ingest.MaxRetries,
 		l4SniMaxKeys:    a.Ingest.L4SniMaxKeys,
+		l7Enabled:       a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
+		l7HvMaxKeys:     intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	for i := range a.shards {
@@ -52,6 +54,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
 	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return a
