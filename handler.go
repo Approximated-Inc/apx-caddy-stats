@@ -126,16 +126,6 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
-	// L7 HTTP-version track. Reuses the SAME vhost_id + status the counter
-	// recorded, so the bucket derives from the status that reached the
-	// client. Internally gated by l7Enabled — a cheap no-op when off.
-	h.app.RecordL7Httpversion(k.VhostID, httpVersionOrUnknown(r), statusBucket(k.Status))
-
-	// L7 per-path track. Same vhost_id + status the counter recorded;
-	// pathBucket buckets the raw request path. Gated inside RecordL7Path
-	// (nil recorder / breaker latch) — a cheap no-op when off.
-	h.app.RecordL7Path(k.VhostID, pathBucket(r.URL.Path), statusBucket(k.Status))
-
 	// request_events: one raw row per SERVED request. Skip WAF-blocked /
 	// rate-limited requests (apx_block_reason set) — those live in
 	// request_counters + coraza_detection_events. A backend 404/5xx IS served

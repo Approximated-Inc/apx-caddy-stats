@@ -20,8 +20,6 @@ type fakeApp struct {
 	mu        sync.Mutex
 	records   []recorded
 	uniques   []recordedUnique
-	l7hv      []recordedL7Hv
-	l7path    []recordedL7Path
 	reqEvents []requestEventRow
 	psID      uint32
 	hashSalt  string
@@ -38,18 +36,6 @@ type recordedUnique struct {
 	hash      uint64
 }
 
-type recordedL7Hv struct {
-	vhostID      uint32
-	httpVersion  string
-	statusBucket uint8
-}
-
-type recordedL7Path struct {
-	vhostID      uint32
-	pathBucket   string
-	statusBucket uint8
-}
-
 func (f *fakeApp) Record(k Key, d CounterDelta) {
 	f.mu.Lock()
 	f.records = append(f.records, recorded{k, d})
@@ -62,18 +48,6 @@ func (f *fakeApp) RecordUnique(tsUnixMin, vhostID uint32, hash uint64) {
 	f.mu.Unlock()
 }
 
-func (f *fakeApp) RecordL7Httpversion(vhostID uint32, httpVersion string, statusBucket uint8) {
-	f.mu.Lock()
-	f.l7hv = append(f.l7hv, recordedL7Hv{vhostID, httpVersion, statusBucket})
-	f.mu.Unlock()
-}
-
-func (f *fakeApp) RecordL7Path(vhostID uint32, pathBucket string, statusBucket uint8) {
-	f.mu.Lock()
-	f.l7path = append(f.l7path, recordedL7Path{vhostID, pathBucket, statusBucket})
-	f.mu.Unlock()
-}
-
 func (f *fakeApp) RecordRequestEvent(row requestEventRow) {
 	f.mu.Lock()
 	f.reqEvents = append(f.reqEvents, row)
@@ -83,22 +57,6 @@ func (f *fakeApp) RecordRequestEvent(row requestEventRow) {
 func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
-
-func (f *fakeApp) l7hvSnapshot() []recordedL7Hv {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]recordedL7Hv, len(f.l7hv))
-	copy(out, f.l7hv)
-	return out
-}
-
-func (f *fakeApp) l7pathSnapshot() []recordedL7Path {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]recordedL7Path, len(f.l7path))
-	copy(out, f.l7path)
-	return out
-}
 
 func (f *fakeApp) reqEventSnapshot() []requestEventRow {
 	f.mu.Lock()
@@ -330,101 +288,6 @@ func TestServeHTTP_DropsRowWhenVhostIDAbsent(t *testing.T) {
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
 	require.Empty(t, app.snapshot())
-}
-
-func TestServeHTTP_RecordsL7Httpversion(t *testing.T) {
-	// The handler always calls RecordL7Httpversion with the request's
-	// HTTP version and the bucketed final status; the enable gate lives in
-	// the real app, not the handler. httptest.NewRequest builds an HTTP/1.1
-	// request, so http_version must be "1.1" and a 200 → bucket 2.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
-	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
-
-	l7 := app.l7hvSnapshot()
-	require.Len(t, l7, 1)
-	require.Equal(t, uint32(100), l7[0].vhostID)
-	require.Equal(t, "1.1", l7[0].httpVersion)
-	require.Equal(t, uint8(2), l7[0].statusBucket)
-}
-
-func TestServeHTTP_L7HttpversionUsesFinalStatusBucket(t *testing.T) {
-	// Bucket derives from the SAME status the counter recorded — the
-	// synthesized 502 on a reverse_proxy failure, not the recorder default.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
-	w := httptest.NewRecorder()
-	failingNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
-	})
-	_ = h.ServeHTTP(w, r, failingNext)
-
-	l7 := app.l7hvSnapshot()
-	require.Len(t, l7, 1)
-	require.Equal(t, uint8(5), l7[0].statusBucket, "502 → bucket 5")
-}
-
-func TestServeHTTP_DropsL7HttpversionWhenVhostIDAbsent(t *testing.T) {
-	// No vhost_id → record() early-returns before the L7 call.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
-	require.Empty(t, app.l7hvSnapshot())
-}
-
-func TestServeHTTP_RecordsL7Path(t *testing.T) {
-	// The handler always calls RecordL7Path with the request's bucketed path
-	// and the bucketed final status; the enable/latch gate lives in the real
-	// app, not the handler. /api/users → "/api/users", 200 → bucket 2.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := newRequestWithReplacer("GET", "/api/users", "100", upstreamSelected("10.0.0.1:8080"))
-	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
-
-	paths := app.l7pathSnapshot()
-	require.Len(t, paths, 1)
-	require.Equal(t, uint32(100), paths[0].vhostID)
-	require.Equal(t, "/api/users", paths[0].pathBucket)
-	require.Equal(t, uint8(2), paths[0].statusBucket)
-}
-
-func TestServeHTTP_L7PathUsesFinalStatusBucket(t *testing.T) {
-	// Path-row status bucket derives from the SAME status the counter
-	// recorded — the synthesized 502 on a reverse_proxy failure.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := newRequestWithReplacer("GET", "/api/users", "100", upstreamSelected("10.0.0.1:8080"))
-	w := httptest.NewRecorder()
-	failingNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
-	})
-	_ = h.ServeHTTP(w, r, failingNext)
-
-	paths := app.l7pathSnapshot()
-	require.Len(t, paths, 1)
-	require.Equal(t, uint8(5), paths[0].statusBucket, "502 → bucket 5")
-}
-
-func TestServeHTTP_DropsL7PathWhenVhostIDAbsent(t *testing.T) {
-	// No vhost_id → record() early-returns before the L7 path call.
-	app := &fakeApp{}
-	h := &StatsHandler{app: app}
-
-	r := httptest.NewRequest("GET", "/api/users", nil)
-	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
-	require.Empty(t, app.l7pathSnapshot())
 }
 
 func TestResponseBytes_ZeroOnHijackedConnection(t *testing.T) {

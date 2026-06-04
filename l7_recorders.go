@@ -111,8 +111,8 @@ func (p *perVhostFair) record(vhostID uint32, pathBucket string, statusBucket ui
 
 // drain snapshots every shard's tracked vhosts into l7PathRows stamped with
 // drainMin, then resets each shard (fresh map + overflow 0) under the lock —
-// snapshot-and-replace, like l7HvSnapshot. Returns the rows plus the total
-// overflow (vhosts rejected at cap) across all shards this window.
+// snapshot-and-replace. Returns the rows plus the total overflow (vhosts
+// rejected at cap) across all shards this window.
 func (p *perVhostFair) drain(drainMin uint32) ([]l7PathRow, uint64) {
 	var rows []l7PathRow
 	var totalOverflow uint64
