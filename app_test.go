@@ -55,6 +55,15 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
+	if a.cfg.l7Enabled && a.Ingest.L7 != nil &&
+		a.Ingest.L7.TrackedVhosts > 0 && a.Ingest.L7.PathsPerVhost > 0 {
+		a.l7Path = newPerVhostFair(
+			a.Ingest.L7.TrackedVhosts,
+			a.Ingest.L7.PathsPerVhost,
+			a.Ingest.L7.PathSketchWidth,
+			a.Ingest.L7.PathSketchDepth,
+		)
+	}
 	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return a
@@ -316,6 +325,57 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 		}
 		_, present := row[histKey(i)]
 		require.False(t, present, "bucket %s should be omitted (zero count)", histKey(i))
+	}
+}
+
+func TestFlushOnce_ShipsL7PathRows(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "shared-secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 64, PathsPerVhost: 16}
+		})
+	require.NotNil(t, a.l7Path)
+
+	for i := 0; i < 3; i++ {
+		a.RecordL7Path(100, "/api/users", 2)
+	}
+
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+
+	var pathRows []map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "l7_path" {
+			pathRows = append(pathRows, r)
+		}
+	}
+	require.Len(t, pathRows, 1, "one l7_path row for the single (vhost,path,status) key")
+	row := pathRows[0]
+	require.Equal(t, float64(42), row["proxy_server_id"])
+	require.Equal(t, float64(100), row["vhost_id"])
+	require.Equal(t, "/api/users", row["path_bucket"])
+	require.Equal(t, float64(2), row["status_bucket"])
+	require.Equal(t, float64(3), row["request_count"])
+}
+
+func TestFlushOnce_NoL7PathRowsWhenRecorderNil(t *testing.T) {
+	// No l7 config → recorder nil → flush ships no l7_path rows (and doesn't
+	// trip the all-empty early return for an otherwise-populated batch).
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	require.Nil(t, a.l7Path)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	for _, r := range posts[0].rows {
+		require.NotEqual(t, "l7_path", r["_type"])
 	}
 }
 
