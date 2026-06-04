@@ -145,6 +145,15 @@ type L7Config struct {
 	PathsPerVhost   int `json:"paths_per_vhost,omitempty"`
 	PathSketchWidth int `json:"path_sketch_width,omitempty"`
 	PathSketchDepth int `json:"path_sketch_depth,omitempty"`
+
+	// BreakerOverflowThreshold / BreakerWindows tune the drain-time edge
+	// circuit breaker (G4). When a flush window's total path overflow stays
+	// >= BreakerOverflowThreshold for BreakerWindows consecutive windows, the
+	// recorder latches to aggregate-only (per-vhost path recording stops;
+	// request_counters still flow). Auto-recovers on a below-threshold window.
+	// 0 / unset → defaults (L7PathBreakerThresholdDefault / WindowsDefault).
+	BreakerOverflowThreshold int `json:"breaker_overflow_threshold,omitempty"`
+	BreakerWindows           int `json:"breaker_windows,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -273,6 +282,18 @@ type StatsApp struct {
 	l7Path              *perVhostFair
 	l7PathAggregateOnly atomic.Bool
 
+	// l7PathOverflowStreak counts consecutive flush windows whose total path
+	// overflow stayed >= the breaker threshold. Touched ONLY in flushOnce
+	// (via evaluateL7PathBreaker), which the flush ticker runs single-
+	// threaded — so a plain int needs no atomic / no mutex. The latch it
+	// drives (l7PathAggregateOnly) IS atomic because the handler hot path
+	// Loads it lock-free.
+	l7PathOverflowStreak int
+	// l7BreakerLogMu / l7BreakerLoggedAt throttle the degrade log line so a
+	// sustained path-spray attack can't flood logs. Mirrors maybeLogL4IpOverflow.
+	l7BreakerLogMu    sync.Mutex
+	l7BreakerLoggedAt time.Time
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -322,7 +343,23 @@ type ingestRuntime struct {
 	// L7 HTTP-version map. Always positive when l7Enabled (defaults to
 	// L7HttpversionMaxKeysDefault).
 	l7HvMaxKeys int
+	// l7PathBreakerThreshold / l7PathBreakerWindows tune the drain-time edge
+	// circuit breaker (see evaluateL7PathBreaker). Resolved with defaults
+	// (L7PathBreakerThresholdDefault / L7PathBreakerWindowsDefault).
+	l7PathBreakerThreshold int
+	l7PathBreakerWindows   int
 }
+
+// L7PathBreakerThresholdDefault is the per-window path-overflow count that,
+// when sustained for L7PathBreakerWindowsDefault consecutive flush windows,
+// trips the edge circuit breaker to aggregate-only. Sized so steady-state
+// traffic never trips it; only a sustained path-spray attack (vhosts rejected
+// at the per-shard recorder cap, window after window) latches the breaker.
+const L7PathBreakerThresholdDefault = 50_000
+
+// L7PathBreakerWindowsDefault is the number of consecutive over-threshold flush
+// windows required before the breaker latches — debounces a one-off spike.
+const L7PathBreakerWindowsDefault = 3
 
 // L7HttpversionMaxKeysDefault is a per-machine-per-minute OOM backstop for
 // the L7 HTTP-version map — NOT the real cardinality bound. Distinct keys
@@ -398,6 +435,9 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		// MaxKeys is a generous OOM backstop, not the real bound (0 → default).
 		l7Enabled:   a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
 		l7HvMaxKeys: intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
+		// Edge circuit breaker (G4) — resolve with defaults. 0/≤0 → default.
+		l7PathBreakerThreshold: intDefault(l7BreakerThresholdFromConfig(a.Ingest.L7), L7PathBreakerThresholdDefault),
+		l7PathBreakerWindows:   intDefault(l7BreakerWindowsFromConfig(a.Ingest.L7), L7PathBreakerWindowsDefault),
 	}
 
 	a.client = &http.Client{
@@ -836,6 +876,60 @@ func (a *StatsApp) RecordL7Path(vhostID uint32, pathBucket string, statusBucket 
 	a.l7Path.record(vhostID, pathBucket, statusBucket)
 }
 
+// evaluateL7PathBreaker runs once per flush (single-threaded under the flush
+// ticker) with the window's total path overflow. It latches
+// l7PathAggregateOnly on sustained overflow — over-threshold for
+// l7PathBreakerWindows consecutive windows — and auto-recovers on the first
+// below-threshold window. Mutates l7PathOverflowStreak + the latch only;
+// returns nothing. The handler reads the latch lock-free via atomic.Bool.
+func (a *StatsApp) evaluateL7PathBreaker(overflow uint64) {
+	threshold := uint64(a.cfg.l7PathBreakerThreshold)
+	if threshold > 0 && overflow >= threshold {
+		a.l7PathOverflowStreak++
+		if a.l7PathOverflowStreak >= a.cfg.l7PathBreakerWindows && !a.l7PathAggregateOnly.Load() {
+			a.l7PathAggregateOnly.Store(true)
+			metricL7PathAggregateOnly.Set(1)
+			a.maybeLogL7BreakerDegrade(overflow)
+		}
+		return
+	}
+
+	// Below threshold (or breaker disabled): reset the streak and recover.
+	a.l7PathOverflowStreak = 0
+	if a.l7PathAggregateOnly.Load() {
+		a.l7PathAggregateOnly.Store(false)
+		metricL7PathAggregateOnly.Set(0)
+		if a.logger != nil {
+			a.logger.Info("apx_stats: L7 path recorder recovered — per-vhost recording resumed",
+				zap.Uint32("proxy_server_id", a.ProxyServerIDValue),
+				zap.Uint64("overflow", overflow))
+		}
+	}
+}
+
+// maybeLogL7BreakerDegrade emits the degrade warning at most once per minute
+// so a sustained attack that re-trips the breaker can't flood logs. Mirrors
+// maybeLogL4IpOverflow's throttle.
+func (a *StatsApp) maybeLogL7BreakerDegrade(overflow uint64) {
+	now := time.Now()
+
+	a.l7BreakerLogMu.Lock()
+	if !a.l7BreakerLoggedAt.IsZero() && now.Sub(a.l7BreakerLoggedAt) < time.Minute {
+		a.l7BreakerLogMu.Unlock()
+		return
+	}
+	a.l7BreakerLoggedAt = now
+	a.l7BreakerLogMu.Unlock()
+
+	if a.logger != nil {
+		a.logger.Warn("apx_stats: L7 path recorder degraded to aggregate-only — sustained overflow",
+			zap.Uint32("proxy_server_id", a.ProxyServerIDValue),
+			zap.Uint64("overflow", overflow),
+			zap.Int("threshold", a.cfg.l7PathBreakerThreshold),
+			zap.Int("windows", a.cfg.l7PathBreakerWindows))
+	}
+}
+
 // RecordL4Ip updates the four per-IP tracking structures for one
 // accepted L4 connection. Called from the same handler tick as
 // RecordL4Sni — ip is the canonical post-PROXY-protocol client IP
@@ -1253,6 +1347,9 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	var l7PathOverflow uint64
 	if a.l7Path != nil {
 		l7PathRows, l7PathOverflow = a.l7Path.drain(flushTs)
+		// G4: drain-time edge circuit breaker. Latches the recorder to
+		// aggregate-only under sustained per-window overflow; auto-recovers.
+		a.evaluateL7PathBreaker(l7PathOverflow)
 	}
 
 	if a.logger != nil {
@@ -1815,6 +1912,23 @@ func l7MaxKeysFromConfig(c *L7Config) int {
 		return 0
 	}
 	return c.MaxKeys
+}
+
+// l7BreakerThresholdFromConfig / l7BreakerWindowsFromConfig pull the G4
+// breaker knobs, returning 0 when the L7 block is absent so intDefault falls
+// back to the package defaults.
+func l7BreakerThresholdFromConfig(c *L7Config) int {
+	if c == nil {
+		return 0
+	}
+	return c.BreakerOverflowThreshold
+}
+
+func l7BreakerWindowsFromConfig(c *L7Config) int {
+	if c == nil {
+		return 0
+	}
+	return c.BreakerWindows
 }
 
 func durationMs(n, def int) time.Duration {

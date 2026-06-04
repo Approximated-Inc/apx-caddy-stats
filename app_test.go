@@ -36,15 +36,17 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.secret = secret
 	a.cfg = ingestRuntime{
-		url:             a.Ingest.URL,
-		authHeader:      "apx-key",
-		flushInterval:   time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
-		maxBuffer:       a.Ingest.MaxBufferRows,
-		maxUniqueHashes: intDefault(a.Ingest.MaxUniqueHashes, 500_000),
-		maxRetries:      a.Ingest.MaxRetries,
-		l4SniMaxKeys:    a.Ingest.L4SniMaxKeys,
-		l7Enabled:       a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
-		l7HvMaxKeys:     intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
+		url:                    a.Ingest.URL,
+		authHeader:             "apx-key",
+		flushInterval:          time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
+		maxBuffer:              a.Ingest.MaxBufferRows,
+		maxUniqueHashes:        intDefault(a.Ingest.MaxUniqueHashes, 500_000),
+		maxRetries:             a.Ingest.MaxRetries,
+		l4SniMaxKeys:           a.Ingest.L4SniMaxKeys,
+		l7Enabled:              a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
+		l7HvMaxKeys:            intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
+		l7PathBreakerThreshold: intDefault(l7BreakerThresholdFromConfig(a.Ingest.L7), L7PathBreakerThresholdDefault),
+		l7PathBreakerWindows:   intDefault(l7BreakerWindowsFromConfig(a.Ingest.L7), L7PathBreakerWindowsDefault),
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	for i := range a.shards {
