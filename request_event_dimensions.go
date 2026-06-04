@@ -61,3 +61,33 @@ func frontProxy(r *http.Request) string {
 	}
 	return ""
 }
+
+// capPath strips the query (and fragment) from a raw request path, then
+// truncates the result to <=1024 bytes UTF-8-safe. pathBucket already strips
+// the query itself, so this is for the raw `path` field. The fragment is
+// almost never present in a request-line path, but trimmed defensively.
+func capPath(p string) string {
+	if i := indexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	if i := indexByte(p, '#'); i >= 0 {
+		p = p[:i]
+	}
+	return truncateBytes(p, 1024)
+}
+
+// capUA truncates a user-agent to <=512 bytes UTF-8-safe.
+func capUA(ua string) string {
+	return truncateBytes(ua, 512)
+}
+
+// indexByte returns the index of the first c in s, or -1. Local helper to
+// avoid pulling in strings just for this.
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}

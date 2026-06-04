@@ -136,6 +136,35 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// (nil recorder / breaker latch) — a cheap no-op when off.
 	h.app.RecordL7Path(k.VhostID, pathBucket(r.URL.Path), statusBucket(k.Status))
 
+	// request_events: one raw row per SERVED request. Skip WAF-blocked /
+	// rate-limited requests (apx_block_reason set) — those live in
+	// request_counters + coraza_detection_events. A backend 404/5xx IS served
+	// and IS recorded. RecordRequestEvent is gated nil-safe (track off →
+	// no-op). SampleRate is stamped inside the recorder.
+	blockReason := ""
+	if repl != nil {
+		blockReason, _ = repl.GetString("http.vars.apx_block_reason")
+	}
+	if blockReason == "" {
+		h.app.RecordRequestEvent(requestEventRow{
+			TsUnixSec:   uint32(time.Now().UTC().Unix()),
+			VhostID:     k.VhostID,
+			ClientIP:    securityClientIP(r),
+			ForwardedIP: forwardedIP(r),
+			FrontProxy:  frontProxy(r),
+			Method:      k.Method,
+			Path:        capPath(r.URL.Path),
+			PathBucket:  pathBucket(r.URL.Path),
+			Status:      k.Status,
+			HTTPVersion: httpVersionOrUnknown(r),
+			UA:          capUA(r.UserAgent()),
+			Origin:      origin,
+			BytesIn:     requestBytes(r),
+			BytesOut:    responseBytes(w),
+			DurationUs:  durationUs,
+		})
+	}
+
 	// Unique-clients tracking. Skipped entirely when the salt isn't
 	// configured (returns "" — see StatsApp.HashSalt). Hash inputs:
 	// client IP + user-agent + salt. Best-effort identity — same UA

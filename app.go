@@ -39,6 +39,11 @@ type AppRef interface {
 	// into the per-vhost-fair path recorder. No-op when the recorder is nil
 	// (track off) or the breaker latch is set (gated internally).
 	RecordL7Path(vhostID uint32, pathBucket string, statusBucket uint8)
+	// RecordRequestEvent feeds one raw per-(served)-request analytics row
+	// into the request_events recorder. No-op when the recorder is nil
+	// (track off — gated internally). The served-only filter lives at the
+	// handler call site, not here.
+	RecordRequestEvent(row requestEventRow)
 	// HashSalt returns the deployment salt for hashing client identifiers.
 	// Empty string disables the unique-clients tracking entirely.
 	HashSalt() string
@@ -128,6 +133,23 @@ type IngestConfig struct {
 	// for 4b knobs and defaults generously here — see
 	// L7HttpversionMaxKeysDefault.
 	L7 *L7Config `json:"l7,omitempty"`
+
+	// RequestEvents gates and bounds the raw per-request analytics track
+	// (request_event rows). Phoenix emits the `ingest.request_events` block
+	// (`enabled`/`sample_threshold`/`max_rows`) when the reqevents feature is
+	// on; absent / `{enabled:false}` keeps the track OFF (no recorder, no
+	// allocation, RecordRequestEvent is a no-op).
+	RequestEvents *RequestEventsConfig `json:"request_events,omitempty"`
+}
+
+// RequestEventsConfig gates and bounds the request_events recorder. Enabled
+// builds the recorder at Provision; SampleThreshold is the per-window emit
+// count above which the recorder samples under load (<=0 → never sample,
+// every served row kept); MaxRows caps rows/window (0 → default 200_000).
+type RequestEventsConfig struct {
+	Enabled         bool `json:"enabled,omitempty"`
+	SampleThreshold int  `json:"sample_threshold,omitempty"`
+	MaxRows         int  `json:"max_rows,omitempty"`
 }
 
 // L7Config gates and bounds the L7 HTTP-version track. 4a Phoenix emits
@@ -281,6 +303,11 @@ type StatsApp struct {
 	// rest of the window so only the aggregate counter rows ship.
 	l7Path              *perVhostFair
 	l7PathAggregateOnly atomic.Bool
+
+	// requestEvents accumulates raw per-(served)-request analytics rows. nil
+	// disables the track — RecordRequestEvent becomes a no-op with no
+	// allocation. Built at Provision only when ingest.request_events.enabled.
+	requestEvents *requestEventRecorder
 
 	// l7PathOverflowStreak counts consecutive flush windows whose total path
 	// overflow stayed >= the breaker threshold. Touched ONLY in flushOnce
@@ -469,6 +496,16 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 			a.Ingest.L7.PathsPerVhost,
 			a.Ingest.L7.PathSketchWidth,
 			a.Ingest.L7.PathSketchDepth,
+		)
+	}
+	// request_events recorder: built only when the track is explicitly
+	// enabled. SampleThreshold passes through as-is (<=0 → never sample);
+	// MaxRows defaults to 200_000. Otherwise left nil → RecordRequestEvent
+	// no-ops.
+	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
+		a.requestEvents = newRequestEventRecorder(
+			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+			a.Ingest.RequestEvents.SampleThreshold,
 		)
 	}
 	a.initL4IpState()
@@ -874,6 +911,18 @@ func (a *StatsApp) RecordL7Path(vhostID uint32, pathBucket string, statusBucket 
 		return
 	}
 	a.l7Path.record(vhostID, pathBucket, statusBucket)
+}
+
+// RecordRequestEvent feeds one raw per-(served)-request row into the
+// request_events recorder. Called once per served request from the
+// StatsHandler (see handler.record) — the served-only filter is applied at
+// the call site. nil recorder (track off) → no-op, no allocation. The
+// recorder stamps SampleRate and applies the sample-under-load + cap.
+func (a *StatsApp) RecordRequestEvent(row requestEventRow) {
+	if a.requestEvents == nil {
+		return
+	}
+	a.requestEvents.record(row)
 }
 
 // evaluateL7PathBreaker runs once per flush (single-threaded under the flush
@@ -1352,6 +1401,14 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		a.evaluateL7PathBreaker(l7PathOverflow)
 	}
 
+	// request_events: flat drain. reqEventOverflow is observability-only here
+	// (no breaker — the recorder samples under load on its own).
+	var reqEventRows []requestEventRow
+	var reqEventOverflow uint64
+	if a.requestEvents != nil {
+		reqEventRows, reqEventOverflow = a.requestEvents.drain()
+	}
+
 	if a.logger != nil {
 		a.logger.Debug("apx_stats: flushOnce summary",
 			zap.Int("http_counter_rows", len(snap)),
@@ -1366,14 +1423,16 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
 			zap.Int("l7_httpversion_rows", len(l7HvSnap)),
 			zap.Int("l7_path_rows", len(l7PathRows)),
-			zap.Uint64("l7_path_overflow", l7PathOverflow))
+			zap.Uint64("l7_path_overflow", l7PathOverflow),
+			zap.Int("request_event_rows", len(reqEventRows)),
+			zap.Uint64("request_event_overflow", reqEventOverflow))
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(l7HvSnap) == 0 && len(l7PathRows) == 0 {
+		len(l7HvSnap) == 0 && len(l7PathRows) == 0 && len(reqEventRows) == 0 {
 		return
 	}
 
@@ -1381,10 +1440,10 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) + len(l7HvSnap) +
-		len(l7PathRows)
+		len(l7PathRows) + len(reqEventRows)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, l7HvSnap, l7PathRows)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, l7HvSnap, l7PathRows, reqEventRows)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1496,7 +1555,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, l7HvSnap map[L7HttpversionKey]*l7HttpversionCounter, l7PathRows []l7PathRow) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, l7HvSnap map[L7HttpversionKey]*l7HttpversionCounter, l7PathRows []l7PathRow, reqEventRows []requestEventRow) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1569,6 +1628,11 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	for _, r := range l7PathRows {
 		// Each path row carries its own drain-stamped TsUnixMin in r.Key.
 		if err := encodeL7PathRow(gz, proxyServerID, r.Key, r.Count); err != nil {
+			return nil, err
+		}
+	}
+	for _, row := range reqEventRows {
+		if err := encodeRequestEventRow(gz, proxyServerID, row); err != nil {
 			return nil, err
 		}
 	}

@@ -66,6 +66,12 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 			a.Ingest.L7.PathSketchDepth,
 		)
 	}
+	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
+		a.requestEvents = newRequestEventRecorder(
+			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+			a.Ingest.RequestEvents.SampleThreshold,
+		)
+	}
 	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return a
@@ -611,4 +617,75 @@ func TestFormatTs_RoundTripsViaIngest(t *testing.T) {
 	parsed, err := time.Parse(time.RFC3339, tsStr)
 	require.NoError(t, err)
 	require.Equal(t, now.Unix(), parsed.UTC().Unix())
+}
+
+func TestProvisionLike_BuildsRequestEventsRecorderWhenEnabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, SampleThreshold: 1000, MaxRows: 50_000}
+	})
+	require.NotNil(t, a.requestEvents)
+}
+
+func TestProvisionLike_NoRequestEventsRecorderWhenAbsentOrDisabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k")
+	require.Nil(t, a.requestEvents, "absent request_events config → nil recorder")
+
+	b := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: false}
+	})
+	require.Nil(t, b.requestEvents, "enabled:false → nil recorder")
+}
+
+func TestFlushOnce_ShipsRequestEventRows(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "shared-secret", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true}
+	})
+	require.NotNil(t, a.requestEvents)
+
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()),
+		VhostID:   100,
+		ClientIP:  "203.0.113.7",
+		Method:    "GET",
+		Path:      "/api/users",
+		Status:    200,
+		Origin:    OriginUpstream,
+	})
+
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var eventRows []map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			eventRows = append(eventRows, r)
+		}
+	}
+	require.Len(t, eventRows, 1)
+	row := eventRows[0]
+	require.Equal(t, float64(42), row["proxy_server_id"])
+	require.Equal(t, float64(100), row["vhost_id"])
+	require.Equal(t, "203.0.113.7", row["client_ip"])
+	require.Equal(t, "/api/users", row["path"])
+	require.Equal(t, float64(200), row["status"])
+	require.Equal(t, float64(1), row["sample_rate"]) // unsampled
+}
+
+func TestFlushOnce_NoRequestEventRowsWhenRecorderNil(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	require.Nil(t, a.requestEvents)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	for _, r := range posts[0].rows {
+		require.NotEqual(t, "request_event", r["_type"])
+	}
 }
