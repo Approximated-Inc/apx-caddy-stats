@@ -508,6 +508,67 @@ func TestServeHTTP_SkipsRequestEventWhenBlockReasonSet(t *testing.T) {
 	require.Len(t, app.snapshot(), 1, "counter row still recorded for blocked request")
 }
 
+func TestServeHTTP_InfersWafBlockFromCorazaInterruption(t *testing.T) {
+	// coraza-caddy (block mode) terminates the chain and returns a
+	// HandlerError whose message is "interruption triggered" (no var set).
+	// We infer reason="waf": no request_event, counter classified blocked.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/?id=1'+OR+'1'='1", "100", nil)
+	w := httptest.NewRecorder()
+	corazaBlock := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusForbidden, errors.New("interruption triggered"))
+	})
+	err := h.ServeHTTP(w, r, corazaBlock)
+	require.Error(t, err)
+
+	require.Empty(t, app.reqEventSnapshot(), "coraza-blocked request records no request_event")
+	require.Len(t, app.snapshot(), 1)
+	require.Equal(t, OriginClusterBlocked, app.snapshot()[0].k.Origin)
+	require.Equal(t, uint16(403), app.snapshot()[0].k.Status)
+}
+
+func TestServeHTTP_InfersRateLimitBlockFrom429HandlerError(t *testing.T) {
+	// The apx rate_limit fork rejects with caddyhttp.Error(429, nil), which
+	// bubbles up as a HandlerError{429} (no var set). We infer
+	// reason="rate_limit": no request_event, counter classified blocked.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	w := httptest.NewRecorder()
+	rateLimited := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusTooManyRequests, nil)
+	})
+	err := h.ServeHTTP(w, r, rateLimited)
+	require.Error(t, err)
+
+	require.Empty(t, app.reqEventSnapshot(), "rate-limited request records no request_event")
+	require.Len(t, app.snapshot(), 1)
+	require.Equal(t, OriginClusterBlocked, app.snapshot()[0].k.Origin)
+	require.Equal(t, uint16(429), app.snapshot()[0].k.Status)
+}
+
+func TestServeHTTP_ProxyErrorIsNotInferredAsBlock(t *testing.T) {
+	// A reverse_proxy failure returns a HandlerError too (502, with an
+	// upstream selected) — it must NOT be read as a block. The request is
+	// recorded as a served event with cluster_proxy_error origin.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	proxyFail := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial: connection refused"))
+	})
+	err := h.ServeHTTP(w, r, proxyFail)
+	require.Error(t, err)
+
+	require.Len(t, app.reqEventSnapshot(), 1, "proxy error is served, not blocked — records a request_event")
+	require.Equal(t, OriginClusterProxyError, app.snapshot()[0].k.Origin)
+}
+
 func TestServeHTTP_RequestEventTruncatesLongPathAndUA(t *testing.T) {
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}

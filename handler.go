@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -102,7 +103,8 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	origin := classifyOrigin(repl, servErr)
+	reason := blockReason(repl, servErr)
+	origin := classifyOrigin(repl, servErr, reason)
 	country := readCountry(repl)
 	asn := readASN(repl)
 	durationUs := uint64(dur.Microseconds())
@@ -127,15 +129,11 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
 	// request_events: one raw row per SERVED request. Skip WAF-blocked /
-	// rate-limited requests (apx_block_reason set) — those live in
+	// rate-limited requests (blockReason != "") — those live in
 	// request_counters + coraza_detection_events. A backend 404/5xx IS served
 	// and IS recorded. RecordRequestEvent is gated nil-safe (track off →
 	// no-op). SampleRate is stamped inside the recorder.
-	blockReason := ""
-	if repl != nil {
-		blockReason, _ = repl.GetString("http.vars.apx_block_reason")
-	}
-	if blockReason == "" {
+	if reason == "" {
 		h.app.RecordRequestEvent(requestEventRow{
 			TsUnixSec:   uint32(time.Now().UTC().Unix()),
 			VhostID:     k.VhostID,
@@ -222,6 +220,47 @@ func readVhostID(r *http.Request) (uint32, bool) {
 	return uint32(n), true
 }
 
+// blockReason reports why Caddy itself blocked this request before it
+// reached the upstream — "waf", "rate_limit", or "" (not blocked). It
+// feeds both the request_counters origin (cluster_blocked) and the
+// request_events served-only filter, so the two stay consistent.
+//
+// An explicit {http.vars.apx_block_reason} wins when a handler sets it
+// (override / future-proofing). Otherwise we infer from the error the
+// blocking handler returned: apx_stats is the OUTERMOST handler, so a
+// coraza interruption or a rate_limit reject bubbles up to us as servErr
+// (a caddyhttp.HandlerError) even though those handlers terminate the
+// chain before reverse_proxy:
+//
+//   - coraza (block mode) returns HandlerError{Err: errInterruptionTriggered}
+//     whose message is "interruption triggered" (coraza-caddy v2.5.0,
+//     coraza.go / interceptor.go). We key on that string.
+//   - the apx rate_limit fork returns caddyhttp.Error(429, nil).
+//
+// A reverse_proxy failure also returns a HandlerError, but with a 5xx/499
+// status and a proxy error message — never these signals — so it is
+// classified as cluster_proxy_error, not a block. An origin's own 429 is
+// served (response written, servErr nil) and never reaches here.
+func blockReason(repl *caddy.Replacer, servErr error) string {
+	if repl != nil {
+		if reason, _ := repl.GetString("http.vars.apx_block_reason"); reason != "" {
+			return reason
+		}
+	}
+
+	var he caddyhttp.HandlerError
+	if !errors.As(servErr, &he) {
+		return ""
+	}
+	if strings.Contains(he.Error(), "interruption triggered") {
+		return "waf"
+	}
+	if he.StatusCode == http.StatusTooManyRequests {
+		return "rate_limit"
+	}
+	return ""
+}
+
 // classifyOrigin maps a finished request to one of four origin classes.
 //
 //   - upstream: reverse_proxy attempted and the upstream returned. Caddy
@@ -254,11 +293,12 @@ func readVhostID(r *http.Request) (uint32, bool) {
 //
 // We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
 // it inside `handle_response` blocks, never for normal pass-through.
-func classifyOrigin(repl *caddy.Replacer, servErr error) string {
-	if repl != nil {
-		if reason, _ := repl.GetString("http.vars.apx_block_reason"); reason != "" {
-			return OriginClusterBlocked
-		}
+//
+// blockReason (computed once by the caller) decides cluster_blocked; an
+// empty reason falls through to the upstream/cluster classification below.
+func classifyOrigin(repl *caddy.Replacer, servErr error, blockReason string) string {
+	if blockReason != "" {
+		return OriginClusterBlocked
 	}
 
 	upstream := ""
