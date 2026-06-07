@@ -60,6 +60,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 
 	if c, err := r.Cookie(CookieName); err == nil && VerifyCookie(h.app.Secret(), c.Value, ip) {
 		setOutcome(r, "passed_recently")
+		// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
 		return next.ServeHTTP(w, r)
 	}
 
@@ -125,9 +126,13 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// safeReturn prevents open-redirects: only same-origin absolute paths allowed.
+// safeReturn prevents open-redirects: only same-origin absolute paths. Rejects
+// scheme-relative ("//host"), absolute URLs, and backslash variants ("/\\host")
+// that browsers normalize to "//host". Anything else → "/".
 func safeReturn(ret string) string {
-	if strings.HasPrefix(ret, "/") && !strings.HasPrefix(ret, "//") {
+	if strings.HasPrefix(ret, "/") &&
+		!strings.HasPrefix(ret, "//") &&
+		!strings.HasPrefix(ret, "/\\") {
 		return ret
 	}
 	return "/"

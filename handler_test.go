@@ -118,6 +118,30 @@ func TestVerifyFailureReturns403(t *testing.T) {
 	require.Equal(t, 403, w.Code)
 }
 
+func TestSafeReturn(t *testing.T) {
+	require.Equal(t, "/dashboard", safeReturn("/dashboard"))
+	require.Equal(t, "/a/b?x=1", safeReturn("/a/b?x=1"))
+	require.Equal(t, "/", safeReturn("//evil.com"))
+	require.Equal(t, "/", safeReturn("/\\evil.com")) // backslash bypass
+	require.Equal(t, "/", safeReturn("https://evil.com"))
+	require.Equal(t, "/", safeReturn("javascript:alert(1)"))
+	require.Equal(t, "/", safeReturn(""))
+}
+
+func TestVerifyRedirectIsSanitized(t *testing.T) {
+	h := newHandler()
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/\\evil.com", timeNowPlus10())
+	sol := SolvePoW(tok, 8)
+	form := url.Values{"challenge": {tok}, "solution": {sol}}
+	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
+	r.RemoteAddr = "203.0.113.5:443"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, withVars(r), nextOK))
+	require.Equal(t, 303, w.Code)
+	require.Equal(t, "/", w.Result().Header.Get("Location"))
+}
+
 func TestOutcomeVarSet(t *testing.T) {
 	h := newHandler()
 	r := browserReq("/x")
