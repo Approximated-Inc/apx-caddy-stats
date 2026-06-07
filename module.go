@@ -1,4 +1,7 @@
 package apxchallenge
 
-// The ChallengeApp registers in app.go's init(). The HTTP handler registers
-// in its own init() (added in a later task).
+import "github.com/caddyserver/caddy/v2"
+
+func init() {
+	caddy.RegisterModule(&ChallengeHandler{})
+}
