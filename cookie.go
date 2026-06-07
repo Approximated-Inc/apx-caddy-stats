@@ -8,12 +8,18 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"strconv"
 	"time"
 )
 
 // CookieName is the pass cookie set after a solved challenge.
 const CookieName = "apx-challenge"
+
+// Domain-separation labels mixed into the HMAC input so a challenge token can
+// never validate as a pass cookie (and vice versa).
+const (
+	challengeDomain = "chal"
+	cookieDomain    = "pass"
+)
 
 // ChallengePayload is the signed body of an issued PoW challenge token.
 type ChallengePayload struct {
@@ -31,31 +37,35 @@ type cookiePayload struct {
 var errInvalid = errors.New("apx_challenge: invalid or expired token")
 
 // clientPrefix returns the /24 (v4) or /64 (v6) network of ip as a string.
-func clientPrefix(ip string) string {
+// The bool is false when ip is unparseable, so callers can reject rather than
+// match unparseable IPs against each other.
+func clientPrefix(ip string) (string, bool) {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
-		return "invalid"
+		return "", false
 	}
 	if v4 := parsed.To4(); v4 != nil {
 		mask := net.CIDRMask(24, 32)
-		return (&net.IPNet{IP: v4.Mask(mask), Mask: mask}).String()
+		return (&net.IPNet{IP: v4.Mask(mask), Mask: mask}).String(), true
 	}
 	mask := net.CIDRMask(64, 128)
-	return (&net.IPNet{IP: parsed.Mask(mask), Mask: mask}).String()
+	return (&net.IPNet{IP: parsed.Mask(mask), Mask: mask}).String(), true
 }
 
-func sign(secret string, body []byte) string {
+func sign(secret, domain string, body []byte) string {
 	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte(domain))
+	m.Write([]byte{0}) // unambiguous separator between domain and body
 	m.Write(body)
 	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
 }
 
-func encodeSigned(secret string, body []byte) string {
-	return base64.RawURLEncoding.EncodeToString(body) + "." + sign(secret, body)
+func encodeSigned(secret, domain string, body []byte) string {
+	return base64.RawURLEncoding.EncodeToString(body) + "." + sign(secret, domain, body)
 }
 
 // splitVerify returns the decoded body iff the signature matches (constant-time).
-func splitVerify(secret, token string) ([]byte, error) {
+func splitVerify(secret, domain, token string) ([]byte, error) {
 	dot := -1
 	for i := len(token) - 1; i >= 0; i-- {
 		if token[i] == '.' {
@@ -70,7 +80,7 @@ func splitVerify(secret, token string) ([]byte, error) {
 	if err != nil {
 		return nil, errInvalid
 	}
-	want := sign(secret, body)
+	want := sign(secret, domain, body)
 	if !hmac.Equal([]byte(want), []byte(token[dot+1:])) {
 		return nil, errInvalid
 	}
@@ -81,18 +91,19 @@ func splitVerify(secret, token string) ([]byte, error) {
 func IssueChallenge(secret, ip, ret string, exp time.Time) string {
 	nb := make([]byte, 12)
 	_, _ = rand.Read(nb)
+	pref, _ := clientPrefix(ip)
 	body, _ := json.Marshal(ChallengePayload{
 		Exp:    exp.Unix(),
 		Nonce:  base64.RawURLEncoding.EncodeToString(nb),
-		Prefix: clientPrefix(ip),
+		Prefix: pref,
 		Ret:    ret,
 	})
-	return encodeSigned(secret, body)
+	return encodeSigned(secret, challengeDomain, body)
 }
 
 // VerifyChallenge checks signature, expiry, and prefix match.
 func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
-	body, err := splitVerify(secret, token)
+	body, err := splitVerify(secret, challengeDomain, token)
 	if err != nil {
 		return ChallengePayload{}, err
 	}
@@ -103,7 +114,8 @@ func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
 	if time.Now().Unix() > p.Exp {
 		return ChallengePayload{}, errInvalid
 	}
-	if p.Prefix != clientPrefix(ip) {
+	pref, ok := clientPrefix(ip)
+	if !ok || p.Prefix != pref {
 		return ChallengePayload{}, errInvalid
 	}
 	return p, nil
@@ -111,14 +123,15 @@ func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
 
 // IssueCookie mints the pass cookie value (HMAC over {exp, prefix}).
 func IssueCookie(secret, ip string, exp time.Time) string {
-	body, _ := json.Marshal(cookiePayload{Exp: exp.Unix(), Prefix: clientPrefix(ip)})
-	return encodeSigned(secret, body)
+	pref, _ := clientPrefix(ip)
+	body, _ := json.Marshal(cookiePayload{Exp: exp.Unix(), Prefix: pref})
+	return encodeSigned(secret, cookieDomain, body)
 }
 
 // VerifyCookie reports whether the cookie is well-signed, unexpired, and bound
 // to the requester's current prefix.
 func VerifyCookie(secret, cookie, ip string) bool {
-	body, err := splitVerify(secret, cookie)
+	body, err := splitVerify(secret, cookieDomain, cookie)
 	if err != nil {
 		return false
 	}
@@ -129,8 +142,6 @@ func VerifyCookie(secret, cookie, ip string) bool {
 	if time.Now().Unix() > p.Exp {
 		return false
 	}
-	return p.Prefix == clientPrefix(ip)
+	pref, ok := clientPrefix(ip)
+	return ok && p.Prefix == pref
 }
-
-// itoa is a tiny helper used by page rendering (Task 5).
-func itoa(i int) string { return strconv.Itoa(i) }
