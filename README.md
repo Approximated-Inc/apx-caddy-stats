@@ -45,18 +45,23 @@ first so the solution POST always reaches the handler.
 
 ## Build (xcaddy — image step)
 
-Build into the same image as apx-caddy-stats; the image tag MUST include a
-`challenge` token (so Phoenix self-gates config emission on it):
+Add this module to the fleet image's `xcaddy build` line in the Approximated
+`fly/Dockerfile`, alongside the other Approximated-Inc modules — they're pulled
+by `@commit` via go-get from GitHub (this repo is **public**, like its siblings
+apx-caddy-stats / apx-caddy-trace), NOT by local path:
 
-    xcaddy build \
-      --with github.com/Approximated-Inc/apx-caddy-stats=/path/to/apx-caddy-stats \
-      --with github.com/Approximated-Inc/apx-caddy-challenge=/path/to/apx-caddy-challenge \
-      ... (other --with modules)
+    RUN xcaddy build v2.11.3 \
+      ... \
+      --with github.com/Approximated-Inc/apx-caddy-stats@<commit> \
+      --with github.com/Approximated-Inc/apx-caddy-challenge@<commit> \
+      ...
 
 - Build `--platform linux/amd64` for Fly.
-- Tag must contain `challenge` as a hyphen-delimited token (e.g.
+- The image **tag** must contain `challenge` as a hyphen-delimited token (e.g.
   `...-coraza4.10-stats-challenge-v1`) so `ProxyServers.image_tag_has_module?`
-  matches and Phoenix emits the challenge config.
+  matches and Phoenix emits the challenge config. (The xcaddy `--with` compiles
+  the module in; the tag token is what gates Phoenix config emission — both are
+  required.)
 - Pins: Go 1.26.1, Caddy v2.11.3 (kept in sync with apx-caddy-stats so xcaddy
   resolves one Caddy version).
 
