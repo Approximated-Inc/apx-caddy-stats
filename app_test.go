@@ -7,9 +7,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAppProvisionReadsSecretFromEnv(t *testing.T) {
-	t.Setenv("APX_CHALLENGE_SECRET", "test-secret-123")
-	app := &ChallengeApp{DifficultyCfg: 16, SecretEnvVar: "APX_CHALLENGE_SECRET", VerifyPathCfg: "/__apx_challenge/verify"}
+func TestAppProvisionReadsSecretFromConfig(t *testing.T) {
+	app := &ChallengeApp{DifficultyCfg: 16, SecretCfg: "test-secret-123", VerifyPathCfg: "/__apx_challenge/verify"}
 	require.NoError(t, app.Provision(caddy.Context{}))
 	require.Equal(t, "test-secret-123", app.Secret())
 	require.Equal(t, 16, app.Difficulty())
@@ -17,8 +16,7 @@ func TestAppProvisionReadsSecretFromEnv(t *testing.T) {
 }
 
 func TestAppProvisionDefaults(t *testing.T) {
-	t.Setenv("APX_CHALLENGE_SECRET", "s")
-	app := &ChallengeApp{}
+	app := &ChallengeApp{SecretCfg: "s"}
 	require.NoError(t, app.Provision(caddy.Context{}))
 	require.Equal(t, 16, app.Difficulty())
 	require.Equal(t, "/__apx_challenge/verify", app.VerifyPath())
@@ -26,7 +24,6 @@ func TestAppProvisionDefaults(t *testing.T) {
 }
 
 func TestAppProvisionErrorsWhenSecretEmpty(t *testing.T) {
-	t.Setenv("APX_CHALLENGE_SECRET", "")
 	app := &ChallengeApp{}
 	require.Error(t, app.Provision(caddy.Context{}))
 }
