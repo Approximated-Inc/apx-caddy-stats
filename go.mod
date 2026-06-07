@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/caddyserver/caddy/v2 v2.11.3
 	github.com/stretchr/testify v1.11.1
+	go.uber.org/zap v1.28.0
 )
 
 require (
@@ -28,7 +29,6 @@ require (
 	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/crypto v0.50.0 // indirect

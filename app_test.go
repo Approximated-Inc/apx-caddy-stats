@@ -1,7 +1,6 @@
 package apxchallenge
 
 import (
-	"os"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -27,7 +26,7 @@ func TestAppProvisionDefaults(t *testing.T) {
 }
 
 func TestAppProvisionErrorsWhenSecretEmpty(t *testing.T) {
-	os.Unsetenv("APX_CHALLENGE_SECRET")
+	t.Setenv("APX_CHALLENGE_SECRET", "")
 	app := &ChallengeApp{}
 	require.Error(t, app.Provision(caddy.Context{}))
 }
