@@ -14,4 +14,7 @@ func TestRenderPageInlinesAssetsAndValues(t *testing.T) {
 	require.Contains(t, html, "async function solve")    // pow.js inlined
 	require.Contains(t, html, "<style>")                 // css inlined
 	require.NotContains(t, html, "{{")                   // no unreplaced placeholders
+	require.Contains(t, html, `method="POST"`)           // native form POST
+	require.Contains(t, html, `action="/__apx_challenge/verify"`)
+	require.Contains(t, html, `name="solution"`)
 }

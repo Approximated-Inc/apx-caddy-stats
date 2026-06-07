@@ -11,7 +11,10 @@
 <h1>Checking your browser…</h1>
 <div class="spinner" aria-hidden="true"></div>
 <p class="muted">This automated check verifies you're not a bot. It runs once and takes a moment.</p>
-<form id="apx-challenge" data-challenge="{{CHALLENGE}}" data-difficulty="{{DIFFICULTY}}" data-verify="{{VERIFY_PATH}}"></form>
+<form id="apx-challenge" method="POST" action="{{VERIFY_PATH}}" data-difficulty="{{DIFFICULTY}}">
+<input type="hidden" name="challenge" value="{{CHALLENGE}}">
+<input type="hidden" name="solution" value="">
+</form>
 <noscript><p>JavaScript is required to continue.</p></noscript>
 </div>
 <script>{{JS}}</script>

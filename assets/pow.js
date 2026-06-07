@@ -1,12 +1,12 @@
-// Reads challenge params from the form's data-* attributes, brute-forces a
-// SHA-256 leading-zero-bit solution (chunked so the UI stays responsive), then
-// POSTs {challenge, solution} to the verify path. The hash input MUST be
-// `challenge + "." + i` to match the Go verifier (proof_of_work.go).
+// Reads the challenge from the form's hidden input, brute-forces a SHA-256
+// leading-zero-bit solution (chunked so the UI stays responsive), fills the
+// hidden solution field, and submits the form natively so the browser follows
+// the server's 303 redirect (sets the cookie AND honors the original deep-link).
+// The hash input MUST be `challenge + "." + i` to match the Go verifier.
 (function () {
-  const el = document.getElementById("apx-challenge");
-  const challenge = el.dataset.challenge;
-  const difficulty = parseInt(el.dataset.difficulty, 10);
-  const verifyPath = el.dataset.verify;
+  const form = document.getElementById("apx-challenge");
+  const challenge = form.elements.challenge.value;
+  const difficulty = parseInt(form.dataset.difficulty, 10);
 
   async function sha256Bytes(s) {
     const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -32,15 +32,7 @@
     }
   }
   solve().then((solution) => {
-    const body = new URLSearchParams({ challenge, solution });
-    return fetch(verifyPath, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-      redirect: "manual",
-    });
-  }).then((resp) => {
-    const loc = resp.headers.get("Location");
-    window.location.replace(loc && loc.startsWith("/") ? loc : "/");
-  }).catch(() => window.location.reload());
+    form.elements.solution.value = solution;
+    form.submit();
+  });
 })();
