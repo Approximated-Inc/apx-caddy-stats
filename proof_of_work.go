@@ -28,6 +28,9 @@ func leadingZeroBits(seed, solution string) int {
 
 // VerifyPoW reports whether SHA-256(seed.solution) has >= difficulty leading
 // zero bits. Cheap (one hash) — safe on the request hot path.
+// NOTE: difficulty <= 0 DISABLES the PoW gate (verification always passes), so a
+// config typo like `difficulty: 0` silently disables this deterrent — the HMAC
+// cookie/token still gates separately in the handler.
 func VerifyPoW(seed, solution string, difficulty int) bool {
 	if difficulty <= 0 {
 		return true
