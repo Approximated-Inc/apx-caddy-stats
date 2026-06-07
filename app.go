@@ -36,6 +36,10 @@ type AppRef interface {
 	// (track off — gated internally). The served-only filter lives at the
 	// handler call site, not here.
 	RecordRequestEvent(row requestEventRow)
+	// RecordChallengeAttempt increments the per-(vhost, ip, outcome)
+	// challenge-attempt counter. Called once per request that carries an
+	// `apx_challenge_outcome` var. Nil-safe.
+	RecordChallengeAttempt(key challengeAttemptKey)
 	// HashSalt returns the deployment salt for hashing client identifiers.
 	// Empty string disables the unique-clients tracking entirely.
 	HashSalt() string
@@ -223,6 +227,17 @@ type StatsApp struct {
 	l4IpOverflowLogMu    sync.Mutex          // throttles per-IP overflow log
 	l4IpOverflowLoggedAt time.Time
 
+	// Challenge attempts. Counter map keyed by (vhost, ip, outcome) — the
+	// PoW-challenge handler sets an `apx_challenge_outcome` request var and
+	// the StatsHandler records one increment per request that carries it.
+	// Single mutexed map (no sharding), mirroring the L4 SNI track:
+	// cardinality is low (bounded by the cluster's vhost × attacker-IP
+	// fan-out) and the record rate is far below HTTP-request rates, so a
+	// single mutex doesn't contend meaningfully. The minute is stamped at
+	// drain/encode time (flush minute), so the key carries no ts field.
+	challengeMu  sync.Mutex
+	challengeMap map[challengeAttemptKey]uint64
+
 	// Fingerprint maps: (ja3, ja4, outcome) traffic and (ja4, ip) join.
 	// Both share a single mutex (fpMu) — cardinality is low (bounded by
 	// FingerprintMaxKeys/FingerprintIpMaxKeys), so one lock is fine.
@@ -373,6 +388,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.challengeMap = make(map[challengeAttemptKey]uint64)
 	// request_events recorder: built only when the track is explicitly
 	// enabled. SampleThreshold passes through as-is (<=0 → never sample);
 	// MaxRows defaults to 200_000. Otherwise left nil → RecordRequestEvent
@@ -724,6 +740,37 @@ func (a *StatsApp) RecordRequestEvent(row requestEventRow) {
 		return
 	}
 	a.requestEvents.record(row)
+}
+
+// RecordChallengeAttempt increments the challenge-attempt counter for the
+// given (vhost, ip, outcome) key. Called once per request whose
+// `apx_challenge_outcome` var is set, from the StatsHandler. Nil-safe —
+// no-op (and no allocation) when the map hasn't been initialized.
+//
+// Single mutexed map, mirroring the L4 SNI track. The minute is stamped
+// at drain time, so the key carries no ts dimension and same-minute
+// (vhost, ip, outcome) tuples merge into one row.
+func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
+	a.challengeMu.Lock()
+	defer a.challengeMu.Unlock()
+	if a.challengeMap == nil {
+		return
+	}
+	a.challengeMap[key]++
+}
+
+// challengeSnapshot atomically swaps the in-memory challenge-attempt map
+// and returns the previous contents. Returns nil when empty so flushOnce
+// can cheaply skip the track. Mirrors l4SniSnapshot.
+func (a *StatsApp) challengeSnapshot() map[challengeAttemptKey]uint64 {
+	a.challengeMu.Lock()
+	defer a.challengeMu.Unlock()
+	if len(a.challengeMap) == 0 {
+		return nil
+	}
+	snap := a.challengeMap
+	a.challengeMap = make(map[challengeAttemptKey]uint64)
+	return snap
 }
 
 // RecordL4Ip updates the four per-IP tracking structures for one
@@ -1133,6 +1180,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	fpSnap := a.fingerprintSnapshot()
 	fpIpSnap := a.fingerprintIpSnapshot()
 	corazaSnap := a.corazaSnapshot()
+	challengeSnap := a.challengeSnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
 
 	// request_events: flat drain. reqEventOverflow is observability-only here
@@ -1155,6 +1203,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
 			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
+			zap.Int("challenge_attempt_rows", len(challengeSnap)),
 			zap.Int("request_event_rows", len(reqEventRows)),
 			zap.Uint64("request_event_overflow", reqEventOverflow))
 	}
@@ -1163,7 +1212,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(reqEventRows) == 0 {
+		len(challengeSnap) == 0 && len(reqEventRows) == 0 {
 		return
 	}
 
@@ -1171,10 +1220,10 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(reqEventRows)
+		len(challengeSnap) + len(reqEventRows)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, reqEventRows)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, reqEventRows)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1286,7 +1335,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, reqEventRows []requestEventRow) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, reqEventRows []requestEventRow) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1348,6 +1397,13 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	for i := range corazaSnap {
 		// Raw per-(request, rule) events — one row each, no aggregation.
 		if err := encodeCorazaDetectionRow(gz, corazaSnap[i], proxyServerID); err != nil {
+			return nil, err
+		}
+	}
+	for k, count := range challengeSnap {
+		// Minute stamped at flush time (the key carries no ts) — same
+		// convention as the L4 IP / fingerprint-flushTs tracks.
+		if err := encodeChallengeAttemptRow(gz, proxyServerID, flushTs, k, count); err != nil {
 			return nil, err
 		}
 	}
