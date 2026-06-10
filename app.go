@@ -62,8 +62,13 @@ type CounterDelta struct {
 type IngestConfig struct {
 	// URL is the absolute URL of the app endpoint that ingests batches.
 	URL string `json:"url,omitempty"`
-	// AuthEnvVar names the env var to source the shared secret from.
-	// Default: APX_INTERNAL_KEY. The secret is sent as a plaintext
+	// AuthToken, when set, is the shared-secret bearer sent on every POST,
+	// sourced directly from the config blob (like hash_salt) so the control
+	// plane can rotate it per-cluster with a config regen — no env var, no
+	// machine restart. When empty, falls back to reading AuthEnvVar.
+	AuthToken string `json:"auth_token,omitempty"`
+	// AuthEnvVar names the env var to source the shared secret from when
+	// AuthToken is unset. Default: APX_INTERNAL_KEY. The secret is sent as a plaintext
 	// bearer in the AuthHeader on every POST — there is no HMAC,
 	// no timestamp, no replay protection. Security relies on the
 	// private mesh transport between Caddy machines and the
@@ -314,10 +319,11 @@ func (*StatsApp) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision validates config, reads the shared-secret bearer token,
+// Provision validates config, resolves the shared-secret bearer token
+// (ingest.auth_token from the config blob first, AuthEnvVar fallback),
 // builds the HTTP client, and initializes the counter map. Called by
 // Caddy before Start. The secret is plaintext bearer auth — no HMAC,
-// no replay protection — see IngestConfig.AuthEnvVar.
+// no replay protection — see IngestConfig.AuthToken / AuthEnvVar.
 func (a *StatsApp) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	if a.Ingest == nil {
@@ -330,13 +336,19 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats app: proxy_server_id is required")
 	}
 
-	envVar := a.Ingest.AuthEnvVar
-	if envVar == "" {
-		envVar = "APX_INTERNAL_KEY"
-	}
-	a.secret = os.Getenv(envVar)
-	if a.secret == "" {
-		return fmt.Errorf("apx_stats app: %s env var is empty", envVar)
+	// auth_token from the config blob wins over the env var — same
+	// rotation story as hash_salt: config regen, no machine restart.
+	if a.Ingest.AuthToken != "" {
+		a.secret = a.Ingest.AuthToken
+	} else {
+		envVar := a.Ingest.AuthEnvVar
+		if envVar == "" {
+			envVar = "APX_INTERNAL_KEY"
+		}
+		a.secret = os.Getenv(envVar)
+		if a.secret == "" {
+			return fmt.Errorf("apx_stats app: %s env var is empty", envVar)
+		}
 	}
 
 	// Hash salt comes from the config blob directly (not an env var) so
@@ -1295,8 +1307,9 @@ func (a *StatsApp) shipOnce(body []byte) error {
 	}
 	// Plaintext shared-secret bearer (NOT HMAC). The Approximated app
 	// verifies via the ApxKeyAuth plug. Anyone with this secret can
-	// forge a batch; rotate APX_INTERNAL_KEY + config-regen Caddy to
-	// invalidate stolen secrets.
+	// forge a batch; rotate ingest.auth_token (config regen) — or
+	// APX_INTERNAL_KEY on the env fallback — to invalidate stolen
+	// secrets.
 	req.Header.Set(a.cfg.authHeader, a.secret)
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("Content-Encoding", "gzip")
