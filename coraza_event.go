@@ -23,6 +23,37 @@ const CorazaMaxEventsDefault = 200_000
 // here keeps the wire payload bounded. Byte-safe (UTF-8 boundary aware).
 const corazaMatchDataMaxBytes = 512
 
+// Row-width caps applied BEFORE buffering (Phoenix re-caps on ingest,
+// but the Go buffer holds raw values until flush — the memory hazard).
+// Truncating up front means the governor's byte budget buys more rows
+// and a long-URI flood can't bloat each one. Same truncateBytes
+// discipline as corazaMatchDataMaxBytes.
+const (
+	corazaRuleMsgMaxBytes     = 256
+	corazaRequestURIMaxBytes  = 2048
+	corazaRequestHostMaxBytes = 255
+)
+
+// corazaDetectionFixedBytes over-approximates the in-memory fixed cost of
+// one buffered detection: unsafe.Sizeof(corazaDetection{}) (~176 on
+// 64-bit) plus a little append slack. Pinned by a test against the real
+// Sizeof so struct growth can't silently undercount the byte budget.
+const corazaDetectionFixedBytes = 184
+
+// corazaDetectionBytes approximates the resident bytes one buffered
+// detection holds: the fixed struct size, every string field's backing
+// bytes, and per-tag string headers + bytes.
+func corazaDetectionBytes(ev *corazaDetection) int {
+	n := corazaDetectionFixedBytes +
+		len(ev.Severity) + len(ev.RuleMsg) + len(ev.TxID) +
+		len(ev.RequestURI) + len(ev.RequestMethod) + len(ev.RequestHost) +
+		len(ev.ClientIP) + len(ev.MatchData)
+	for _, tag := range ev.Tags {
+		n += len(tag) + 16 // string header in the backing array + bytes
+	}
+	return n
+}
+
 // corazaDetection is one raw per-(request, rule) WAF detection event.
 // NOT aggregated — each fired rule on each request is its own event,
 // carrying its own tx_id / ts / match_data. Stored append-only in a

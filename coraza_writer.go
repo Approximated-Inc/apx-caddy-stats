@@ -170,14 +170,18 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	tsSec := corazaUnixNanoToSec(tx.UnixTimestamp())
 	wasBlocked := tx.IsInterrupted()
 	txID := tx.ID()
-	host := tx.ServerID()
+	// Width-cap attacker-controlled fields BEFORE buffering — the Go
+	// buffer holds events raw until flush, so a long-URI flood would
+	// otherwise bloat every row's resident cost (Phoenix re-caps on
+	// ingest, but that's too late for this machine's RAM).
+	host := truncateBytes(tx.ServerID(), corazaRequestHostMaxBytes)
 	clientIP := tx.ClientIP()
 
 	var method, uri string
 	var vhostID uint32
 	if req := tx.Request(); req != nil {
 		method = req.Method()
-		uri = req.URI()
+		uri = truncateBytes(req.URI(), corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
 	}
 
@@ -199,7 +203,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			VhostID:       vhostID,
 			RuleID:        uint32(nonNegInt(d.ID())),
 			Severity:      corazaSeverityLabel(d.Severity()),
-			RuleMsg:       d.Msg(),
+			RuleMsg:       truncateBytes(d.Msg(), corazaRuleMsgMaxBytes),
 			Tags:          d.Tags(),
 			TxID:          txID,
 			RequestURI:    uri,

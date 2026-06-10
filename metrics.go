@@ -93,6 +93,15 @@ var metricFingerprintIpOverflows = promauto.NewCounter(
 	},
 )
 
+// metricChallengeOverflows counts new (vhost, ip, outcome) keys dropped
+// because the per-flush challenge-attempt map was at challengeMaxKeys.
+var metricChallengeOverflows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_stats_challenge_map_overflows_total",
+		Help: "Distinct (vhost, ip, outcome) keys dropped because the per-flush challenge-attempt map was at cap.",
+	},
+)
+
 // metricCorazaOverflows counts raw WAF detection events dropped because
 // the per-flush-window detection slice was at its cap.
 var metricCorazaOverflows = promauto.NewCounter(

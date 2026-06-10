@@ -240,8 +240,9 @@ type StatsApp struct {
 	// fan-out) and the record rate is far below HTTP-request rates, so a
 	// single mutex doesn't contend meaningfully. The minute is stamped at
 	// drain/encode time (flush minute), so the key carries no ts field.
-	challengeMu  sync.Mutex
-	challengeMap map[challengeAttemptKey]uint64
+	challengeMu       sync.Mutex
+	challengeMap      map[challengeAttemptKey]uint64
+	challengeOverflow uint64 // new keys dropped because the map was at challengeMaxKeys
 
 	// Fingerprint maps: (ja3, ja4, outcome) traffic and (ja4, ip) join.
 	// Both share a single mutex (fpMu) — cardinality is low (bounded by
@@ -258,9 +259,16 @@ type StatsApp struct {
 	// store is therefore a capped append-only SLICE, drained at flush.
 	// Overflow drops the new event and counts it (matching the
 	// fingerprint overflow accounting, but for a slice not a counter map).
-	corazaMu       sync.Mutex
-	corazaEvents   []corazaDetection
-	corazaOverflow uint64 // dropped events because the slice was at cap
+	corazaMu            sync.Mutex
+	corazaEvents        []corazaDetection
+	corazaOverflow      uint64 // dropped events (slice at cap, or governor reject)
+	corazaReservedBytes int    // governor bytes reserved by corazaEvents; released at snapshot
+
+	// memGov byte-bounds the two byte-heavy drainable buffers
+	// (request_events + corazaEvents) to fit the machine's detected RAM.
+	// Built once at Provision; its RSS cache refreshes on a goroutine
+	// started by Start. nil only in tests that bypass Provision.
+	memGov *memGovernor
 
 	// requestEvents accumulates raw per-(served)-request analytics rows. nil
 	// disables the track — RecordRequestEvent becomes a no-op with no
@@ -401,6 +409,17 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.challengeMap = make(map[challengeAttemptKey]uint64)
+
+	// Memory governor: self-sized from the machine's RAM detected at
+	// runtime (the autoscaler resizes machines per-machine, so config-gen
+	// can't know it). Byte-bounds the request_events + coraza buffers.
+	totalRAM := clampTotalRAM(detectTotalRAM())
+	a.memGov = newMemGovernor(totalRAM, readProcessRSS, a.logger)
+	a.logger.Info("apx_stats: memory governor sized",
+		zap.Uint64("total_ram_bytes", totalRAM),
+		zap.Uint64("buffer_share_budget_bytes", a.memGov.shareBudget),
+		zap.Uint64("rss_ceiling_bytes", a.memGov.rssCeiling))
+
 	// request_events recorder: built only when the track is explicitly
 	// enabled. SampleThreshold passes through as-is (<=0 → never sample);
 	// MaxRows defaults to 200_000. Otherwise left nil → RecordRequestEvent
@@ -409,6 +428,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		a.requestEvents = newRequestEventRecorder(
 			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
 			a.Ingest.RequestEvents.SampleThreshold,
+			a.memGov,
 		)
 	}
 	a.initL4IpState()
@@ -491,10 +511,18 @@ func mixString(h uint64, s string) uint64 {
 	return h
 }
 
-// Start launches the periodic flush goroutine.
+// Start launches the periodic flush goroutine and the governor's RSS
+// refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
 	a.wg.Add(1)
 	go a.flushLoop()
+	if a.memGov != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.memGov.refreshLoop(a.stopCh)
+		}()
+	}
 	return nil
 }
 
@@ -761,11 +789,17 @@ func (a *StatsApp) RecordRequestEvent(row requestEventRow) {
 //
 // Single mutexed map, mirroring the L4 SNI track. The minute is stamped
 // at drain time, so the key carries no ts dimension and same-minute
-// (vhost, ip, outcome) tuples merge into one row.
+// (vhost, ip, outcome) tuples merge into one row. New keys past
+// challengeMaxKeys are dropped + counted; existing keys keep counting.
 func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
 	a.challengeMu.Lock()
 	defer a.challengeMu.Unlock()
 	if a.challengeMap == nil {
+		return
+	}
+	if _, ok := a.challengeMap[key]; !ok && len(a.challengeMap) >= challengeMaxKeys {
+		a.challengeOverflow++
+		metricChallengeOverflows.Inc()
 		return
 	}
 	a.challengeMap[key]++
@@ -1068,8 +1102,11 @@ func (a *StatsApp) fingerprintIpSnapshot() map[fingerprintIpKey]*fingerprintCoun
 // RecordCorazaDetection appends one raw per-(request, rule) WAF detection
 // event to the capped slice. Called by the Coraza audit-log writer once
 // per fired rule per transaction. NOT aggregated — every call adds a row.
-// At the cap the event is dropped and counted (corazaOverflow + metric),
-// mirroring the fingerprint overflow accounting but for a slice.
+// At the count cap OR when the memory governor rejects the event's bytes,
+// the event is dropped and counted (corazaOverflow + metric). Hard drop,
+// no sampling: there is no sample_rate on the coraza wire format for
+// Phoenix to upscale, and a deterministic keep-until-full preserves the
+// earliest (strongest) signal of a window.
 func (a *StatsApp) RecordCorazaDetection(ev corazaDetection) {
 	a.corazaMu.Lock()
 	if a.cfg.corazaMaxEvents > 0 && len(a.corazaEvents) >= a.cfg.corazaMaxEvents {
@@ -1078,16 +1115,29 @@ func (a *StatsApp) RecordCorazaDetection(ev corazaDetection) {
 		metricCorazaOverflows.Inc()
 		return
 	}
+	n := corazaDetectionBytes(&ev)
+	if a.memGov != nil && !a.memGov.tryReserve(n) {
+		a.corazaOverflow++
+		a.corazaMu.Unlock()
+		metricCorazaOverflows.Inc()
+		return
+	}
+	a.corazaReservedBytes += n
 	a.corazaEvents = append(a.corazaEvents, ev)
 	a.corazaMu.Unlock()
 }
 
-// corazaSnapshot atomically takes and resets the detection slice. Returns
-// nil when empty so flushOnce can cheaply skip the track. The returned
-// slice is owned by the caller (the app starts a fresh one).
+// corazaSnapshot atomically takes and resets the detection slice,
+// releasing the window's governor reservation. Returns nil when empty so
+// flushOnce can cheaply skip the track. The returned slice is owned by
+// the caller (the app starts a fresh one).
 func (a *StatsApp) corazaSnapshot() []corazaDetection {
 	a.corazaMu.Lock()
 	defer a.corazaMu.Unlock()
+	if a.memGov != nil && a.corazaReservedBytes > 0 {
+		a.memGov.release(a.corazaReservedBytes)
+	}
+	a.corazaReservedBytes = 0
 	if len(a.corazaEvents) == 0 {
 		return nil
 	}
