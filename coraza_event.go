@@ -122,7 +122,10 @@ func truncateBytes(s string, max int) string {
 	for end > 0 && s[end]&0xC0 == 0x80 {
 		end--
 	}
-	return s[:end]
+	// Clone into a right-sized allocation: s[:end] would share (pin) the
+	// parent's full backing array while the byte accounting counts only
+	// the truncated length.
+	return strings.Clone(s[:end])
 }
 
 // encodeCorazaDetectionRow emits one `_type: "coraza_detection"` NDJSON

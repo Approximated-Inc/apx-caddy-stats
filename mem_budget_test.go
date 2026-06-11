@@ -113,6 +113,27 @@ func TestMemGovernor_TryReserveConcurrent(t *testing.T) {
 		"concurrent reserves must never exceed the share budget")
 }
 
+func TestMemGovernor_NextRefreshIntervalTightensUnderPressure(t *testing.T) {
+	g := newMemGovernor(1_000_000, stubRSS(0), nil) // share 400_000
+	require.Equal(t, rssRefreshInterval, g.nextRefreshInterval(), "no pressure → normal cadence")
+
+	// Share pressure past pressureSampleStart (0.70) tightens the cadence.
+	require.True(t, g.tryReserve(300_000)) // pressure 0.75
+	require.Equal(t, rssRefreshPressureInterval, g.nextRefreshInterval())
+	g.release(300_000)
+	require.Equal(t, rssRefreshInterval, g.nextRefreshInterval(), "cadence relaxes when pressure subsides")
+
+	// RSS pressure alone also tightens: baseline 100K, ceiling 800K.
+	var rss atomic.Uint64
+	read := func() (uint64, bool) { return rss.Load(), true }
+	rss.Store(100_000)
+	g2 := newMemGovernor(1_000_000, read, nil)
+	require.Equal(t, rssRefreshInterval, g2.nextRefreshInterval())
+	rss.Store(700_000) // (700K-100K)/(800K-100K) ≈ 0.86
+	g2.refreshRSS()
+	require.Equal(t, rssRefreshPressureInterval, g2.nextRefreshInterval())
+}
+
 func TestPressureSampleFloor(t *testing.T) {
 	require.Equal(t, 1, pressureSampleFloor(0))
 	require.Equal(t, 1, pressureSampleFloor(0.5))

@@ -3,6 +3,7 @@ package apxstats
 import (
 	"net"
 	"net/http"
+	"strings"
 )
 
 // securityClientIP returns the PROXY-decoded real client IP from
@@ -67,11 +68,17 @@ func frontProxy(r *http.Request) string {
 // the query itself, so this is for the raw `path` field. The fragment is
 // almost never present in a request-line path, but trimmed defensively.
 func capPath(p string) string {
-	if i := indexByte(p, '?'); i >= 0 {
-		p = p[:i]
+	stripped := false
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p, stripped = p[:i], true
 	}
-	if i := indexByte(p, '#'); i >= 0 {
-		p = p[:i]
+	if i := strings.IndexByte(p, '#'); i >= 0 {
+		p, stripped = p[:i], true
+	}
+	if stripped && len(p) <= 1024 {
+		// Clone so a short path can't pin a huge stripped parent (the
+		// truncateBytes early-return below is deliberately copy-free).
+		return strings.Clone(p)
 	}
 	return truncateBytes(p, 1024)
 }
@@ -79,15 +86,4 @@ func capPath(p string) string {
 // capUA truncates a user-agent to <=512 bytes UTF-8-safe.
 func capUA(ua string) string {
 	return truncateBytes(ua, 512)
-}
-
-// indexByte returns the index of the first c in s, or -1. Local helper to
-// avoid pulling in strings just for this.
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

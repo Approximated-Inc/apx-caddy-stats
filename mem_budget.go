@@ -38,6 +38,11 @@ const (
 	// rssRefreshInterval is how often the cached RSS reading refreshes.
 	// One ~µs procfs read per second; the hot path only loads the cache.
 	rssRefreshInterval = time.Second
+	// rssRefreshPressureInterval replaces rssRefreshInterval while
+	// pressure() is past pressureSampleStart: near a limit, the ~1s cache
+	// lag is the window in which an extreme flood could cross the ceiling
+	// undetected, and the extra ~µs statm reads only happen then.
+	rssRefreshPressureInterval = 150 * time.Millisecond
 )
 
 // Pressure-driven sample floor: as governor pressure rises past
@@ -126,19 +131,31 @@ func (g *memGovernor) refreshRSS() {
 	})
 }
 
-// refreshLoop refreshes the cached RSS every rssRefreshInterval until
-// stop closes. Driven by StatsApp.Start on the app's WaitGroup.
+// refreshLoop refreshes the cached RSS on an adaptive cadence (see
+// nextRefreshInterval) until stop closes. Driven by StatsApp.Start on
+// the app's WaitGroup.
 func (g *memGovernor) refreshLoop(stop <-chan struct{}) {
-	t := time.NewTicker(rssRefreshInterval)
+	t := time.NewTimer(g.nextRefreshInterval())
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
 			g.refreshRSS()
+			t.Reset(g.nextRefreshInterval())
 		case <-stop:
 			return
 		}
 	}
+}
+
+// nextRefreshInterval picks the delay before the next RSS read: the
+// normal ~1s cadence, tightened to rssRefreshPressureInterval while the
+// governor is under pressure.
+func (g *memGovernor) nextRefreshInterval() time.Duration {
+	if g.pressure() > pressureSampleStart {
+		return rssRefreshPressureInterval
+	}
+	return rssRefreshInterval
 }
 
 // tryReserve reserves n buffer bytes, returning false (caller drops the
