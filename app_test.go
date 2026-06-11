@@ -298,6 +298,9 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 	posts := captured()
 	require.Len(t, posts, 1)
 	require.Equal(t, "shared-secret", posts[0].headers.Get("apx-key"))
+	// Cluster id rides alongside the secret so the control plane can
+	// authenticate the derived-key arm before reading the body.
+	require.Equal(t, "42", posts[0].headers.Get("apx-proxy-server-id"))
 	require.Equal(t, "gzip", posts[0].headers.Get("Content-Encoding"))
 	require.Equal(t, "application/x-ndjson", posts[0].headers.Get("Content-Type"))
 

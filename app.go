@@ -1380,6 +1380,11 @@ func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
 	return lastErr
 }
 
+// proxyServerIDHeader carries the module's cluster id on every ingest
+// POST so the control plane can authenticate the per-cluster derived
+// key without reading the request body first.
+const proxyServerIDHeader = "apx-proxy-server-id"
+
 func (a *StatsApp) shipOnce(body []byte) error {
 	start := time.Now()
 	defer func() {
@@ -1401,6 +1406,9 @@ func (a *StatsApp) shipOnce(body []byte) error {
 	// APX_INTERNAL_KEY on the env fallback — to invalidate stolen
 	// secrets.
 	req.Header.Set(a.cfg.authHeader, a.secret)
+	// Cluster id alongside the secret lets the control plane verify the
+	// per-cluster derived key BEFORE reading the body (pre-body 401).
+	req.Header.Set(proxyServerIDHeader, strconv.FormatUint(uint64(a.ProxyServerIDValue), 10))
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("Content-Encoding", "gzip")
 
