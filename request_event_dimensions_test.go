@@ -209,9 +209,17 @@ func TestCapPath_QueryStripReleasesParentBacking(t *testing.T) {
 	if unsafe.StringData(got) == unsafe.StringData(parent) {
 		t.Errorf("stripped path shares the parent's backing array; want a clone")
 	}
-	// Unstripped short path: copy-free passthrough.
-	p := "/health"
-	if got := capPath(p); unsafe.StringData(got) != unsafe.StringData(p) {
-		t.Errorf("unstripped short path was needlessly copied")
+	// Unstripped short path: must STILL be an owned copy. Even a short
+	// query-less path can be a slice of a huge request line (absolute-form
+	// URI with a long host, junk long method) — capPath can't see the
+	// backing, so it must always clone before the row is buffered.
+	p := "/health" + strings.Repeat("x", 1<<20)
+	short := p[:7]
+	got2 := capPath(short)
+	if got2 != "/health" {
+		t.Fatalf("got %q, want %q", got2, "/health")
+	}
+	if unsafe.StringData(got2) == unsafe.StringData(p) {
+		t.Errorf("unstripped short path shares the caller's backing array; want an owned copy")
 	}
 }

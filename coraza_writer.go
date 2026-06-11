@@ -169,19 +169,24 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 
 	tsSec := corazaUnixNanoToSec(tx.UnixTimestamp())
 	wasBlocked := tx.IsInterrupted()
-	txID := tx.ID()
-	// Width-cap attacker-controlled fields BEFORE buffering — the Go
-	// buffer holds events raw until flush, so a long-URI flood would
-	// otherwise bloat every row's resident cost (Phoenix re-caps on
-	// ingest, but that's too late for this machine's RAM).
-	host := truncateBytes(tx.ServerID(), corazaRequestHostMaxBytes)
-	clientIP := tx.ClientIP()
+	txID := tx.ID() // coraza-generated random id — fresh, bounded; safe to retain
+	// Width-cap AND clone attacker-controlled fields BEFORE buffering —
+	// the Go buffer holds events raw until flush (Phoenix re-caps on
+	// ingest, but that's too late for this machine's RAM). ownedTruncate
+	// (not truncateBytes) because these arrive as slices of larger
+	// request-owned backings: Method is request_line[:i] on HTTP/1.1,
+	// ServerID is a SplitHostPort slice of req.Host, MatchData can be a
+	// substring of a parsed buffer. An under-cap copy-free passthrough
+	// would pin the whole parent (~1MB under a flood) while the governor
+	// counts only the short length.
+	host := ownedTruncate(tx.ServerID(), corazaRequestHostMaxBytes)
+	clientIP := strings.Clone(tx.ClientIP())
 
 	var method, uri string
 	var vhostID uint32
 	if req := tx.Request(); req != nil {
-		method = req.Method()
-		uri = truncateBytes(req.URI(), corazaRequestURIMaxBytes)
+		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
+		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
 	}
 
@@ -199,19 +204,26 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			continue
 		}
 		out = append(out, corazaDetection{
-			TsUnixSec:     tsSec,
-			VhostID:       vhostID,
-			RuleID:        uint32(nonNegInt(d.ID())),
-			Severity:      corazaSeverityLabel(d.Severity()),
-			RuleMsg:       truncateBytes(d.Msg(), corazaRuleMsgMaxBytes),
+			TsUnixSec: tsSec,
+			VhostID:   vhostID,
+			RuleID:    uint32(nonNegInt(d.ID())),
+			Severity:  corazaSeverityLabel(d.Severity()),
+			// RuleMsg stays copy-free under the cap: Msg() is either a
+			// static rule-config string (process-lifetime — cloning would
+			// duplicate it per event) or a macro-expanded fresh build.
+			RuleMsg: truncateBytes(d.Msg(), corazaRuleMsgMaxBytes),
+			// Tags reference the rule's static config slice — no
+			// per-request data, safe to share.
 			Tags:          d.Tags(),
 			TxID:          txID,
 			RequestURI:    uri,
 			RequestMethod: method,
 			RequestHost:   host,
 			ClientIP:      clientIP,
-			MatchData:     truncateBytes(d.Data(), corazaMatchDataMaxBytes),
-			WasBlocked:    wasBlocked,
+			// MatchData can be a substring slice of a large parsed buffer
+			// (arg value out of a flooded query string) — must be owned.
+			MatchData:  ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
+			WasBlocked: wasBlocked,
 		})
 	}
 	return out

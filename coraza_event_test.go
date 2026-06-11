@@ -162,6 +162,38 @@ func TestTruncateBytes_cloneReleasesParentBacking(t *testing.T) {
 	}
 }
 
+func TestOwnedTruncate_neverSharesBacking(t *testing.T) {
+	parent := strings.Repeat("a", 1<<20)
+
+	// Under-cap input: content preserved, backing NOT shared (this is the
+	// difference from truncateBytes, whose under-cap path is copy-free).
+	short := parent[:10]
+	got := ownedTruncate(short, 512)
+	if got != short {
+		t.Errorf("got %q, want %q", got, short)
+	}
+	if unsafe.StringData(got) == unsafe.StringData(parent) {
+		t.Errorf("under-cap result shares the parent's backing array; want an owned copy")
+	}
+
+	// Over-cap input: truncated to the cap, backing not shared.
+	got2 := ownedTruncate(parent, 512)
+	if len(got2) != 512 {
+		t.Errorf("len = %d, want 512", len(got2))
+	}
+	if unsafe.StringData(got2) == unsafe.StringData(parent) {
+		t.Errorf("truncated result shares the parent's backing array; want an owned copy")
+	}
+
+	// UTF-8 boundary safety matches truncateBytes (511 ASCII + 2-byte é,
+	// cut at 512 drops the partial é).
+	s := strings.Repeat("a", 511) + "é"
+	got3 := ownedTruncate(s, 512)
+	if len(got3) != 511 || !utf8.ValidString(got3) {
+		t.Errorf("utf8 boundary: len=%d valid=%v", len(got3), utf8.ValidString(got3))
+	}
+}
+
 func TestTruncateBytes_utf8Boundary(t *testing.T) {
 	// "é" is 2 bytes (0xC3 0xA9). Build 511 ASCII + one é so the cut at
 	// 512 lands mid-codepoint; truncate must drop the partial é, yielding

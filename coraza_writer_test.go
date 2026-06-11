@@ -3,6 +3,7 @@ package apxstats
 import (
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 	"github.com/corazawaf/coraza/v3/types"
@@ -180,6 +181,79 @@ func TestBuildCorazaEvents_matchDataTruncatedTo512(t *testing.T) {
 	}
 	if len(evs[0].MatchData) != 512 {
 		t.Errorf("MatchData len = %d, want 512", len(evs[0].MatchData))
+	}
+}
+
+func TestBuildCorazaEvents_bufferedStringsDoNotPinLargeBackings(t *testing.T) {
+	// Every attacker-length-controlled request field reaches the writer as
+	// a SHORT slice of a potentially huge backing array: req.Method on
+	// HTTP/1.1 is request_line[:i] (shares the full ~1MB line with the
+	// URI), ServerID is a SplitHostPort slice of req.Host, MatchData can
+	// be a substring of a large parsed buffer. Buffering those slices
+	// uncloned pins the whole parent allocation while the governor's byte
+	// accounting counts only the short length — a ~500x undercount that
+	// defeats the governor under a flood. Build each field as a short
+	// slice of a 1MB runtime backing and assert the buffered event owns
+	// its bytes (different backing array).
+	methodBacking := "POST" + strings.Repeat("m", 1<<20)
+	uriBacking := "/login" + strings.Repeat("u", 1<<20)
+	hostBacking := "example.com" + strings.Repeat("h", 1<<20)
+	ipBacking := "203.0.113.7" + strings.Repeat("i", 1<<20)
+	dataBacking := "' OR 1=1" + strings.Repeat("d", 1<<20)
+
+	al := &fakeAuditLog{
+		tx: &fakeTx{
+			unixTs:   1,
+			id:       "txPin",
+			serverID: hostBacking[:11],
+			clientIP: ipBacking[:11],
+			req:      &fakeReq{method: methodBacking[:4], uri: uriBacking[:6]},
+		},
+		messages: []corazaMsgView{&fakeMsg{data: &fakeMsgData{id: 1, data: dataBacking[:8]}}},
+	}
+	evs := buildCorazaEvents(al)
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	ev := evs[0]
+
+	// Content must be intact...
+	if ev.RequestMethod != "POST" || ev.RequestURI != "/login" ||
+		ev.RequestHost != "example.com" || ev.ClientIP != "203.0.113.7" ||
+		ev.MatchData != "' OR 1=1" {
+		t.Fatalf("content mangled: %+v", ev)
+	}
+	// ...but every field must own its bytes, NOT share the parent backing.
+	if unsafe.StringData(ev.RequestMethod) == unsafe.StringData(methodBacking) {
+		t.Errorf("buffered RequestMethod shares the request-line backing; want a clone")
+	}
+	if unsafe.StringData(ev.RequestURI) == unsafe.StringData(uriBacking) {
+		t.Errorf("buffered RequestURI shares its parent backing; want a clone")
+	}
+	if unsafe.StringData(ev.RequestHost) == unsafe.StringData(hostBacking) {
+		t.Errorf("buffered RequestHost shares its parent backing; want a clone")
+	}
+	if unsafe.StringData(ev.ClientIP) == unsafe.StringData(ipBacking) {
+		t.Errorf("buffered ClientIP shares its parent backing; want a clone")
+	}
+	if unsafe.StringData(ev.MatchData) == unsafe.StringData(dataBacking) {
+		t.Errorf("buffered MatchData shares its parent backing; want a clone")
+	}
+}
+
+func TestBuildCorazaEvents_methodWidthBounded(t *testing.T) {
+	// A junk long method (any token chars pass net/http validation) must
+	// not ride into the buffer at full width: capped to
+	// corazaRequestMethodMaxBytes. Standard verbs are far below the cap.
+	junk := strings.Repeat("X", 100)
+	al := buildAuditLog(1, "tx", "h", false, nil, &fakeMsgData{id: 1})
+	al.tx.(*fakeTx).req = &fakeReq{method: junk, uri: "/x"}
+	evs := buildCorazaEvents(al)
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if len(evs[0].RequestMethod) != corazaRequestMethodMaxBytes {
+		t.Errorf("RequestMethod len = %d, want %d", len(evs[0].RequestMethod), corazaRequestMethodMaxBytes)
 	}
 }
 

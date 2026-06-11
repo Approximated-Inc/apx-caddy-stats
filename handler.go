@@ -248,15 +248,21 @@ func readChallengeOutcome(r *http.Request) string {
 }
 
 // challengeVhost returns the lowercased Host header with any :port
-// stripped. A served challenge is terminal (the apx_challenge handler
-// returns without calling next), so the per-vhost vars handler never runs
-// and vhost_id is unset — the challenge_attempt dimension is therefore
-// the Host string, NOT vhost_id.
+// stripped, width-capped to challengeVhostMaxBytes. A served challenge is
+// terminal (the apx_challenge handler returns without calling next), so
+// the per-vhost vars handler never runs and vhost_id is unset — the
+// challenge_attempt dimension is therefore the Host string, NOT vhost_id.
+//
+// The result may still slice a request-owned backing (truncateBytes is
+// copy-free under the cap, and r.Host can be a slice of the request line
+// for absolute-form URIs); RecordChallengeAttempt clones the key strings
+// on first insert, so steady-state increments stay copy-free.
 func challengeVhost(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.Host); err == nil {
-		return strings.ToLower(host)
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
-	return strings.ToLower(r.Host)
+	return truncateBytes(strings.ToLower(host), challengeVhostMaxBytes)
 }
 
 // blockReason reports why Caddy itself blocked this request before it
@@ -427,12 +433,35 @@ func normalizeCountry(s string) string {
 // methodOrUnknown protects the cardinality of the method field. A
 // malformed request can land an arbitrary token in r.Method; clamp to
 // the standard verbs we'd expect to see in a reverse-proxy fleet.
+//
+// Returns the net/http package CONSTANT for matched verbs — never m
+// itself. On HTTP/1.1, m is a slice of the full request line (method +
+// URI + proto share one backing array), and the result is buffered in
+// the counter map Key and the request_events rows until flush; returning
+// m would pin the whole attacker-length-controlled line (~1MB under a
+// long-URI flood) per buffered entry while the governor's byte
+// accounting counts only len("POST"). Non-standard verbs clamp to the
+// static "OTHER" sentinel, which is equally pin-free.
 func methodOrUnknown(m string) string {
 	switch m {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
-		http.MethodDelete, http.MethodHead, http.MethodOptions,
-		http.MethodConnect, http.MethodTrace:
-		return m
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodOptions:
+		return http.MethodOptions
+	case http.MethodConnect:
+		return http.MethodConnect
+	case http.MethodTrace:
+		return http.MethodTrace
 	}
 	return "OTHER"
 }

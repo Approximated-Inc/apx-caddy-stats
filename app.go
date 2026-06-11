@@ -733,6 +733,11 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	if sni == "" {
 		sni = L4SniEmptySNI
 	}
+	// Bound the key width BEFORE the lookup so lookups and stored keys
+	// agree: RFC 6066 caps host_name at 255 bytes, but a hand-rolled
+	// ClientHello can claim up to 64KB, and this map is count-capped, not
+	// byte-accounted. Copy-free under the cap.
+	sni = truncateBytes(sni, l4SniMaxBytes)
 
 	if a.logger != nil {
 		a.logger.Debug("apx_stats: RecordL4Sni",
@@ -767,6 +772,13 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 		return
 	}
 
+	// First retention of this SNI: own the key string before it enters
+	// the long-lived (flush-window) map. The l4tls parser hands us a
+	// fresh allocation today, but that provenance lives in the caddy-l4
+	// fork — clone-on-insert (new keys only; increments above stay
+	// alloc-free) makes the map immune to a fork change reintroducing a
+	// shared backing.
+	k.SNI = strings.Clone(sni)
 	a.l4SniMap[k] = &l4SniCounter{ConnectionCount: 1}
 }
 
@@ -802,6 +814,20 @@ func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
 		metricChallengeOverflows.Inc()
 		return
 	}
+	// Own every key string before it enters the long-lived (flush-window)
+	// map. The caller hands us slices of request-owned backings — vhost is
+	// a SplitHostPort slice of r.Host (itself possibly a slice of the full
+	// request line for absolute-form URIs), outcome is another module's
+	// request var — and retaining them would pin the parent allocations.
+	// Cloned on EVERY call, not just inserts: `m[key]++` is a map
+	// assignment, and the runtime re-stores string-containing keys on
+	// every assignment (needkeyupdate), so a clone-on-insert would be
+	// silently undone by the next increment. Unlike the pointer-valued
+	// SNI/fingerprint maps there is no assignment-free increment here;
+	// three small clones per challenge attempt is acceptable.
+	key.vhost = strings.Clone(key.vhost)
+	key.ip = strings.Clone(key.ip)
+	key.outcome = strings.Clone(key.outcome)
 	a.challengeMap[key]++
 }
 
@@ -852,6 +878,10 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	if sni == "" {
 		sni = L4SniEmptySNI
 	}
+	// Same width bound as RecordL4Sni: the (IP, SNI, outcome) composite
+	// keys are built fresh but EMBED the SNI, so an unbounded junk SNI
+	// would balloon the count-capped map's resident bytes.
+	sni = truncateBytes(sni, l4SniMaxBytes)
 
 	a.l4IpMu.Lock()
 	defer a.l4IpMu.Unlock()
@@ -928,6 +958,13 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 			a.fpOverflow++
 			metricFingerprintOverflows.Inc()
 		} else {
+			// First retention: own the key strings before they enter the
+			// long-lived map. ja3/ja4 are fixed-width hashes built by the
+			// caddy-l4 fork (fresh today), but their provenance is outside
+			// this repo — clone-on-insert (new keys only) keeps the map
+			// immune to a fork change sharing a larger backing.
+			k.JA3 = strings.Clone(ja3)
+			k.JA4 = strings.Clone(ja4)
 			a.fpMap[k] = &fingerprintCounter{ConnectionCount: 1}
 		}
 		a.fpMu.Unlock()
@@ -943,6 +980,9 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 			a.fpIpOverflow++
 			metricFingerprintIpOverflows.Inc()
 		} else {
+			// Same clone-on-insert ownership as the traffic map above.
+			k.JA4 = strings.Clone(ja4)
+			k.IP = strings.Clone(ip)
 			a.fpIpMap[k] = &fingerprintCounter{ConnectionCount: 1}
 		}
 		a.fpMu.Unlock()

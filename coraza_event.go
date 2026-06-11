@@ -32,6 +32,10 @@ const (
 	corazaRuleMsgMaxBytes     = 256
 	corazaRequestURIMaxBytes  = 2048
 	corazaRequestHostMaxBytes = 255
+	// corazaRequestMethodMaxBytes bounds the method field: real verbs are
+	// <=16 bytes (VERSION-CONTROL is 15); anything longer is a junk token
+	// flood that net/http's validMethod happily passes through.
+	corazaRequestMethodMaxBytes = 32
 )
 
 // corazaDetectionFixedBytes over-approximates the in-memory fixed cost of
@@ -126,6 +130,19 @@ func truncateBytes(s string, max int) string {
 	// parent's full backing array while the byte accounting counts only
 	// the truncated length.
 	return strings.Clone(s[:end])
+}
+
+// ownedTruncate is truncateBytes for inputs of UNTRUSTED PROVENANCE: the
+// result NEVER shares s's backing array, even under the cap. Use it for
+// any string headed into a long-lived buffer when the input may be a
+// short slice of a large parent (request line, raw URI, parsed-buffer
+// substring) — truncateBytes's under-cap early return is deliberately
+// copy-free and would pin the parent. strings.Clone of "" is alloc-free.
+func ownedTruncate(s string, max int) string {
+	if len(s) <= max {
+		return strings.Clone(s)
+	}
+	return truncateBytes(s, max)
 }
 
 // encodeCorazaDetectionRow emits one `_type: "coraza_detection"` NDJSON

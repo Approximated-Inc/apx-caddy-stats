@@ -23,6 +23,14 @@ const L4SniOverflowSNI = "__overflow__"
 // from genuinely unknown.
 const L4SniEmptySNI = "__empty__"
 
+// l4SniMaxBytes bounds the SNI width before it's used in any buffered
+// key (the L4 SNI map and the per-IP (IP, SNI, outcome) composites).
+// RFC 6066 caps host_name at 255 bytes; a hand-rolled ClientHello can
+// claim up to 64KB, and these maps are count-capped, not byte-accounted,
+// so unbounded width would defeat their sizing assumptions. Mirrors
+// corazaRequestHostMaxBytes / challengeVhostMaxBytes.
+const l4SniMaxBytes = 255
+
 // l4SniCounter holds the aggregated count for one L4SniKey. Separate
 // type from Counter because the L4 SNI track has only one scalar (no
 // bytes, no latency histogram) — a connection arrived and was counted.

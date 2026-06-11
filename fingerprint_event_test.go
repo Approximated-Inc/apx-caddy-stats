@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"strings"
 	"testing"
+	"unsafe"
 )
 
 func gunzipString(t *testing.T, b []byte) string {
@@ -61,6 +63,42 @@ func newTestAppWithFP(maxKeys, maxIpKeys int) *StatsApp {
 	a.fpMap = make(map[fingerprintKey]*fingerprintCounter)
 	a.fpIpMap = make(map[fingerprintIpKey]*fingerprintCounter)
 	return a
+}
+
+func TestRecordFingerprint_OwnsStoredKeyStrings(t *testing.T) {
+	// Both fingerprint maps are long-lived buffers (drained per flush
+	// window). JA3/JA4 are fixed-width hash strings and the IP is a fresh
+	// netip render today, but all three come from outside this repo (the
+	// caddy-l4 fork) — the maps must own their key strings so a fork
+	// change can't reintroduce backing-array pinning.
+	a := newTestAppWithFP(100, 100)
+	ja3Backing := strings.Repeat("a", 32) + strings.Repeat("z", 1<<20)
+	ja4Backing := "t13d1516h2_8daaf6152771_e5627efa2ab1" + strings.Repeat("z", 1<<20)
+	ipBacking := "203.0.113.7" + strings.Repeat("z", 1<<20)
+
+	a.RecordFingerprint(ja3Backing[:32], ja4Backing[:36], ipBacking[:11])
+
+	a.fpMu.Lock()
+	defer a.fpMu.Unlock()
+	if len(a.fpMap) != 1 || len(a.fpIpMap) != 1 {
+		t.Fatalf("map sizes = %d/%d, want 1/1", len(a.fpMap), len(a.fpIpMap))
+	}
+	for k := range a.fpMap {
+		if unsafe.StringData(k.JA3) == unsafe.StringData(ja3Backing) {
+			t.Error("stored JA3 key shares the caller's backing array; want an owned clone")
+		}
+		if unsafe.StringData(k.JA4) == unsafe.StringData(ja4Backing) {
+			t.Error("stored JA4 key shares the caller's backing array; want an owned clone")
+		}
+	}
+	for k := range a.fpIpMap {
+		if unsafe.StringData(k.JA4) == unsafe.StringData(ja4Backing) {
+			t.Error("stored ip-map JA4 key shares the caller's backing array; want an owned clone")
+		}
+		if unsafe.StringData(k.IP) == unsafe.StringData(ipBacking) {
+			t.Error("stored ip-map IP key shares the caller's backing array; want an owned clone")
+		}
+	}
 }
 
 func TestRecordFingerprint_capDropsNewKeys(t *testing.T) {

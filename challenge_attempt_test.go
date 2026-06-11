@@ -4,10 +4,51 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestRecordChallengeAttempt_OwnsRetainedKeyStrings(t *testing.T) {
+	// The challenge map is a long-lived buffer (drained per flush window).
+	// Its key strings arrive as slices of request-owned backings: vhost is
+	// SplitHostPort(r.Host) (and r.Host can itself be a slice of the full
+	// request line for absolute-form URIs), outcome comes from another
+	// module's request var. Retaining those slices would pin the parent
+	// allocations for the whole window — the map must own its key strings.
+	a := newTestApp(t, "http://unused", "secret")
+	vhostBacking := "example.com" + strings.Repeat("h", 1<<20)
+	ipBacking := "203.0.113.7" + strings.Repeat("i", 1<<20)
+	outcomeBacking := "issued" + strings.Repeat("o", 1<<20)
+	key := challengeAttemptKey{
+		vhost:   vhostBacking[:11],
+		ip:      ipBacking[:11],
+		outcome: outcomeBacking[:6],
+	}
+	a.RecordChallengeAttempt(key)
+	a.RecordChallengeAttempt(key) // increment path must not re-retain
+
+	a.challengeMu.Lock()
+	defer a.challengeMu.Unlock()
+	require.Len(t, a.challengeMap, 1)
+	for k, n := range a.challengeMap {
+		require.Equal(t, uint64(2), n)
+		require.Equal(t, "example.com", k.vhost)
+		require.Equal(t, "203.0.113.7", k.ip)
+		require.Equal(t, "issued", k.outcome)
+		if unsafe.StringData(k.vhost) == unsafe.StringData(vhostBacking) {
+			t.Error("stored vhost key shares the caller's backing array; want an owned clone")
+		}
+		if unsafe.StringData(k.ip) == unsafe.StringData(ipBacking) {
+			t.Error("stored ip key shares the caller's backing array; want an owned clone")
+		}
+		if unsafe.StringData(k.outcome) == unsafe.StringData(outcomeBacking) {
+			t.Error("stored outcome key shares the caller's backing array; want an owned clone")
+		}
+	}
+}
 
 func TestRecordChallengeAttempt_MergesPerKey(t *testing.T) {
 	a := newTestApp(t, "http://unused", "secret")
