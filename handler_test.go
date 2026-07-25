@@ -25,6 +25,8 @@ type fakeApp struct {
 	challenges []challengeAttemptKey
 	psID       uint32
 	hashSalt   string
+	machineID  string
+	modeV2     bool
 }
 
 type recorded struct {
@@ -65,6 +67,9 @@ func (f *fakeApp) RecordChallengeAttempt(key challengeAttemptKey) {
 func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
+
+func (f *fakeApp) MachineID() string         { return f.machineID }
+func (f *fakeApp) RequestEventsModeV2() bool { return f.modeV2 }
 
 func (f *fakeApp) challengeSnapshot() []challengeAttemptKey {
 	f.mu.Lock()
@@ -751,4 +756,93 @@ func TestServeHTTP_RequestEventTruncatesLongPathAndUA(t *testing.T) {
 	require.LessOrEqual(t, len(evs[0].UA), 512)
 	require.True(t, utf8.ValidString(evs[0].Path))
 	require.True(t, utf8.ValidString(evs[0].UA))
+}
+
+func TestServeHTTP_V2RecordsBlockedRequestEventWithDisposition(t *testing.T) {
+	// mode_v2: a WAF-blocked request (apx_block_reason=waf) is now LOGGED as
+	// a request_event with disposition=waf_blocked (legacy mode skipped it).
+	app := &fakeApp{modeV2: true, machineID: "mach-1"}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/wp-login.php", "100", map[string]any{
+		"http.vars.apx_block_reason": "waf",
+	})
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1, "v2 logs blocked requests")
+	require.Equal(t, dispWafBlocked, evs[0].Disposition)
+	require.Equal(t, uint32(100), evs[0].VhostID)
+	require.Equal(t, "", evs[0].Host, "host empty when vhost_id>0")
+	require.True(t, evs[0].V2)
+	require.Equal(t, "mach-1", evs[0].MachineID)
+	require.NotZero(t, evs[0].TsUnixMs)
+	require.NotZero(t, evs[0].MachineSeq)
+}
+
+func TestServeHTTP_V2RecordsRateLimitedDisposition(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	w := httptest.NewRecorder()
+	rateLimited := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusTooManyRequests, nil)
+	})
+	_ = h.ServeHTTP(w, r, rateLimited)
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, dispRateLimited, evs[0].Disposition)
+	require.Equal(t, uint16(429), evs[0].Status)
+}
+
+func TestServeHTTP_V2RecordsTerminalChallengeWithHostAndZeroVhost(t *testing.T) {
+	// mode_v2: a terminal challenge has NO vhost_id (apx_challenge returns
+	// before the per-vhost vars handler). It must still be logged with
+	// vhost_id=0, host set (lowercased/port-stripped), disposition mapped.
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithChallengeOutcome("GET", "/", "Example.COM:8443", "issued")
+	r.RemoteAddr = "203.0.113.7:54321"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1, "terminal challenge logged despite missing vhost_id")
+	require.Equal(t, uint32(0), evs[0].VhostID)
+	require.Equal(t, "example.com", evs[0].Host)
+	require.Equal(t, dispChallengeIssued, evs[0].Disposition)
+	// The challenge_attempt counter is still recorded too.
+	require.Len(t, app.challengeSnapshot(), 1)
+}
+
+func TestServeHTTP_V2ServedDispositionAndEmptyHost(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/api", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, dispServed, evs[0].Disposition)
+	require.Equal(t, "", evs[0].Host, "served rows with a vhost_id omit host")
+	require.True(t, evs[0].V2)
+}
+
+func TestServeHTTP_V2NoChallengeNoVhost_DoesNotLog(t *testing.T) {
+	// mode_v2: a plain no-route request (no vhost_id, no challenge outcome)
+	// must still be dropped — logging it under vhost_id=0 would pollute the
+	// per-vhost log. Only terminal challenges relax the vhost gate.
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(404)))
+	require.Empty(t, app.reqEventSnapshot())
 }
