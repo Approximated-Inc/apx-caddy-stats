@@ -75,10 +75,12 @@ func requestEventRowBytes(row *requestEventRow) int {
 		len(row.MachineID) + len(row.Disposition) + len(row.Host)
 }
 
-// record is called once per served request. The caller has already applied
-// the served-only filter and built row WITHOUT SampleRate; record computes
-// the sample decision, stamps SampleRate on kept rows, and appends (or
-// counts overflow at the row cap / governor byte budget).
+// record is called once per request the handler decides to log. The caller
+// builds row WITHOUT SampleRate; record computes the sample decision (in
+// mode_v2, recordV2Locked splits served vs. non-served internally — no
+// served-only filter is applied by the caller), stamps SampleRate on kept
+// rows, and appends (or counts overflow at the row cap / governor byte
+// budget).
 //
 // The sample factor is the MAX of the seen-based load factor and the
 // governor's pressure-driven floor: as memory pressure rises past

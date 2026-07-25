@@ -150,6 +150,18 @@ type RequestEventsConfig struct {
 	Enabled         bool `json:"enabled,omitempty"`
 	SampleThreshold int  `json:"sample_threshold,omitempty"`
 	MaxRows         int  `json:"max_rows,omitempty"`
+
+	// ModeV2 turns on customer-facing cluster request logs: served rows are
+	// UNSAMPLED, blocked/rate-limited/challenge requests are logged with a
+	// disposition (non-served rows sampled via BlockedSampleThreshold), and
+	// each row carries the extra wire fields (ts_ms, machine_id, machine_seq,
+	// disposition, host). Emitted by the Phoenix config generator only for
+	// new-enough images, so old configs (ModeV2 false) stay byte-identical.
+	ModeV2 bool `json:"mode_v2,omitempty"`
+	// BlockedSampleThreshold is the per-window emit count above which
+	// NON-served rows sample under load (mode_v2 only). <=0 → default 2000.
+	// Served rows ignore this entirely (unsampled).
+	BlockedSampleThreshold int `json:"blocked_sample_threshold,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -434,13 +446,23 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	// request_events recorder: built only when the track is explicitly
 	// enabled. SampleThreshold passes through as-is (<=0 → never sample);
 	// MaxRows defaults to 200_000. Otherwise left nil → RecordRequestEvent
-	// no-ops.
+	// no-ops. ModeV2 builds the v2 recorder instead (unsampled served rows,
+	// disposition-sampled non-served rows) and resolves reqEventsModeV2.
 	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
-		a.requestEvents = newRequestEventRecorder(
-			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
-			a.Ingest.RequestEvents.SampleThreshold,
-			a.memGov,
-		)
+		if a.Ingest.RequestEvents.ModeV2 {
+			a.reqEventsModeV2 = true
+			a.requestEvents = newRequestEventRecorderV2(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				intDefault(a.Ingest.RequestEvents.BlockedSampleThreshold, 2000),
+				a.memGov,
+			)
+		} else {
+			a.requestEvents = newRequestEventRecorder(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				a.Ingest.RequestEvents.SampleThreshold,
+				a.memGov,
+			)
+		}
 	}
 	a.initL4IpState()
 	if a.cfg.fingerprintMaxKeys > 0 {

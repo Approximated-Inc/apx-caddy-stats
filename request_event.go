@@ -52,6 +52,10 @@ type requestEventRow struct {
 //
 //	{"_type":"request_event","ts":"...","proxy_server_id":N,"vhost_id":N,"client_ip":"...","forwarded_ip":"...","front_proxy":"...","method":"...","path":"...","path_bucket":"...","status":N,"http_version":"...","ua":"...","origin":"...","bytes_in":N,"bytes_out":N,"duration_us":N,"sample_rate":N}
 //
+// When row.V2 is set, five more fields are appended after sample_rate:
+// ts_ms, machine_id, machine_seq, disposition, host. This keeps the
+// legacy prefix byte-identical for non-v2 rows (old configs / old ingest).
+//
 // ts is second-precision RFC3339 (formatTsSec). String fields go through
 // writeString so arbitrary-byte values (path, ua) are JSON-escaped.
 // country/asn/asn_org are intentionally absent — Phoenix enriches those
