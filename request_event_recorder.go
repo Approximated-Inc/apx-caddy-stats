@@ -31,6 +31,14 @@ type requestEventRecorder struct {
 	// ungoverned (tests).
 	gov           *memGovernor
 	reservedBytes int // governor bytes reserved this window; released at drain
+
+	// mode_v2: served rows bypass the seen-threshold sampler entirely
+	// (unsampled) while non-served (blocked/rate-limited/challenge) rows use
+	// blockedThreshold with their own seenBlocked window counter. The
+	// governor's pressure floor + the row cap still apply to both.
+	modeV2           bool
+	blockedThreshold int
+	seenBlocked      int
 }
 
 // newRequestEventRecorder builds a recorder capped at maxRows rows/window
@@ -40,6 +48,14 @@ type requestEventRecorder struct {
 // under memory pressure.
 func newRequestEventRecorder(maxRows, threshold int, gov *memGovernor) *requestEventRecorder {
 	return &requestEventRecorder{maxRows: maxRows, threshold: threshold, gov: gov}
+}
+
+// newRequestEventRecorderV2 builds a mode_v2 recorder: served rows are kept
+// unsampled (governor + cap still bound memory), non-served rows sample
+// once seenBlocked passes blockedThreshold in a window. A blockedThreshold
+// <= 0 disables load-based sampling for non-served rows too.
+func newRequestEventRecorderV2(maxRows, blockedThreshold int, gov *memGovernor) *requestEventRecorder {
+	return &requestEventRecorder{maxRows: maxRows, blockedThreshold: blockedThreshold, gov: gov, modeV2: true}
 }
 
 // requestEventRowFixedBytes over-approximates the in-memory fixed cost of
@@ -75,6 +91,12 @@ func (r *requestEventRecorder) record(row requestEventRow) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.modeV2 {
+		r.recordV2Locked(row)
+		return
+	}
+
+	// Legacy: single seen-threshold sampler over every (served-only) row.
 	factor := 1
 	if r.threshold > 0 && r.seen >= r.threshold {
 		factor = r.seen/r.threshold + 1
@@ -84,26 +106,69 @@ func (r *requestEventRecorder) record(row requestEventRow) {
 			factor = pf
 		}
 	}
-
-	keep := true
-	rate := uint16(1)
-	if factor > 1 {
-		if r.seen%factor == 0 {
-			rate = uint16(factor)
-		} else {
-			keep = false
-		}
-	}
+	keep, rate := sampleDecision(r.seen, factor)
 	r.seen++
+	if keep {
+		r.appendLocked(row, rate)
+	}
+}
 
-	if !keep {
+// recordV2Locked applies disposition-aware sampling. Caller holds r.mu.
+func (r *requestEventRecorder) recordV2Locked(row requestEventRow) {
+	if row.Disposition == dispServed {
+		// Served: UNSAMPLED by threshold. Only the governor's pressure floor
+		// can force sampling under memory pressure; the row cap still binds.
+		factor := 1
+		if r.gov != nil {
+			if pf := pressureSampleFloor(r.gov.pressure()); pf > factor {
+				factor = pf
+			}
+		}
+		keep, rate := sampleDecision(r.seen, factor)
+		r.seen++
+		if keep {
+			r.appendLocked(row, rate)
+		}
 		return
 	}
+
+	// Non-served (blocked / rate-limited / challenge): own threshold + own
+	// window counter, with the governor floor as a lower bound.
+	factor := 1
+	if r.blockedThreshold > 0 && r.seenBlocked >= r.blockedThreshold {
+		factor = r.seenBlocked/r.blockedThreshold + 1
+	}
+	if r.gov != nil {
+		if pf := pressureSampleFloor(r.gov.pressure()); pf > factor {
+			factor = pf
+		}
+	}
+	keep, rate := sampleDecision(r.seenBlocked, factor)
+	r.seenBlocked++
+	if keep {
+		r.appendLocked(row, rate)
+	}
+}
+
+// sampleDecision applies the deterministic 1-in-factor keep rule for the
+// given per-window seen count. factor<=1 keeps every row at SampleRate=1.
+func sampleDecision(seen, factor int) (keep bool, rate uint16) {
+	if factor <= 1 {
+		return true, 1
+	}
+	if seen%factor == 0 {
+		return true, uint16(factor)
+	}
+	return false, 0
+}
+
+// appendLocked stamps SampleRate and appends row, honoring the row cap and
+// the governor byte budget. Caller holds r.mu.
+func (r *requestEventRecorder) appendLocked(row requestEventRow, rate uint16) {
 	if len(r.rows) >= r.maxRows {
 		r.overflow++
 		return
 	}
-	// Hard backstop: the row's bytes must fit the governed budget.
 	if r.gov != nil {
 		n := requestEventRowBytes(&row)
 		if !r.gov.tryReserve(n) {
@@ -131,6 +196,7 @@ func (r *requestEventRecorder) drain() ([]requestEventRow, uint64) {
 	r.reservedBytes = 0
 	r.rows = nil
 	r.seen = 0
+	r.seenBlocked = 0
 	r.overflow = 0
 	return rows, overflow
 }
