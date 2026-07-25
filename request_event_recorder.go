@@ -43,10 +43,11 @@ func newRequestEventRecorder(maxRows, threshold int, gov *memGovernor) *requestE
 }
 
 // requestEventRowFixedBytes over-approximates the in-memory fixed cost of
-// one buffered row: unsafe.Sizeof(requestEventRow{}) (~184 on 64-bit)
-// plus a little append slack. Pinned by a test against the real Sizeof so
-// struct growth can't silently undercount the byte budget.
-const requestEventRowFixedBytes = 192
+// one buffered row (unsafe.Sizeof(requestEventRow{}) plus append slack).
+// Pinned by TestRowFixedBytesCoverStructSizes against the real Sizeof.
+// Bumped from 192 when the mode_v2 fields (TsUnixMs/MachineID/MachineSeq/
+// Disposition/Host/V2) were added.
+const requestEventRowFixedBytes = 320
 
 // requestEventRowBytes approximates the resident bytes one buffered row
 // holds: the fixed struct size plus every string field's backing bytes.
@@ -54,7 +55,8 @@ func requestEventRowBytes(row *requestEventRow) int {
 	return requestEventRowFixedBytes +
 		len(row.ClientIP) + len(row.ForwardedIP) + len(row.FrontProxy) +
 		len(row.Method) + len(row.Path) + len(row.PathBucket) +
-		len(row.HTTPVersion) + len(row.UA) + len(row.Origin)
+		len(row.HTTPVersion) + len(row.UA) + len(row.Origin) +
+		len(row.MachineID) + len(row.Disposition) + len(row.Host)
 }
 
 // record is called once per served request. The caller has already applied
