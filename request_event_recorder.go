@@ -2,10 +2,12 @@ package apxstats
 
 import "sync"
 
-// requestEventRecorder accumulates raw request_event rows (one per SERVED
-// request — the served-only filter is applied at the handler, not here)
-// into a flat append buffer per window, with a per-window
-// sample-under-load guard plus a hard cap.
+// requestEventRecorder accumulates raw request_event rows into a flat append
+// buffer per window, with a per-window sample-under-load guard plus a hard
+// cap. In mode_v2 every disposition flows through record (no served-only
+// filter at the handler); the recorder splits served vs. non-served
+// internally (recordV2Locked) and samples each independently. The legacy
+// (non-v2) recorder still expects a served-only stream filtered upstream.
 //
 // Sample-under-load (deterministic): seen counts emits considered this
 // window. While seen < threshold (or threshold<=0) every row is kept with
