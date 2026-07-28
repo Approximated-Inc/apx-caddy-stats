@@ -87,3 +87,84 @@ func TestEncodeRequestEventRow_EscapesStrings(t *testing.T) {
 	require.Equal(t, "/a\"b\x01c", got["path"])
 	require.Equal(t, "bad\\agent\"x", got["ua"])
 }
+
+func TestEncodeRequestEventRow_V2_ExactNDJSON(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	row := requestEventRow{
+		TsUnixSec:   1_700_000_000,
+		TsUnixMs:    1_700_000_000_123,
+		VhostID:     0, // terminal challenge: no vhost_id
+		ClientIP:    "203.0.113.7",
+		ForwardedIP: "198.51.100.9",
+		FrontProxy:  "cloudflare",
+		Method:      "GET",
+		Path:        "/login",
+		PathBucket:  "/login",
+		Status:      403,
+		HTTPVersion: "HTTP/2.0",
+		UA:          "curl/8.0",
+		Origin:      "cluster",
+		BytesIn:     512,
+		BytesOut:    4096,
+		DurationUs:  12345,
+		SampleRate:  1,
+		MachineID:   "mach-abc",
+		MachineSeq:  99,
+		Disposition: dispChallengeIssued,
+		Host:        "example.com",
+		V2:          true,
+	}
+	require.NoError(t, encodeRequestEventRow(gz, 42, row))
+	require.NoError(t, gz.Close())
+
+	gzr, err := gzip.NewReader(&buf)
+	require.NoError(t, err)
+	defer gzr.Close()
+	line, err := readAll(gzr)
+	require.NoError(t, err)
+
+	// V2 appends the new fields after sample_rate; the legacy prefix is
+	// byte-identical to the non-v2 line.
+	want := `{"_type":"request_event","ts":"2023-11-14T22:13:20Z","proxy_server_id":42,"vhost_id":0,"client_ip":"203.0.113.7","forwarded_ip":"198.51.100.9","front_proxy":"cloudflare","method":"GET","path":"/login","path_bucket":"/login","status":403,"http_version":"HTTP/2.0","ua":"curl/8.0","origin":"cluster","bytes_in":512,"bytes_out":4096,"duration_us":12345,"sample_rate":1,"ts_ms":1700000000123,"machine_id":"mach-abc","machine_seq":99,"disposition":"challenge_issued","host":"example.com"}` + "\n"
+	require.Equal(t, want, string(line))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got))
+	require.Equal(t, float64(1700000000123), got["ts_ms"])
+	require.Equal(t, "challenge_issued", got["disposition"])
+	require.Equal(t, "example.com", got["host"])
+	require.Equal(t, float64(99), got["machine_seq"])
+}
+
+func TestEncodeRequestEventRow_NonV2_OmitsNewFields(t *testing.T) {
+	// V2=false must produce zero new keys (byte-identical legacy wire).
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	require.NoError(t, encodeRequestEventRow(gz, 1, requestEventRow{
+		TsUnixSec: 1_700_000_000, VhostID: 7, Status: 200, SampleRate: 1,
+		// New fields populated but V2 is false → must NOT be emitted.
+		TsUnixMs: 123, MachineID: "x", MachineSeq: 5, Disposition: dispServed, Host: "h",
+	}))
+	require.NoError(t, gz.Close())
+	gzr, err := gzip.NewReader(&buf)
+	require.NoError(t, err)
+	defer gzr.Close()
+	line, err := readAll(gzr)
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got))
+	for _, k := range []string{"ts_ms", "machine_id", "machine_seq", "disposition", "host"} {
+		_, present := got[k]
+		require.False(t, present, "non-v2 row must not carry %q", k)
+	}
+}
+
+func TestNextMachineSeq_Monotonic(t *testing.T) {
+	a := nextMachineSeq()
+	b := nextMachineSeq()
+	c := nextMachineSeq()
+	require.Greater(t, b, a)
+	require.Greater(t, c, b)
+}

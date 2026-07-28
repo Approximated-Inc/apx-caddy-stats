@@ -59,11 +59,20 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	// tests that aren't about the governor; RSS stubbed to 0.
 	a.memGov = newMemGovernor(4<<30, func() (uint64, bool) { return 0, true }, nil)
 	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
-		a.requestEvents = newRequestEventRecorder(
-			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
-			a.Ingest.RequestEvents.SampleThreshold,
-			a.memGov,
-		)
+		if a.Ingest.RequestEvents.ModeV2 {
+			a.reqEventsModeV2 = true
+			a.requestEvents = newRequestEventRecorderV2(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				intDefault(a.Ingest.RequestEvents.BlockedSampleThreshold, 2000),
+				a.memGov,
+			)
+		} else {
+			a.requestEvents = newRequestEventRecorder(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				a.Ingest.RequestEvents.SampleThreshold,
+				a.memGov,
+			)
+		}
 	}
 	a.initL4IpState()
 	a.stopCh = make(chan struct{})
@@ -687,4 +696,81 @@ func TestFlushOnce_NoRequestEventRowsWhenRecorderNil(t *testing.T) {
 	for _, r := range posts[0].rows {
 		require.NotEqual(t, "request_event", r["_type"])
 	}
+}
+
+func TestProvisionLike_BuildsV2RecorderWhenModeV2(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, ModeV2: true}
+	})
+	require.NotNil(t, a.requestEvents)
+	require.True(t, a.requestEvents.modeV2, "mode_v2 config must build a v2 recorder")
+	require.True(t, a.RequestEventsModeV2())
+	require.Equal(t, 2000, a.requestEvents.blockedThreshold, "default blocked_sample_threshold is 2000/window")
+}
+
+func TestProvisionLike_LegacyRecorderWhenModeV2Off(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, SampleThreshold: 1000}
+	})
+	require.NotNil(t, a.requestEvents)
+	require.False(t, a.requestEvents.modeV2)
+	require.False(t, a.RequestEventsModeV2())
+	require.Equal(t, 1000, a.requestEvents.threshold, "legacy recorder keeps sample_threshold")
+}
+
+func TestFlushOnce_ModeV2Off_WireHasNoNewFields(t *testing.T) {
+	// mode_v2 off: a served row ships in the legacy wire shape — none of the
+	// new keys may appear (byte-identical wire for old configs).
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true}
+	})
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()), VhostID: 100,
+		ClientIP: "203.0.113.7", Method: "GET", Path: "/api", Status: 200, Origin: OriginUpstream,
+	})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var ev map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			ev = r
+		}
+	}
+	require.NotNil(t, ev)
+	for _, k := range []string{"ts_ms", "machine_id", "machine_seq", "disposition", "host"} {
+		_, present := ev[k]
+		require.False(t, present, "mode_v2-off wire must not carry %q", k)
+	}
+}
+
+func TestFlushOnce_ModeV2On_WireCarriesDisposition(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, ModeV2: true}
+	})
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()), TsUnixMs: time.Now().UnixMilli(),
+		VhostID: 0, ClientIP: "203.0.113.7", Method: "GET", Path: "/login", Status: 403,
+		Origin: OriginCluster, Disposition: dispChallengeIssued, Host: "example.com", V2: true,
+	})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var ev map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			ev = r
+		}
+	}
+	require.NotNil(t, ev)
+	require.Equal(t, "challenge_issued", ev["disposition"])
+	require.Equal(t, "example.com", ev["host"])
+	_, hasTsMs := ev["ts_ms"]
+	require.True(t, hasTsMs)
 }

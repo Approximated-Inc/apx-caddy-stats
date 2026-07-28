@@ -152,6 +152,64 @@ func TestRequestEventRecorder_DrainReleasesGovernorBytes(t *testing.T) {
 	require.True(t, g.tryReserve(int(g.shareBudget)), "the full budget is usable next window")
 }
 
+func TestRequestEventRecorderV2_ServedUnsampled(t *testing.T) {
+	// mode_v2: served rows are never threshold-sampled, even far past what
+	// a blocked threshold would trigger. All kept, SampleRate=1, up to cap.
+	r := newRequestEventRecorderV2(100000, 10, nil)
+	const n = 500
+	for i := 0; i < n; i++ {
+		r.record(requestEventRow{Disposition: dispServed, VhostID: uint32(i)})
+	}
+	rows, overflow := r.drain()
+	require.Zero(t, overflow)
+	require.Len(t, rows, n, "served rows must not be sampled in v2")
+	for _, row := range rows {
+		require.Equal(t, uint16(1), row.SampleRate)
+	}
+}
+
+func TestRequestEventRecorderV2_NonServedSampledByBlockedThreshold(t *testing.T) {
+	// mode_v2: blocked/challenge rows use their OWN threshold and sample
+	// above it, stamping SampleRate>1.
+	r := newRequestEventRecorderV2(100000, 10, nil)
+	const n = 200
+	for i := 0; i < n; i++ {
+		r.record(requestEventRow{Disposition: dispWafBlocked})
+	}
+	rows, _ := r.drain()
+	require.Less(t, len(rows), n, "non-served rows sample above the blocked threshold")
+	require.NotEmpty(t, rows)
+	sawSampled := false
+	for _, row := range rows {
+		require.GreaterOrEqual(t, row.SampleRate, uint16(1))
+		if row.SampleRate > 1 {
+			sawSampled = true
+		}
+	}
+	require.True(t, sawSampled, "expected at least one blocked row with SampleRate>1")
+}
+
+func TestRequestEventRecorderV2_ServedAndBlockedIndependent(t *testing.T) {
+	// The two streams keep separate seen counters: a flood of blocked rows
+	// must not cause served rows to be sampled.
+	r := newRequestEventRecorderV2(100000, 5, nil)
+	for i := 0; i < 100; i++ {
+		r.record(requestEventRow{Disposition: dispWafBlocked})
+	}
+	for i := 0; i < 100; i++ {
+		r.record(requestEventRow{Disposition: dispServed})
+	}
+	rows, _ := r.drain()
+	served := 0
+	for _, row := range rows {
+		if row.Disposition == dispServed {
+			served++
+			require.Equal(t, uint16(1), row.SampleRate)
+		}
+	}
+	require.Equal(t, 100, served, "served stream unaffected by blocked flood")
+}
+
 func TestRequestEventRecorder_Race(t *testing.T) {
 	r := newRequestEventRecorder(100000, 10, nil)
 	var wg sync.WaitGroup
