@@ -1,6 +1,6 @@
 package apxchallenge
 
-// Probes is the JSON the widget posts to /__apx_form/token. All fields are
+// Probes is the JSON the widget posts to /__apx_verify/token. All fields are
 // attacker-controlled — treat as untrusted signal, never as ground truth.
 type Probes struct {
 	FillMs       int64    `json:"fill_ms"`      // load → token-request elapsed

@@ -20,28 +20,28 @@ func TestRenderPageInlinesAssetsAndValues(t *testing.T) {
 	require.Contains(t, html, `name="solution"`)
 }
 
-func TestRenderFormWidgetSubstitutes(t *testing.T) {
-	out := renderFormWidget("/__apx_form/challenge", "/__apx_form/token")
+func TestRenderVerifyWidgetSubstitutes(t *testing.T) {
+	out := renderVerifyWidget("/__apx_verify/challenge", "/__apx_verify/token")
 	if strings.Contains(out, "{{CHALLENGE_PATH}}") || strings.Contains(out, "{{TOKEN_PATH}}") {
 		t.Fatal("placeholders not substituted")
 	}
-	if !strings.Contains(out, "/__apx_form/token") {
+	if !strings.Contains(out, "/__apx_verify/token") {
 		t.Fatal("token path missing")
 	}
-	if !strings.Contains(out, "_apx_form_token") {
+	if !strings.Contains(out, "_apx_verify_token") {
 		t.Fatal("hidden field name missing from widget")
 	}
 }
 
-// TestRenderFormWidgetWireContract guards the browser-side literals that the
+// TestRenderVerifyWidgetWireContract guards the browser-side literals that the
 // Go endpoint/token code (Task 6) depends on but that Go tests can't execute.
 // A future accidental deletion of any of these breaks interop silently.
-func TestRenderFormWidgetWireContract(t *testing.T) {
-	out := renderFormWidget("/__apx_form/challenge", "/__apx_form/token")
-	require.Contains(t, out, "/__apx_form/challenge") // challenge path substituted
-	require.Contains(t, out, `'SHA-256'`)             // WebCrypto PoW digest algo
-	require.Contains(t, out, "crypto.subtle")         // WebCrypto used
-	require.Contains(t, out, `+ "." +`)               // exact challenge + "." + solution construction
+func TestRenderVerifyWidgetWireContract(t *testing.T) {
+	out := renderVerifyWidget("/__apx_verify/challenge", "/__apx_verify/token")
+	require.Contains(t, out, "/__apx_verify/challenge") // challenge path substituted
+	require.Contains(t, out, `'SHA-256'`)               // WebCrypto PoW digest algo
+	require.Contains(t, out, "crypto.subtle")           // WebCrypto used
+	require.Contains(t, out, `+ "." +`)                 // exact challenge + "." + solution construction
 	// Probes JSON field names must byte-match the Go Probes struct tags.
 	require.Contains(t, out, "fill_ms")
 	require.Contains(t, out, "interactions")
@@ -51,6 +51,6 @@ func TestRenderFormWidgetWireContract(t *testing.T) {
 	require.Contains(t, out, "challenge")
 	require.Contains(t, out, "solution")
 	require.Contains(t, out, "probes")
-	require.Contains(t, out, "X-Apx-Form-Token") // header for JSON/fetch submitters
-	require.Contains(t, out, "window.apxForm")   // public API
+	require.Contains(t, out, "X-Apx-Verify-Token") // header for JSON/fetch submitters
+	require.Contains(t, out, "window.apxVerify")   // public API
 }

@@ -1,5 +1,5 @@
 /*
- * Approximated first-party form-protection widget.
+ * Approximated first-party Edge Verify widget.
  *
  * Served from the customer's own domain by the edge (embedded in the Go binary,
  * endpoint paths substituted server-side). It is the in-house alternative to a
@@ -13,12 +13,12 @@
  *      SHA-256(challenge + "." + solution) has >= difficulty LEADING ZERO BITS.
  *      The hash input is byte-identical to the Go verifier (proof_of_work.go).
  *   3. POST {{TOKEN_PATH}} (urlencoded: challenge, solution, probes) -> { token, expires_in }
- *   4. Inject <input type="hidden" name="_apx_form_token" value=token> into every
+ *   4. Inject <input type="hidden" name="_apx_verify_token" value=token> into every
  *      <form> (now and, via MutationObserver, any added later by SPAs).
  *   5. Refresh the token before it expires.
  *
- * window.apxForm.getToken() returns the current token (or null) so fetch/JSON
- * submitters can send it in the `X-Apx-Form-Token` request header.
+ * window.apxVerify.getToken() returns the current token (or null) so fetch/JSON
+ * submitters can send it in the `X-Apx-Verify-Token` request header.
  *
  * Dependency-free vanilla JS, no build step.
  */
@@ -27,8 +27,8 @@
 
   var CHALLENGE_PATH = "{{CHALLENGE_PATH}}";
   var TOKEN_PATH = "{{TOKEN_PATH}}";
-  var FIELD_NAME = "_apx_form_token";
-  var HEADER_NAME = "X-Apx-Form-Token";
+  var FIELD_NAME = "_apx_verify_token";
+  var HEADER_NAME = "X-Apx-Verify-Token";
 
   var startedAt = now();
   var currentToken = null;
@@ -36,7 +36,7 @@
   var refreshTimer = null;
 
   // --- public API ---------------------------------------------------------
-  window.apxForm = {
+  window.apxVerify = {
     getToken: function () {
       return currentToken;
     },
@@ -278,7 +278,7 @@
       })
       .catch(function (e) {
         // Fail open: a broken widget must never wedge a real customer's forms.
-        if (window.console && console.debug) console.debug("apxForm:", e);
+        if (window.console && console.debug) console.debug("apxVerify:", e);
       });
   }
 

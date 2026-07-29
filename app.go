@@ -22,13 +22,13 @@ type AppRef interface {
 	Secret() string
 	Difficulty() int
 	VerifyPath() string
-	FormDifficulty() int
-	FormTokenTTL() time.Duration
-	FormMinFillMs() int64
-	FormScoring() string
-	FormBodyCap() int64
-	// ReplayLRU is the process-wide, app-owned set of recently-seen form-token
-	// nonces. Shared across all form routes so a token is single-use per machine.
+	VerifyDifficulty() int
+	VerifyTokenTTL() time.Duration
+	VerifyMinFillMs() int64
+	VerifyScoring() string
+	VerifyBodyCap() int64
+	// ReplayLRU is the process-wide, app-owned set of recently-seen verify-token
+	// nonces. Shared across all verify routes so a token is single-use per machine.
 	ReplayLRU() *NonceLRU
 }
 
@@ -45,27 +45,27 @@ type ChallengeApp struct {
 	SecretCfg     string `json:"secret,omitempty"`
 	VerifyPathCfg string `json:"verify_path,omitempty"`
 
-	// FormDifficultyCfg / FormTokenTTLSecondsCfg / FormMinFillMsCfg /
-	// FormScoringCfg / FormBodyCapBytesCfg carry the form-protection config
-	// keys form_difficulty / form_token_ttl_seconds / form_min_fill_ms /
-	// form_scoring / form_body_cap_bytes. Same *Cfg-suffix convention as above.
-	FormDifficultyCfg      int    `json:"form_difficulty,omitempty"`
-	FormTokenTTLSecondsCfg int    `json:"form_token_ttl_seconds,omitempty"`
-	FormMinFillMsCfg       int64  `json:"form_min_fill_ms,omitempty"`
-	FormScoringCfg         string `json:"form_scoring,omitempty"`
-	FormBodyCapBytesCfg    int64  `json:"form_body_cap_bytes,omitempty"`
+	// VerifyDifficultyCfg / VerifyTokenTTLSecondsCfg / VerifyMinFillMsCfg /
+	// VerifyScoringCfg / VerifyBodyCapBytesCfg carry the Edge Verify config
+	// keys verify_difficulty / verify_token_ttl_seconds / verify_min_fill_ms /
+	// verify_scoring / verify_body_cap_bytes. Same *Cfg-suffix convention as above.
+	VerifyDifficultyCfg      int    `json:"verify_difficulty,omitempty"`
+	VerifyTokenTTLSecondsCfg int    `json:"verify_token_ttl_seconds,omitempty"`
+	VerifyMinFillMsCfg       int64  `json:"verify_min_fill_ms,omitempty"`
+	VerifyScoringCfg         string `json:"verify_scoring,omitempty"`
+	VerifyBodyCapBytesCfg    int64  `json:"verify_body_cap_bytes,omitempty"`
 
 	logger     *zap.Logger
 	secret     string
 	difficulty int
 	verifyPath string
 
-	formDifficulty int
-	formTokenTTL   time.Duration
-	formMinFillMs  int64
-	formScoring    string
-	formBodyCap    int64
-	replayLRU      *NonceLRU
+	verifyDifficulty int
+	verifyTokenTTL   time.Duration
+	verifyMinFillMs  int64
+	verifyScoring    string
+	verifyBodyCap    int64
+	replayLRU        *NonceLRU
 }
 
 // defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
@@ -95,25 +95,25 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
 
-	if a.formDifficulty = a.FormDifficultyCfg; a.formDifficulty <= 0 {
-		a.formDifficulty = 14
+	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
+		a.verifyDifficulty = 14
 	}
-	if s := a.FormTokenTTLSecondsCfg; s > 0 {
-		a.formTokenTTL = time.Duration(s) * time.Second
+	if s := a.VerifyTokenTTLSecondsCfg; s > 0 {
+		a.verifyTokenTTL = time.Duration(s) * time.Second
 	} else {
-		a.formTokenTTL = 600 * time.Second
+		a.verifyTokenTTL = 600 * time.Second
 	}
-	if a.formMinFillMs = a.FormMinFillMsCfg; a.formMinFillMs <= 0 {
-		a.formMinFillMs = 800
+	if a.verifyMinFillMs = a.VerifyMinFillMsCfg; a.verifyMinFillMs <= 0 {
+		a.verifyMinFillMs = 800
 	}
-	switch a.FormScoringCfg {
+	switch a.VerifyScoringCfg {
 	case "off", "lenient", "strict":
-		a.formScoring = a.FormScoringCfg
+		a.verifyScoring = a.VerifyScoringCfg
 	default:
-		a.formScoring = "lenient"
+		a.verifyScoring = "lenient"
 	}
-	if a.formBodyCap = a.FormBodyCapBytesCfg; a.formBodyCap <= 0 {
-		a.formBodyCap = 1 << 20
+	if a.verifyBodyCap = a.VerifyBodyCapBytesCfg; a.verifyBodyCap <= 0 {
+		a.verifyBodyCap = 1 << 20
 	}
 	a.replayLRU = NewNonceLRU(defaultReplayLRUSize)
 
@@ -127,12 +127,12 @@ func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
 func (a *ChallengeApp) VerifyPath() string { return a.verifyPath }
 
-func (a *ChallengeApp) FormDifficulty() int         { return a.formDifficulty }
-func (a *ChallengeApp) FormTokenTTL() time.Duration { return a.formTokenTTL }
-func (a *ChallengeApp) FormMinFillMs() int64        { return a.formMinFillMs }
-func (a *ChallengeApp) FormScoring() string         { return a.formScoring }
-func (a *ChallengeApp) FormBodyCap() int64          { return a.formBodyCap }
-func (a *ChallengeApp) ReplayLRU() *NonceLRU        { return a.replayLRU }
+func (a *ChallengeApp) VerifyDifficulty() int         { return a.verifyDifficulty }
+func (a *ChallengeApp) VerifyTokenTTL() time.Duration { return a.verifyTokenTTL }
+func (a *ChallengeApp) VerifyMinFillMs() int64        { return a.verifyMinFillMs }
+func (a *ChallengeApp) VerifyScoring() string         { return a.verifyScoring }
+func (a *ChallengeApp) VerifyBodyCap() int64          { return a.verifyBodyCap }
+func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)

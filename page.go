@@ -15,8 +15,8 @@ var powJS string
 //go:embed assets/challenge.css
 var pageCSS string
 
-//go:embed assets/form_widget.js
-var formWidgetJS string
+//go:embed assets/verify_widget.js
+var verifyWidgetJS string
 
 // renderPage inlines the CSS + JS and injects the per-request challenge token,
 // difficulty, and verify path. One self-contained HTML response — no separate
@@ -31,11 +31,11 @@ func renderPage(challengeToken string, difficulty int, verifyPath string) string
 	).Replace(pageHTML)
 }
 
-// renderFormWidget substitutes the endpoint paths into the embedded widget.
+// renderVerifyWidget substitutes the endpoint paths into the embedded widget.
 // Served as application/javascript with a long cache + ETag by the handler.
-func renderFormWidget(challengePath, tokenPath string) string {
+func renderVerifyWidget(challengePath, tokenPath string) string {
 	return strings.NewReplacer(
 		"{{CHALLENGE_PATH}}", challengePath,
 		"{{TOKEN_PATH}}", tokenPath,
-	).Replace(formWidgetJS)
+	).Replace(verifyWidgetJS)
 }

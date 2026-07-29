@@ -13,22 +13,22 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// formTestApp is an AppRef for the form handlers with FormScoring "off" so the
-// probe ruleset never blocks a well-formed mint, and a low FormDifficulty so the
+// verifyTestApp is an AppRef for the verify handlers with VerifyScoring "off" so the
+// probe ruleset never blocks a well-formed mint, and a low VerifyDifficulty so the
 // PoW solve in-test is instant.
-type formTestApp struct{}
+type verifyTestApp struct{}
 
-func (formTestApp) Secret() string              { return "s" }
-func (formTestApp) Difficulty() int             { return 8 }
-func (formTestApp) VerifyPath() string          { return "/__apx_challenge/verify" }
-func (formTestApp) FormDifficulty() int         { return 4 }
-func (formTestApp) FormTokenTTL() time.Duration { return 600 * time.Second }
-func (formTestApp) FormMinFillMs() int64        { return 800 }
-func (formTestApp) FormScoring() string         { return "off" }
-func (formTestApp) FormBodyCap() int64          { return 1 << 20 }
-func (formTestApp) ReplayLRU() *NonceLRU        { return NewNonceLRU(1024) }
+func (verifyTestApp) Secret() string                { return "s" }
+func (verifyTestApp) Difficulty() int               { return 8 }
+func (verifyTestApp) VerifyPath() string            { return "/__apx_challenge/verify" }
+func (verifyTestApp) VerifyDifficulty() int         { return 4 }
+func (verifyTestApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
+func (verifyTestApp) VerifyMinFillMs() int64        { return 800 }
+func (verifyTestApp) VerifyScoring() string         { return "off" }
+func (verifyTestApp) VerifyBodyCap() int64          { return 1 << 20 }
+func (verifyTestApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }
 
-func newFakeApp() AppRef { return formTestApp{} }
+func newFakeApp() AppRef { return verifyTestApp{} }
 
 func formBody(fields map[string]string) io.Reader {
 	v := url.Values{}
@@ -65,10 +65,10 @@ var emptyNext = caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Reques
 
 // mintToken drives the challenge+token endpoints and returns a valid token bound
 // to ip+host. Fails the test on any endpoint error.
-func mintToken(t *testing.T, eh *FormEndpointHandler, ip, host string) string {
+func mintToken(t *testing.T, eh *VerifyEndpointHandler, ip, host string) string {
 	t.Helper()
 
-	chReq := postReqHost("/__apx_form/challenge", ip, host, nil)
+	chReq := postReqHost("/__apx_verify/challenge", ip, host, nil)
 	chRec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(chRec, chReq, emptyNext)
 	var ch struct {
@@ -80,7 +80,7 @@ func mintToken(t *testing.T, eh *FormEndpointHandler, ip, host string) string {
 	}
 
 	sol := SolvePoW(ch.Challenge, ch.Difficulty)
-	tokReq := postReqHost("/__apx_form/token", ip, host,
+	tokReq := postReqHost("/__apx_verify/token", ip, host,
 		formBody(map[string]string{"challenge": ch.Challenge, "solution": sol, "probes": `{"fill_ms":5000}`}))
 	tokRec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(tokRec, tokReq, emptyNext)
@@ -96,16 +96,16 @@ func mintToken(t *testing.T, eh *FormEndpointHandler, ip, host string) string {
 	return tk.Token
 }
 
-func TestFormEndpointMintsAndHandlerAccepts(t *testing.T) {
+func TestVerifyEndpointMintsAndHandlerAccepts(t *testing.T) {
 	app := newFakeApp()
-	eh := &FormEndpointHandler{app: app}
-	ph := &FormProtectionHandler{app: app, replay: NewNonceLRU(1024), Mode: "enforce"}
+	eh := &VerifyEndpointHandler{app: app}
+	ph := &VerifyHandler{app: app, replay: NewNonceLRU(1024), Mode: "enforce"}
 
 	tok := mintToken(t, eh, "203.0.113.5", "shop.example.com")
 
 	// protected POST carrying the token in the body → passes to next AND the
 	// restored body must still be fully readable by next (upstream).
-	body := formBody(map[string]string{"_apx_form_token": tok, "email": "a@b.c"})
+	body := formBody(map[string]string{"_apx_verify_token": tok, "email": "a@b.c"})
 	pReq := postReqHost("/contact", "203.0.113.5", "shop.example.com", body)
 	pRec := httptest.NewRecorder()
 	called := false
@@ -120,7 +120,7 @@ func TestFormEndpointMintsAndHandlerAccepts(t *testing.T) {
 	if !called {
 		t.Fatalf("valid token should pass to next; got %d", pRec.Code)
 	}
-	if !strings.Contains(forwarded, "_apx_form_token") || !strings.Contains(forwarded, "email") {
+	if !strings.Contains(forwarded, "_apx_verify_token") || !strings.Contains(forwarded, "email") {
 		t.Fatalf("upstream did not receive the full restored body: %q", forwarded)
 	}
 	if got := outcomeVar(pReq); got != "passed" {
@@ -128,9 +128,9 @@ func TestFormEndpointMintsAndHandlerAccepts(t *testing.T) {
 	}
 }
 
-func TestFormHandlerBlocksMissingTokenInEnforce(t *testing.T) {
+func TestVerifyHandlerBlocksMissingTokenInEnforce(t *testing.T) {
 	app := newFakeApp()
-	ph := &FormProtectionHandler{app: app, replay: NewNonceLRU(16), Mode: "enforce"}
+	ph := &VerifyHandler{app: app, replay: NewNonceLRU(16), Mode: "enforce"}
 	req := postReqHost("/contact", "203.0.113.5", "shop.example.com", formBody(map[string]string{"email": "a@b.c"}))
 	rec := httptest.NewRecorder()
 	called := false
@@ -143,9 +143,9 @@ func TestFormHandlerBlocksMissingTokenInEnforce(t *testing.T) {
 	}
 }
 
-func TestFormHandlerMonitorAlwaysPasses(t *testing.T) {
+func TestVerifyHandlerMonitorAlwaysPasses(t *testing.T) {
 	app := newFakeApp()
-	ph := &FormProtectionHandler{app: app, replay: NewNonceLRU(16), Mode: "monitor"}
+	ph := &VerifyHandler{app: app, replay: NewNonceLRU(16), Mode: "monitor"}
 	req := postReqHost("/contact", "203.0.113.5", "shop.example.com", formBody(nil))
 	rec := httptest.NewRecorder()
 	called := false
@@ -158,18 +158,18 @@ func TestFormHandlerMonitorAlwaysPasses(t *testing.T) {
 	}
 }
 
-func TestFormHandlerReplayRejected(t *testing.T) {
+func TestVerifyHandlerReplayRejected(t *testing.T) {
 	// second use of same token → outcome replayed, blocked in enforce
 	app := newFakeApp()
-	eh := &FormEndpointHandler{app: app}
+	eh := &VerifyEndpointHandler{app: app}
 	replay := NewNonceLRU(1024)
-	ph := &FormProtectionHandler{app: app, replay: replay, Mode: "enforce"}
+	ph := &VerifyHandler{app: app, replay: replay, Mode: "enforce"}
 
 	tok := mintToken(t, eh, "203.0.113.5", "shop.example.com")
 
 	// first submission passes
 	req1 := postReqHost("/contact", "203.0.113.5", "shop.example.com",
-		formBody(map[string]string{"_apx_form_token": tok, "email": "a@b.c"}))
+		formBody(map[string]string{"_apx_verify_token": tok, "email": "a@b.c"}))
 	rec1 := httptest.NewRecorder()
 	called1 := false
 	_ = ph.ServeHTTP(rec1, req1, nextFn(func() { called1 = true }))
@@ -182,7 +182,7 @@ func TestFormHandlerReplayRejected(t *testing.T) {
 
 	// replay: same token again → blocked
 	req2 := postReqHost("/contact", "203.0.113.5", "shop.example.com",
-		formBody(map[string]string{"_apx_form_token": tok, "email": "a@b.c"}))
+		formBody(map[string]string{"_apx_verify_token": tok, "email": "a@b.c"}))
 	rec2 := httptest.NewRecorder()
 	called2 := false
 	_ = ph.ServeHTTP(rec2, req2, nextFn(func() { called2 = true }))
@@ -194,9 +194,9 @@ func TestFormHandlerReplayRejected(t *testing.T) {
 	}
 }
 
-func TestFormEndpointServesWidget(t *testing.T) {
-	eh := &FormEndpointHandler{app: newFakeApp()}
-	r := withVars(httptest.NewRequest("GET", "/__apx_form/widget.js", nil))
+func TestVerifyEndpointServesWidget(t *testing.T) {
+	eh := &VerifyEndpointHandler{app: newFakeApp()}
+	r := withVars(httptest.NewRequest("GET", "/__apx_verify/widget.js", nil))
 	rec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(rec, r, emptyNext)
 	if rec.Code != 200 {
@@ -208,14 +208,14 @@ func TestFormEndpointServesWidget(t *testing.T) {
 	if rec.Result().Header.Get("ETag") == "" {
 		t.Fatal("widget missing ETag")
 	}
-	if !strings.Contains(rec.Body.String(), "_apx_form_token") {
+	if !strings.Contains(rec.Body.String(), "_apx_verify_token") {
 		t.Fatal("widget body missing field name")
 	}
 }
 
-func TestFormTokenRefusedOnBadPoW(t *testing.T) {
-	eh := &FormEndpointHandler{app: newFakeApp()}
-	chReq := postReqHost("/__apx_form/challenge", "203.0.113.5", "shop.example.com", nil)
+func TestVerifyTokenRefusedOnBadPoW(t *testing.T) {
+	eh := &VerifyEndpointHandler{app: newFakeApp()}
+	chReq := postReqHost("/__apx_verify/challenge", "203.0.113.5", "shop.example.com", nil)
 	chRec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(chRec, chReq, emptyNext)
 	var ch struct {
@@ -224,7 +224,7 @@ func TestFormTokenRefusedOnBadPoW(t *testing.T) {
 	}
 	_ = json.Unmarshal(chRec.Body.Bytes(), &ch)
 
-	tokReq := postReqHost("/__apx_form/token", "203.0.113.5", "shop.example.com",
+	tokReq := postReqHost("/__apx_verify/token", "203.0.113.5", "shop.example.com",
 		formBody(map[string]string{"challenge": ch.Challenge, "solution": "wrong", "probes": `{"fill_ms":5000}`}))
 	tokRec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(tokRec, tokReq, emptyNext)
@@ -241,12 +241,12 @@ func TestFormTokenRefusedOnBadPoW(t *testing.T) {
 	}
 }
 
-// outcomeVar reads the apx_form_outcome var seeded by withVars.
+// outcomeVar reads the apx_verify_outcome var seeded by withVars.
 func outcomeVar(r *http.Request) string {
 	vars, _ := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
 	if vars == nil {
 		return ""
 	}
-	s, _ := vars[formOutcomeVarKey].(string)
+	s, _ := vars[verifyOutcomeVarKey].(string)
 	return s
 }

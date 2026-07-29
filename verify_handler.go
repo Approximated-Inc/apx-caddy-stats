@@ -19,43 +19,43 @@ import (
 )
 
 const (
-	// formOutcomeVarKey is the caddyhttp var the protection handler writes for
+	// verifyOutcomeVarKey is the caddyhttp var the protection handler writes for
 	// downstream logging/analytics.
-	formOutcomeVarKey = "apx_form_outcome"
-	// formTokenField is the hidden form field the widget injects.
-	formTokenField = "_apx_form_token"
-	// formTokenHeader carries the token for fetch/JSON submitters.
-	formTokenHeader = "X-Apx-Form-Token"
+	verifyOutcomeVarKey = "apx_verify_outcome"
+	// verifyTokenField is the hidden form field the widget injects.
+	verifyTokenField = "_apx_verify_token"
+	// verifyTokenHeader carries the token for fetch/JSON submitters.
+	verifyTokenHeader = "X-Apx-Verify-Token"
 
-	formWidgetPath    = "/__apx_form/widget.js"
-	formChallengePath = "/__apx_form/challenge"
-	formTokenPath     = "/__apx_form/token"
+	verifyWidgetPath    = "/__apx_verify/widget.js"
+	verifyChallengePath = "/__apx_verify/challenge"
+	verifyTokenPath     = "/__apx_verify/token"
 
-	// formWidgetVersion bumps whenever assets/form_widget.js or the substituted
+	// verifyWidgetVersion bumps whenever assets/verify_widget.js or the substituted
 	// paths change; it is the ETag basis so caches revalidate on a new build.
-	formWidgetVersion = "1"
+	verifyWidgetVersion = "1"
 )
 
 // ---------------------------------------------------------------------------
-// FormEndpointHandler — terminal handler for the three widget endpoints.
+// VerifyEndpointHandler — terminal handler for the three widget endpoints.
 // ---------------------------------------------------------------------------
 
-// FormEndpointHandler serves the form-protection widget script and the
+// VerifyEndpointHandler serves the Edge Verify widget script and the
 // challenge/token minting endpoints. It is terminal: it always writes a
 // response and never calls next.
-type FormEndpointHandler struct {
+type VerifyEndpointHandler struct {
 	logger *zap.Logger
 	app    AppRef
 }
 
-func (*FormEndpointHandler) CaddyModule() caddy.ModuleInfo {
+func (*VerifyEndpointHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.apx_form_endpoints",
-		New: func() caddy.Module { return new(FormEndpointHandler) },
+		ID:  "http.handlers.apx_verify_endpoints",
+		New: func() caddy.Module { return new(VerifyEndpointHandler) },
 	}
 }
 
-func (h *FormEndpointHandler) Provision(ctx caddy.Context) error {
+func (h *VerifyEndpointHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
 	if h.app == nil {
 		app, err := resolveApp(ctx)
@@ -67,40 +67,40 @@ func (h *FormEndpointHandler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (h *FormEndpointHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
+func (h *VerifyEndpointHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
 
-func (h *FormEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.Handler) error {
+func (h *VerifyEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.Handler) error {
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == formWidgetPath:
+	case r.Method == http.MethodGet && r.URL.Path == verifyWidgetPath:
 		return h.serveWidget(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == formChallengePath:
+	case r.Method == http.MethodPost && r.URL.Path == verifyChallengePath:
 		return h.serveChallenge(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == formTokenPath:
+	case r.Method == http.MethodPost && r.URL.Path == verifyTokenPath:
 		return h.serveToken(w, r)
 	}
 	w.WriteHeader(http.StatusNotFound)
 	return nil
 }
 
-func (h *FormEndpointHandler) serveWidget(w http.ResponseWriter, r *http.Request) error {
-	etag := `"apxform-` + formWidgetVersion + `"`
+func (h *VerifyEndpointHandler) serveWidget(w http.ResponseWriter, r *http.Request) error {
+	etag := `"apxverify-` + verifyWidgetVersion + `"`
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return nil
 	}
-	body := renderFormWidget(formChallengePath, formTokenPath)
+	body := renderVerifyWidget(verifyChallengePath, verifyTokenPath)
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, body)
 	return nil
 }
 
-func (h *FormEndpointHandler) serveChallenge(w http.ResponseWriter, r *http.Request) error {
+func (h *VerifyEndpointHandler) serveChallenge(w http.ResponseWriter, r *http.Request) error {
 	ip := clientIP(r)
-	difficulty := h.app.FormDifficulty()
-	challenge := IssueFormChallenge(h.app.Secret(), ip, difficulty, time.Now().Add(h.app.FormTokenTTL()))
+	difficulty := h.app.VerifyDifficulty()
+	challenge := IssueVerifyChallenge(h.app.Secret(), ip, difficulty, time.Now().Add(h.app.VerifyTokenTTL()))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"challenge":  challenge,
 		"difficulty": difficulty,
@@ -108,14 +108,14 @@ func (h *FormEndpointHandler) serveChallenge(w http.ResponseWriter, r *http.Requ
 	return nil
 }
 
-func (h *FormEndpointHandler) serveToken(w http.ResponseWriter, r *http.Request) error {
+func (h *VerifyEndpointHandler) serveToken(w http.ResponseWriter, r *http.Request) error {
 	ip := clientIP(r)
 	_ = r.ParseForm()
 	challenge := r.FormValue("challenge")
 	solution := r.FormValue("solution")
 	probesRaw := r.FormValue("probes")
 
-	payload, err := VerifyFormChallenge(h.app.Secret(), challenge, ip)
+	payload, err := CheckVerifyChallenge(h.app.Secret(), challenge, ip)
 	if err != nil {
 		return refuse(w, "challenge_invalid", "bad_challenge")
 	}
@@ -127,13 +127,13 @@ func (h *FormEndpointHandler) serveToken(w http.ResponseWriter, r *http.Request)
 	if err := json.Unmarshal([]byte(probesRaw), &probes); err != nil {
 		return refuse(w, "probes_invalid", "bad_probes")
 	}
-	if ok, reason := ScoreProbes(probes, h.app.FormScoring(), h.app.FormMinFillMs()); !ok {
+	if ok, reason := ScoreProbes(probes, h.app.VerifyScoring(), h.app.VerifyMinFillMs()); !ok {
 		return refuse(w, "probe_failed", reason)
 	}
 
 	host := hostOnly(r.Host)
-	ttl := h.app.FormTokenTTL()
-	token := IssueFormToken(h.app.Secret(), ip, host, payload.Nonce, time.Now().Add(ttl))
+	ttl := h.app.VerifyTokenTTL()
+	token := IssueVerifyToken(h.app.Secret(), ip, host, payload.Nonce, time.Now().Add(ttl))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":      token,
 		"expires_in": int(ttl.Seconds()),
@@ -150,13 +150,13 @@ func refuse(w http.ResponseWriter, errCode, reason string) error {
 }
 
 // ---------------------------------------------------------------------------
-// FormProtectionHandler — gates the matched protected POST.
+// VerifyHandler — gates the matched protected POST.
 // ---------------------------------------------------------------------------
 
-// FormProtectionHandler validates the injected token on a request the config-gen
+// VerifyHandler validates the injected token on a request the config-gen
 // route already scoped to a protected path+method. Mode is "enforce" (block
 // non-passing) or "monitor" (record outcome, always forward).
-type FormProtectionHandler struct {
+type VerifyHandler struct {
 	Mode string `json:"mode,omitempty"`
 
 	logger *zap.Logger
@@ -164,14 +164,14 @@ type FormProtectionHandler struct {
 	replay *NonceLRU
 }
 
-func (*FormProtectionHandler) CaddyModule() caddy.ModuleInfo {
+func (*VerifyHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.apx_form_protection",
-		New: func() caddy.Module { return new(FormProtectionHandler) },
+		ID:  "http.handlers.apx_verify",
+		New: func() caddy.Module { return new(VerifyHandler) },
 	}
 }
 
-func (h *FormProtectionHandler) Provision(ctx caddy.Context) error {
+func (h *VerifyHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
 	if h.app == nil {
 		app, err := resolveApp(ctx)
@@ -189,17 +189,17 @@ func (h *FormProtectionHandler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (h *FormProtectionHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
+func (h *VerifyHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
 
-func (h *FormProtectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *VerifyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
 	host := hostOnly(r.Host)
 
 	token := h.extractToken(r)
 	outcome := "missing"
 	if token != "" {
-		if p, err := VerifyFormToken(h.app.Secret(), token, ip, host); err != nil {
-			// VerifyFormToken folds expiry into a generic invalid error; we do not
+		if p, err := CheckVerifyToken(h.app.Secret(), token, ip, host); err != nil {
+			// CheckVerifyToken folds expiry into a generic invalid error; we do not
 			// separately emit "expired" (see task report).
 			outcome = "invalid"
 		} else if h.replay.Seen(p.Nonce) {
@@ -208,7 +208,7 @@ func (h *FormProtectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 			outcome = "passed"
 		}
 	}
-	setFormOutcome(r, outcome)
+	setVerifyOutcome(r, outcome)
 
 	if h.Mode == "monitor" || outcome == "passed" {
 		return next.ServeHTTP(w, r)
@@ -216,11 +216,11 @@ func (h *FormProtectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	return h.block(w, r)
 }
 
-func (h *FormProtectionHandler) block(w http.ResponseWriter, r *http.Request) error {
+func (h *VerifyHandler) block(w http.ResponseWriter, r *http.Request) error {
 	if isLikelyAPIClient(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `{"error":"form_protection_failed"}`)
+		_, _ = io.WriteString(w, `{"error":"edge_verify_failed"}`)
 		return nil
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -229,13 +229,13 @@ func (h *FormProtectionHandler) block(w http.ResponseWriter, r *http.Request) er
 	return nil
 }
 
-// extractToken returns the form token from the X-Apx-Form-Token header (always
+// extractToken returns the verify token from the X-Apx-Verify-Token header (always
 // honored) or, for urlencoded/multipart bodies within the cap, from the parsed
 // body. When it reads the body it RESTORES it so reverse_proxy forwards the
 // untouched request; an over-cap or unknown-length body is left untouched and
 // only the header is consulted.
-func (h *FormProtectionHandler) extractToken(r *http.Request) string {
-	if t := r.Header.Get(formTokenHeader); t != "" {
+func (h *VerifyHandler) extractToken(r *http.Request) string {
+	if t := r.Header.Get(verifyTokenHeader); t != "" {
 		return t
 	}
 
@@ -246,7 +246,7 @@ func (h *FormProtectionHandler) extractToken(r *http.Request) string {
 	if r.Body == nil {
 		return ""
 	}
-	bodyCap := h.app.FormBodyCap()
+	bodyCap := h.app.VerifyBodyCap()
 	// Unknown length (chunked) or over-cap: skip body parsing, leave body intact.
 	if r.ContentLength < 0 || r.ContentLength > bodyCap {
 		return ""
@@ -272,7 +272,7 @@ func tokenFromBody(mediaType, contentType string, buf []byte, bodyCap int64) str
 		if err != nil {
 			return ""
 		}
-		return vals.Get(formTokenField)
+		return vals.Get(verifyTokenField)
 	case "multipart/form-data":
 		_, params, err := mime.ParseMediaType(contentType)
 		if err != nil {
@@ -287,7 +287,7 @@ func tokenFromBody(mediaType, contentType string, buf []byte, bodyCap int64) str
 			return ""
 		}
 		defer func() { _ = form.RemoveAll() }()
-		if vs := form.Value[formTokenField]; len(vs) > 0 {
+		if vs := form.Value[verifyTokenField]; len(vs) > 0 {
 			return vs[0]
 		}
 	}
@@ -301,17 +301,17 @@ func tokenFromBody(mediaType, contentType string, buf []byte, bodyCap int64) str
 func resolveApp(ctx caddy.Context) (AppRef, error) {
 	app, err := ctx.App("apx_challenge")
 	if err != nil {
-		return nil, fmt.Errorf("apx_form handler requires apx_challenge app: %w", err)
+		return nil, fmt.Errorf("apx_verify handler requires apx_challenge app: %w", err)
 	}
 	ca, ok := app.(*ChallengeApp)
 	if !ok {
-		return nil, fmt.Errorf("apx_form handler: unexpected app type %T", app)
+		return nil, fmt.Errorf("apx_verify handler: unexpected app type %T", app)
 	}
 	return ca, nil
 }
 
-func setFormOutcome(r *http.Request, outcome string) {
-	caddyhttp.SetVar(r.Context(), formOutcomeVarKey, outcome)
+func setVerifyOutcome(r *http.Request, outcome string) {
+	caddyhttp.SetVar(r.Context(), verifyOutcomeVarKey, outcome)
 }
 
 // hostOnly strips any port from a Host header value.
@@ -329,11 +329,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 var (
-	_ caddy.Provisioner           = (*FormEndpointHandler)(nil)
-	_ caddyfile.Unmarshaler       = (*FormEndpointHandler)(nil)
-	_ caddyhttp.MiddlewareHandler = (*FormEndpointHandler)(nil)
+	_ caddy.Provisioner           = (*VerifyEndpointHandler)(nil)
+	_ caddyfile.Unmarshaler       = (*VerifyEndpointHandler)(nil)
+	_ caddyhttp.MiddlewareHandler = (*VerifyEndpointHandler)(nil)
 
-	_ caddy.Provisioner           = (*FormProtectionHandler)(nil)
-	_ caddyfile.Unmarshaler       = (*FormProtectionHandler)(nil)
-	_ caddyhttp.MiddlewareHandler = (*FormProtectionHandler)(nil)
+	_ caddy.Provisioner           = (*VerifyHandler)(nil)
+	_ caddyfile.Unmarshaler       = (*VerifyHandler)(nil)
+	_ caddyhttp.MiddlewareHandler = (*VerifyHandler)(nil)
 )
