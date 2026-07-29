@@ -24,6 +24,12 @@ func (f fakeApp) Secret() string     { return f.sec }
 func (f fakeApp) Difficulty() int    { return f.diff }
 func (f fakeApp) VerifyPath() string { return f.vp }
 
+func (f fakeApp) FormDifficulty() int         { return 14 }
+func (f fakeApp) FormTokenTTL() time.Duration { return 600 * time.Second }
+func (f fakeApp) FormMinFillMs() int64        { return 800 }
+func (f fakeApp) FormScoring() string         { return "lenient" }
+func (f fakeApp) FormBodyCap() int64          { return 1048576 }
+
 func newHandler() *ChallengeHandler {
 	return &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 8, vp: "/__apx_challenge/verify"}}
 }

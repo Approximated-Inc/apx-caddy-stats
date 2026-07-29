@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/require"
@@ -30,4 +31,17 @@ func TestAppProvisionErrorsWhenSecretEmpty(t *testing.T) {
 
 func TestAppModuleID(t *testing.T) {
 	require.Equal(t, "apx_challenge", string((&ChallengeApp{}).CaddyModule().ID))
+}
+
+func TestFormDefaultsApplied(t *testing.T) {
+	a := &ChallengeApp{SecretCfg: "s"}
+	if err := a.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if a.FormDifficulty() != 14 || a.FormScoring() != "lenient" || a.FormBodyCap() != 1048576 {
+		t.Fatalf("defaults wrong: diff=%d scoring=%q cap=%d", a.FormDifficulty(), a.FormScoring(), a.FormBodyCap())
+	}
+	if a.FormTokenTTL() != 600*time.Second || a.FormMinFillMs() != 800 {
+		t.Fatalf("ttl/fill wrong: ttl=%v fill=%d", a.FormTokenTTL(), a.FormMinFillMs())
+	}
 }

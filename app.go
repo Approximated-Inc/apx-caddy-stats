@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
@@ -21,6 +22,11 @@ type AppRef interface {
 	Secret() string
 	Difficulty() int
 	VerifyPath() string
+	FormDifficulty() int
+	FormTokenTTL() time.Duration
+	FormMinFillMs() int64
+	FormScoring() string
+	FormBodyCap() int64
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -36,10 +42,26 @@ type ChallengeApp struct {
 	SecretCfg     string `json:"secret,omitempty"`
 	VerifyPathCfg string `json:"verify_path,omitempty"`
 
+	// FormDifficultyCfg / FormTokenTTLSecondsCfg / FormMinFillMsCfg /
+	// FormScoringCfg / FormBodyCapBytesCfg carry the form-protection config
+	// keys form_difficulty / form_token_ttl_seconds / form_min_fill_ms /
+	// form_scoring / form_body_cap_bytes. Same *Cfg-suffix convention as above.
+	FormDifficultyCfg      int    `json:"form_difficulty,omitempty"`
+	FormTokenTTLSecondsCfg int    `json:"form_token_ttl_seconds,omitempty"`
+	FormMinFillMsCfg       int64  `json:"form_min_fill_ms,omitempty"`
+	FormScoringCfg         string `json:"form_scoring,omitempty"`
+	FormBodyCapBytesCfg    int64  `json:"form_body_cap_bytes,omitempty"`
+
 	logger     *zap.Logger
 	secret     string
 	difficulty int
 	verifyPath string
+
+	formDifficulty int
+	formTokenTTL   time.Duration
+	formMinFillMs  int64
+	formScoring    string
+	formBodyCap    int64
 }
 
 func (*ChallengeApp) CaddyModule() caddy.ModuleInfo {
@@ -64,6 +86,28 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.secret == "" {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
+
+	if a.formDifficulty = a.FormDifficultyCfg; a.formDifficulty <= 0 {
+		a.formDifficulty = 14
+	}
+	if s := a.FormTokenTTLSecondsCfg; s > 0 {
+		a.formTokenTTL = time.Duration(s) * time.Second
+	} else {
+		a.formTokenTTL = 600 * time.Second
+	}
+	if a.formMinFillMs = a.FormMinFillMsCfg; a.formMinFillMs <= 0 {
+		a.formMinFillMs = 800
+	}
+	switch a.FormScoringCfg {
+	case "off", "lenient", "strict":
+		a.formScoring = a.FormScoringCfg
+	default:
+		a.formScoring = "lenient"
+	}
+	if a.formBodyCap = a.FormBodyCapBytesCfg; a.formBodyCap <= 0 {
+		a.formBodyCap = 1 << 20
+	}
+
 	return nil
 }
 
@@ -73,6 +117,12 @@ func (a *ChallengeApp) Stop() error  { return nil }
 func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
 func (a *ChallengeApp) VerifyPath() string { return a.verifyPath }
+
+func (a *ChallengeApp) FormDifficulty() int         { return a.formDifficulty }
+func (a *ChallengeApp) FormTokenTTL() time.Duration { return a.formTokenTTL }
+func (a *ChallengeApp) FormMinFillMs() int64        { return a.formMinFillMs }
+func (a *ChallengeApp) FormScoring() string         { return a.formScoring }
+func (a *ChallengeApp) FormBodyCap() int64          { return a.formBodyCap }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)
