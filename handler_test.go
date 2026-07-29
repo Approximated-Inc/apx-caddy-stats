@@ -29,6 +29,7 @@ func (f fakeApp) FormTokenTTL() time.Duration { return 600 * time.Second }
 func (f fakeApp) FormMinFillMs() int64        { return 800 }
 func (f fakeApp) FormScoring() string         { return "lenient" }
 func (f fakeApp) FormBodyCap() int64          { return 1048576 }
+func (f fakeApp) ReplayLRU() *NonceLRU        { return NewNonceLRU(1024) }
 
 func newHandler() *ChallengeHandler {
 	return &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 8, vp: "/__apx_challenge/verify"}}

@@ -27,6 +27,9 @@ type AppRef interface {
 	FormMinFillMs() int64
 	FormScoring() string
 	FormBodyCap() int64
+	// ReplayLRU is the process-wide, app-owned set of recently-seen form-token
+	// nonces. Shared across all form routes so a token is single-use per machine.
+	ReplayLRU() *NonceLRU
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -62,7 +65,12 @@ type ChallengeApp struct {
 	formMinFillMs  int64
 	formScoring    string
 	formBodyCap    int64
+	replayLRU      *NonceLRU
 }
+
+// defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
+// single-use — cluster-wide uniqueness is not attempted.
+const defaultReplayLRUSize = 65536
 
 func (*ChallengeApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -107,6 +115,7 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.formBodyCap = a.FormBodyCapBytesCfg; a.formBodyCap <= 0 {
 		a.formBodyCap = 1 << 20
 	}
+	a.replayLRU = NewNonceLRU(defaultReplayLRUSize)
 
 	return nil
 }
@@ -123,6 +132,7 @@ func (a *ChallengeApp) FormTokenTTL() time.Duration { return a.formTokenTTL }
 func (a *ChallengeApp) FormMinFillMs() int64        { return a.formMinFillMs }
 func (a *ChallengeApp) FormScoring() string         { return a.formScoring }
 func (a *ChallengeApp) FormBodyCap() int64          { return a.formBodyCap }
+func (a *ChallengeApp) ReplayLRU() *NonceLRU        { return a.replayLRU }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)
