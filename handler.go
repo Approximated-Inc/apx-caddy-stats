@@ -112,6 +112,20 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		})
 	}
 
+	// Edge Verify attempts record independently of vhost_id too: the
+	// Edge Verify edge handler sets `apx_verify_outcome` and, like the
+	// challenge handler, may be terminal (vhost_id unset). The dimension is
+	// (Host, path_bucket, outcome) — no per-client IP is recorded at the
+	// edge for Edge Verify.
+	edgeVerifyOutcome := readEdgeVerifyOutcome(r)
+	if edgeVerifyOutcome != "" {
+		h.app.RecordEdgeVerifyAttempt(edgeVerifyAttemptKey{
+			vhost:      challengeVhost(r),
+			pathBucket: pathBucket(r.URL.Path),
+			outcome:    edgeVerifyOutcome,
+		})
+	}
+
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	vhostID, ok := readVhostID(r)
@@ -295,6 +309,18 @@ func readVhostID(r *http.Request) (uint32, bool) {
 // next.ServeHTTP returns, so the var is visible.
 func readChallengeOutcome(r *http.Request) string {
 	v := caddyhttp.GetVar(r.Context(), "apx_challenge_outcome")
+	s, _ := v.(string)
+	return s
+}
+
+// readEdgeVerifyOutcome reads the `apx_verify_outcome` request var set by
+// the Edge Verify edge handler — one of "passed" | "missing" | "invalid" |
+// "expired" | "replayed", or "" when no Edge Verify handler ran.
+// Readable here for the same reason as readChallengeOutcome: apx_stats is
+// the outermost handler wrapping the subroute, so vars set by inner
+// handlers before returning are visible in our deferred record().
+func readEdgeVerifyOutcome(r *http.Request) string {
+	v := caddyhttp.GetVar(r.Context(), "apx_verify_outcome")
 	s, _ := v.(string)
 	return s
 }

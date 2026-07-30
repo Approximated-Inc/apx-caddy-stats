@@ -18,15 +18,16 @@ import (
 
 // fakeApp captures calls to Record so handler tests can assert.
 type fakeApp struct {
-	mu         sync.Mutex
-	records    []recorded
-	uniques    []recordedUnique
-	reqEvents  []requestEventRow
-	challenges []challengeAttemptKey
-	psID       uint32
-	hashSalt   string
-	machineID  string
-	modeV2     bool
+	mu           sync.Mutex
+	records      []recorded
+	uniques      []recordedUnique
+	reqEvents    []requestEventRow
+	challenges   []challengeAttemptKey
+	edgeVerifies []edgeVerifyAttemptKey
+	psID         uint32
+	hashSalt     string
+	machineID    string
+	modeV2       bool
 }
 
 type recorded struct {
@@ -64,6 +65,12 @@ func (f *fakeApp) RecordChallengeAttempt(key challengeAttemptKey) {
 	f.mu.Unlock()
 }
 
+func (f *fakeApp) RecordEdgeVerifyAttempt(key edgeVerifyAttemptKey) {
+	f.mu.Lock()
+	f.edgeVerifies = append(f.edgeVerifies, key)
+	f.mu.Unlock()
+}
+
 func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
@@ -76,6 +83,14 @@ func (f *fakeApp) challengeSnapshot() []challengeAttemptKey {
 	defer f.mu.Unlock()
 	out := make([]challengeAttemptKey, len(f.challenges))
 	copy(out, f.challenges)
+	return out
+}
+
+func (f *fakeApp) edgeVerifySnapshot() []edgeVerifyAttemptKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]edgeVerifyAttemptKey, len(f.edgeVerifies))
+	copy(out, f.edgeVerifies)
 	return out
 }
 
@@ -390,6 +405,52 @@ func TestServeHTTP_ChallengeVhostFallbackWhenNoPort(t *testing.T) {
 	ch := app.challengeSnapshot()
 	require.Len(t, ch, 1)
 	require.Equal(t, "api.example.com", ch[0].vhost)
+}
+
+// newRequestWithVerifyOutcome builds a request whose context carries a
+// caddyhttp vars map with `apx_verify_outcome` set — mirroring what the
+// Edge Verify edge handler does via caddyhttp.SetVar.
+func newRequestWithVerifyOutcome(method, target, host, outcome string) *http.Request {
+	r := httptest.NewRequest(method, target, nil)
+	r.Host = host
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, map[string]any{})
+	r = r.WithContext(ctx)
+	if outcome != "" {
+		caddyhttp.SetVar(r.Context(), "apx_verify_outcome", outcome)
+	}
+	return r
+}
+
+func TestServeHTTP_RecordsEdgeVerifyAttemptWhenOutcomeVarSet(t *testing.T) {
+	// A request carrying apx_verify_outcome records one edge_verify_attempt
+	// keyed by lowercased Host (port stripped) + bucketed path + outcome.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithVerifyOutcome("POST", "/checkout/123", "Example.COM:8443", "invalid")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	attempts := app.edgeVerifySnapshot()
+	require.Len(t, attempts, 1)
+	require.Equal(t, "example.com", attempts[0].vhost, "Host lowercased + port stripped")
+	require.Equal(t, "/checkout/*", attempts[0].pathBucket, "path bucketed (numeric id starred)")
+	require.Equal(t, "invalid", attempts[0].outcome)
+}
+
+func TestServeHTTP_NoEdgeVerifyAttemptWhenVarUnset(t *testing.T) {
+	// A normal request (no apx_verify_outcome var) records no
+	// edge_verify_attempt.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	require.Empty(t, app.edgeVerifySnapshot(), "no verify var → no edge_verify_attempt")
 }
 
 func TestResponseBytes_ZeroOnHijackedConnection(t *testing.T) {

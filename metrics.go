@@ -102,6 +102,16 @@ var metricChallengeOverflows = promauto.NewCounter(
 	},
 )
 
+// metricEdgeVerifyOverflows counts new (vhost, path_bucket, outcome) keys
+// dropped because the per-flush edge-verify-attempt map was at
+// edgeVerifyMaxKeys.
+var metricEdgeVerifyOverflows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_stats_edge_verify_map_overflows_total",
+		Help: "Distinct (vhost, path_bucket, outcome) keys dropped because the per-flush edge-verify-attempt map was at cap.",
+	},
+)
+
 // metricCorazaOverflows counts raw WAF detection events dropped because
 // the per-flush-window detection slice was at its cap.
 var metricCorazaOverflows = promauto.NewCounter(
