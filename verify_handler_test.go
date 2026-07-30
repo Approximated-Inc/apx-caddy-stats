@@ -128,6 +128,33 @@ func TestVerifyEndpointMintsAndHandlerAccepts(t *testing.T) {
 	}
 }
 
+func TestVerifyHostBindingIsCaseInsensitive(t *testing.T) {
+	// Hostnames are case-insensitive: a token minted under one Host casing must
+	// verify against another casing of the same host, in both directions.
+	app := newFakeApp()
+	eh := &VerifyEndpointHandler{app: app}
+
+	cases := []struct{ mintHost, submitHost string }{
+		{"Shop.Example.COM", "shop.example.com"},
+		{"shop.example.com", "Shop.Example.COM"},
+	}
+	for _, tc := range cases {
+		ph := &VerifyHandler{app: app, replay: NewNonceLRU(16), Mode: "enforce"}
+		tok := mintToken(t, eh, "203.0.113.5", tc.mintHost)
+		req := postReqHost("/contact", "203.0.113.5", tc.submitHost,
+			formBody(map[string]string{"_apx_verify_token": tok, "email": "a@b.c"}))
+		rec := httptest.NewRecorder()
+		called := false
+		_ = ph.ServeHTTP(rec, req, nextFn(func() { called = true }))
+		if !called {
+			t.Fatalf("token minted with Host %q must verify with Host %q; code=%d", tc.mintHost, tc.submitHost, rec.Code)
+		}
+		if got := outcomeVar(req); got != "passed" {
+			t.Fatalf("mint %q / submit %q: outcome=%q want passed", tc.mintHost, tc.submitHost, got)
+		}
+	}
+}
+
 func TestVerifyHandlerBlocksMissingTokenInEnforce(t *testing.T) {
 	app := newFakeApp()
 	ph := &VerifyHandler{app: app, replay: NewNonceLRU(16), Mode: "enforce"}

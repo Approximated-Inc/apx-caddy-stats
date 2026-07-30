@@ -6,13 +6,13 @@ the widget → PoW → token → edge-enforce flow in a real browser. No Fly, no
 ## 1. Build a Caddy binary with the local module
 
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-    cd /Users/carter/dev/APX/apx-caddy-challenge
+    # from the repo root:
     xcaddy build --with github.com/Approximated-Inc/apx-caddy-challenge=$(pwd)
     # produces ./caddy in the repo root
 
 ## 2. Run it against this config
 
-    cd /Users/carter/dev/APX/apx-caddy-challenge/localtest
+    cd localtest
     ../caddy run --config caddy.json
 
 ## 3. Test in a browser — the happy path

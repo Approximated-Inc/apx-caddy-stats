@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -131,7 +132,8 @@ func (h *VerifyEndpointHandler) serveToken(w http.ResponseWriter, r *http.Reques
 		return refuse(w, "probe_failed", reason)
 	}
 
-	host := hostOnly(r.Host)
+	// Hostnames are case-insensitive; lowercase so mint and verify always match.
+	host := strings.ToLower(hostOnly(r.Host))
 	ttl := h.app.VerifyTokenTTL()
 	token := IssueVerifyToken(h.app.Secret(), ip, host, payload.Nonce, time.Now().Add(ttl))
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -193,7 +195,8 @@ func (h *VerifyHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { retur
 
 func (h *VerifyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
-	host := hostOnly(r.Host)
+	// Hostnames are case-insensitive; lowercase so mint and verify always match.
+	host := strings.ToLower(hostOnly(r.Host))
 
 	token := h.extractToken(r)
 	outcome := "missing"

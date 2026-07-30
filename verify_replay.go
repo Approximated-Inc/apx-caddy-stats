@@ -18,7 +18,8 @@ func NewNonceLRU(max int) *NonceLRU {
 	if max <= 0 {
 		max = 1
 	}
-	return &NonceLRU{max: max, ll: list.New(), m: make(map[string]*list.Element, max)}
+	// Map grows lazily; eviction in Seen bounds it to max entries.
+	return &NonceLRU{max: max, ll: list.New(), m: make(map[string]*list.Element)}
 }
 
 // Seen records nonce and reports whether it was already present (a replay).
