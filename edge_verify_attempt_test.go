@@ -107,8 +107,9 @@ func TestEncodeEdgeVerifyAttemptRow_JSONShape(t *testing.T) {
 
 	// _type MUST be the first key on the wire (Phoenix contract).
 	line := string(raw[:len(raw)-1]) // strip trailing \n
-	require.True(t, len(line) > 0)
-	require.Equal(t, `{"_type":"edge_verify_attempt"`, line[:len(`{"_type":"edge_verify_attempt"`)],
+	prefix := `{"_type":"edge_verify_attempt"`
+	require.GreaterOrEqual(t, len(line), len(prefix), "encoded line shorter than expected _type prefix")
+	require.Equal(t, prefix, line[:len(prefix)],
 		"_type must be the first JSON key")
 
 	var row map[string]any
