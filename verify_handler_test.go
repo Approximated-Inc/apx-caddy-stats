@@ -23,7 +23,6 @@ func (verifyTestApp) Difficulty() int               { return 8 }
 func (verifyTestApp) VerifyPath() string            { return "/__apx_challenge/verify" }
 func (verifyTestApp) VerifyDifficulty() int         { return 4 }
 func (verifyTestApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
-func (verifyTestApp) VerifyMinFillMs() int64        { return 800 }
 func (verifyTestApp) VerifyScoring() string         { return "off" }
 func (verifyTestApp) VerifyBodyCap() int64          { return 1 << 20 }
 func (verifyTestApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }

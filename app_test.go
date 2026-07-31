@@ -41,7 +41,7 @@ func TestVerifyDefaultsApplied(t *testing.T) {
 	if a.VerifyDifficulty() != 14 || a.VerifyScoring() != "lenient" || a.VerifyBodyCap() != 1048576 {
 		t.Fatalf("defaults wrong: diff=%d scoring=%q cap=%d", a.VerifyDifficulty(), a.VerifyScoring(), a.VerifyBodyCap())
 	}
-	if a.VerifyTokenTTL() != 600*time.Second || a.VerifyMinFillMs() != 800 {
-		t.Fatalf("ttl/fill wrong: ttl=%v fill=%d", a.VerifyTokenTTL(), a.VerifyMinFillMs())
+	if a.VerifyTokenTTL() != 600*time.Second {
+		t.Fatalf("ttl wrong: ttl=%v", a.VerifyTokenTTL())
 	}
 }

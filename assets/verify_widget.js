@@ -75,6 +75,13 @@
 
   // APIs a genuine modern browser exposes; absences are a bot tell. Reported as
   // signal only (server scores them) — never used to block on the client.
+  //
+  // Only APIs that are UNIVERSAL across real interactive browsers belong here:
+  // a platform-legitimate absence would be a false bot tell that, under a low
+  // scoring threshold, blocks real users. Deliberately excluded: Notification
+  // (undefined in normal iOS Safari and most in-app WebViews) and localStorage
+  // (throws/absent when storage access is blocked) — both are commonly missing
+  // on real devices and were poor signals.
   function missingAPIs() {
     var missing = [];
     var checks = {
@@ -86,21 +93,11 @@
       requestAnimationFrame: typeof requestAnimationFrame !== "undefined",
       Intl: typeof Intl !== "undefined",
       WebGLRenderingContext: typeof WebGLRenderingContext !== "undefined",
-      Notification: typeof Notification !== "undefined",
-      localStorage: hasLocalStorage(),
     };
     for (var k in checks) {
       if (checks.hasOwnProperty(k) && !checks[k]) missing.push(k);
     }
     return missing;
-  }
-  function hasLocalStorage() {
-    // Presence probe only — we never read or write storage.
-    try {
-      return typeof window.localStorage !== "undefined" && window.localStorage !== null;
-    } catch (e) {
-      return false; // access can throw when storage is blocked
-    }
   }
 
   function collectProbes() {
