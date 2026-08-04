@@ -17,9 +17,10 @@ func init() { caddy.RegisterModule(App{}) }
 type PullerConfig struct {
 	Enabled         bool `json:"enabled,omitempty"`
 	IntervalSeconds int  `json:"interval_seconds,omitempty"`
-	// CheckURL/DownloadURL/ProxyServerID/InternalKey default from the
-	// CALL_HOME_URL, PROXY_SERVER_ID, APX_INTERNAL_KEY env vars at
-	// Provision time so generated configs stay secret-free.
+	// CheckURL/DownloadURL/ProxyServerID default from the CALL_HOME_URL
+	// and PROXY_SERVER_ID env vars in newPuller (Start time). The internal
+	// key is deliberately NOT a config field: it comes only from
+	// APX_INTERNAL_KEY so generated configs stay secret-free.
 	CheckURL      string `json:"check_url,omitempty"`
 	DownloadURL   string `json:"download_url,omitempty"`
 	ProxyServerID string `json:"proxy_server_id,omitempty"`
