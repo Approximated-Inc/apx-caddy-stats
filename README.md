@@ -137,7 +137,92 @@ validates the in-process puller in production. Turning the puller on is a
 **per-cluster config decision**, made by setting `puller.enabled: true` in
 that cluster's generated Caddy config — not a blanket flip for the fleet.
 
-## Phase 0+1 status
+## apx_gate
+
+`apx_gate` (module ID `http.handlers.apx_gate`) is a single server-level
+handler that replaces two things generated configs install separately
+today:
+
+- the top-of-chain `{"handler":"apx_stats"}` handler (stats recording), and
+- the shared per-request `{"handler":"geoip2","enable":"wild"}` route
+  further down the inner subroute (the one whose only job is populating
+  `geoip2.*` placeholders for the `Geoip-Country` header route).
+
+It does **not** touch anything else in the per-server chain: `apx_trace`
+and trace marks, the `apx_challenge`/`apx_verify` routes, the per-vhost
+`waf` handler, or the vhost routes themselves (identity handlers, rewrite,
+encode, reverse_proxy) are all unchanged and stay exactly where they are
+today.
+
+**Config shape:**
+
+```json
+{"handler": "apx_gate", "geo": "wild"}
+```
+
+`apx_gate` composes two apps and requires both:
+
+- `apx_stats` — the same recording sink the `apx_stats` handler uses today
+  (counters, request_event, challenge_attempt, unique-clients hashing).
+- `apx` with `geo.db_path` set — the mmdb-backed geo reader used for
+  lookups.
+
+`Provision` resolves both via `AppIfConfigured` (not `ctx.App`) and hard-
+errors if either is missing, rather than silently instantiating an empty
+app — a silent instantiation would mean dropped counters (no `apx_stats`)
+or an always-empty geo surface (no `apx`) with no error to show for it.
+
+**Geo mode semantics:** the `geo` field mirrors the incumbent
+`caddy-geoip2` fork's `Enable` values — `"wild"` (leftmost
+X-Forwarded-For entry when present, else RemoteAddr), `"strict"`
+(RemoteAddr only), `"trusted_proxies"` (XFF only when Caddy's
+trusted-proxy var is true), or `"off"` (lookups disabled, fixed keys
+resolve empty). An empty/absent `geo` field maps to **off** — deliberately
+*not* the fork's implicit `trusted_proxies` default, so an unconfigured
+gate behaves like a disabled geoip2 handler rather than quietly doing
+lookups.
+
+> **Note:** prod's mode is `"wild"`, which trusts the **leftmost**
+> X-Forwarded-For entry — client-controlled and spoofable. That is the
+> incumbent's real, shipped behavior, and it is preserved here
+> byte-for-byte for compatibility. Changing it (e.g. to the rightmost XFF
+> entry, or to RemoteAddr-only) would change `Geoip-Country`, geo-gated
+> edge rules, and the counters' Country dimension for any client that
+> sends an X-Forwarded-For header — that is an explicit, flagged product
+> decision to make separately, not a side effect of adopting this handler.
+
+**Lazy placeholder surface:** on every request, `apx_gate` registers a
+lazy `geoip2.*` replacer provider that reproduces the fork's full
+compatibility surface — the 89 fixed keys (blanket `""` before any lookup
+runs; typed values, including zero/false/empty on a DB miss, once one
+does) plus the unbounded dynamic locale- and subdivision-indexed keys —
+preserving the fork's two-state typed semantics exactly (e.g.
+`geoip2.country_eu` is the string `""` pre-lookup but the bool `false`
+post-lookup on a miss). Nothing is computed until a specific key is read:
+`geoip2.country_code` is special-cased to a fast, country-only decode path
+(the perf win this handler exists for), while every other key falls back
+to a one-time full record decode, memoized per request.
+
+**Recording parity:** `apx_gate`'s `ServeHTTP` calls the exact same
+`recordCompletedRequest` function the `apx_stats` handler calls (shared
+code, extracted for reuse — no behavior change) — same monitor-skip check,
+same response wrapper, same recording-after-`next.ServeHTTP`-returns
+semantics. A shape-equivalence test harness (`gate_equivalence_test.go`)
+A/B-tests this: it drives an identical request set through both the old
+apx_stats+geoip2 shape and the new apx_gate shape and byte-compares
+responses plus captured ingest rows, after normalizing only genuinely
+volatile fields (timestamps, per-process sequence counters).
+
+**Rollout stance:** the generator-side flag that chooses `apx_gate` over
+today's two-piece shape lands in the Phoenix repo (`approximated`) on a
+separate branch/PR — out of scope for this module. The old shape (a
+standalone `apx_stats` handler plus a `geoip2` route) remains fully
+supported here; nothing in this change removes it. Adopting the
+`apx_gate` shape requires the generator to also emit the `apx` app (with
+`geo.db_path`) in generated configs, which today's generated configs do
+not include.
+
+## Phase status
 
 This branch (`apx-unified-module`) contains:
 
@@ -147,7 +232,7 @@ This branch (`apx-unified-module`) contains:
 - `unified.go` — single-import registration so one `--with
   github.com/Approximated-Inc/apx-caddy-stats` line replaces the three
   separate per-module `--with` lines in `fly/Dockerfile`.
-- `tools/check-modules.sh` — gate script asserting all 11 apx module IDs
+- `tools/check-modules.sh` — gate script asserting all 12 apx module IDs
   register in a built `caddy` binary.
 - `apx/` (package `apxapp`) — the `apps.apx` skeleton plus the flag-gated
   in-process config puller described above.
@@ -157,3 +242,8 @@ changes, only import-path and directory relocation. Renaming this
 repository/module path to `apx-caddy` is **deferred to push time** (a call
 for Carter to make, along with the `fly/Dockerfile` `--with` swap and image
 build — both out of scope for this branch).
+
+**Phase 2** (the `apx_gate` handler, geo reader, and lazy geoip2 provider
+described above) is complete on this branch, Go side only — the
+generator-side change to emit `apx_gate` shape configs is separate,
+pending work in the Phoenix repo (`approximated`).
