@@ -4,6 +4,7 @@
 package apxstats
 
 import (
+	_ "github.com/Approximated-Inc/apx-caddy-stats/apx"
 	_ "github.com/Approximated-Inc/apx-caddy-stats/challenge"
 	_ "github.com/Approximated-Inc/apx-caddy-stats/trace"
 )

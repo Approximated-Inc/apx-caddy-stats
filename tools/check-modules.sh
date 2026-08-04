@@ -2,7 +2,7 @@
 # Verifies a caddy binary registers every apx module ID. Usage: check-modules.sh ./caddy
 set -euo pipefail
 BIN="${1:?usage: check-modules.sh <caddy-binary>}"
-IDS=(apx_stats http.handlers.apx_stats apx_trace http.handlers.apx_trace \
+IDS=(apx apx_stats http.handlers.apx_stats apx_trace http.handlers.apx_trace \
      http.handlers.apx_trace_mark http.reverse_proxy.transport.apx_trace \
      apx_challenge http.handlers.apx_challenge http.handlers.apx_verify_endpoints \
      http.handlers.apx_verify)
