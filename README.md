@@ -8,21 +8,25 @@ prior written permission from the copyright holder.
 
 ## Unified build
 
-This module now bundles stats, trace, and challenge/edge-verify into one
-importable package. A single build-time `--with` line:
+This module now bundles stats, trace, challenge/edge-verify, and the
+apx_gate reverse-proxy handler into one importable package. A build-time
+`--with` line:
 
 ```
 --with github.com/Approximated-Inc/apx-caddy-stats
 ```
 
 replaces the three separate per-module `--with` lines previously listed in
-the fleet Dockerfile (`fly/Dockerfile`).
+the fleet Dockerfile (`fly/Dockerfile`) — plus a second required `--with`
+for `caddy-l4`, since the mode_v2 stats core imports `layer4` directly (see
+the verified build command below).
 
-Importing the root package registers all 11 apx Caddy module IDs:
+Importing the root package registers all 12 apx Caddy module IDs:
 
 - `apx`
 - `apx_stats`
 - `http.handlers.apx_stats`
+- `http.handlers.apx_gate`
 - `apx_trace`
 - `http.handlers.apx_trace`
 - `http.handlers.apx_trace_mark`
@@ -33,25 +37,28 @@ Importing the root package registers all 11 apx Caddy module IDs:
 - `http.handlers.apx_verify`
 
 Use `tools/check-modules.sh <caddy-binary>` to verify a built `caddy` binary
-registers all 11 IDs (exits non-zero on any miss).
+registers all 12 IDs (exits non-zero on any miss).
 
 **Provenance:** `trace/` was imported from apx-caddy-trace commit `bb9d7f7`;
 `challenge/` was imported from apx-caddy-challenge (edge-verify) commit
 `e9434a7`. Both subpackages carry their Phase-0 code verbatim — no logic
 changes, only import-path and directory relocation.
 
-**Verified build (2026-08-03):** an `xcaddy` build of Caddy v2.11.3 against
-this tree (arm64, local `go1.26.1`) succeeds and passes the module gate:
+**Verified build (2026-08-04):** an `xcaddy` build of Caddy v2.11.3 against
+this tree (arm64, local `go1.26.1`) succeeds and passes the module gate.
+The `caddy-l4` `--with` is required — the mode_v2 stats core imports
+`layer4`, so a single-flag build fails to compile:
 
 ```
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 OUT=$(mktemp -d)
 ~/go/bin/xcaddy build v2.11.3 \
   --with github.com/Approximated-Inc/apx-caddy-stats=/Users/carter/dev/APX/apx-caddy-unified \
+  --with github.com/mholt/caddy-l4=github.com/Approximated-Inc/caddy-l4@8ebffe3b63fc968cc4e0ba8fcc2ec450c94cce00 \
   --output "$OUT/caddy"
 
 tools/check-modules.sh "$OUT/caddy"
-# => all 11 apx module IDs registered
+# => all 12 apx module IDs registered
 ```
 
 `xcaddy` resolves the module's own `go.mod` pin of `caddy/v2 v2.11.2` up to
