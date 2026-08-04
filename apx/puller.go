@@ -35,6 +35,12 @@ type puller struct {
 	tick        time.Duration
 	consecFails int // only touched by the loop goroutine (read by tests after stop)
 
+	// Per-step timeouts (legacy fleet budgets: check ~20s, download/load 60s
+	// via curl --max-time). Set in newPuller, overridable in tests.
+	checkTimeout    time.Duration
+	downloadTimeout time.Duration
+	loadTimeout     time.Duration
+
 	startedMu sync.Mutex
 	started   bool
 }
@@ -82,11 +88,34 @@ func newPuller(cfg PullerConfig, st *SharedState, log *zap.Logger) (*puller, err
 		internalKey: key,
 		st:          st,
 		log:         log,
-		// One client for the puller's lifetime: 20s timeout, default
-		// transport so keep-alives stay on (the whole point vs curl).
-		client: &http.Client{Timeout: 20 * time.Second},
+		// One client for the puller's lifetime, default transport so
+		// keep-alives stay on (the whole point vs curl). No client-level
+		// timeout: each step wraps its request in its own deadline so a big
+		// config zip's 60s download budget isn't capped by the 20s check
+		// budget.
+		client: &http.Client{CheckRedirect: dropApxKeysAcrossHosts},
 		tick:   time.Duration(interval) * time.Second,
+		// Legacy fleet budgets: config-check ~20s, download and admin /load
+		// 60s each (curl --max-time 60).
+		checkTimeout:    20 * time.Second,
+		downloadTimeout: 60 * time.Second,
+		loadTimeout:     60 * time.Second,
 	}, nil
+}
+
+// dropApxKeysAcrossHosts follows redirects (keeping the stdlib 10-hop cap) but
+// removes the apx credential headers whenever the redirect leaves the original
+// request's host — e.g. the control plane's 302 to a presigned Spaces URL —
+// mirroring stdlib's own cross-host handling of Authorization/Cookie.
+func dropApxKeysAcrossHosts(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req.URL.Host != via[0].URL.Host {
+		req.Header.Del("apx-key")
+		req.Header.Del("apx-internal-key")
+	}
+	return nil
 }
 
 func (p *puller) start() {
@@ -155,7 +184,12 @@ func (p *puller) checkOnce(ctx context.Context) {
 		stamp = "0"
 	}
 	url := fmt.Sprintf("%s/%s/%s", p.cfg.CheckURL, p.cfg.ProxyServerID, stamp)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Step deadline derives from the loop ctx so stop() still aborts
+	// in-flight requests. Deferred cancel: the check response body (the
+	// stamp) is read further down.
+	checkCtx, checkCancel := context.WithTimeout(ctx, p.checkTimeout)
+	defer checkCancel()
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, url, nil)
 	if err != nil {
 		p.fail(ctx, "check", err)
 		return
@@ -219,6 +253,8 @@ func (p *puller) checkOnce(ctx context.Context) {
 }
 
 func (p *puller) download(ctx context.Context) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.downloadTimeout)
+	defer cancel()
 	url := fmt.Sprintf("%s/%s", p.cfg.DownloadURL, p.cfg.ProxyServerID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -285,6 +321,8 @@ func extractCaddyConfig(zipBytes []byte) ([]byte, error) {
 }
 
 func (p *puller) load(ctx context.Context, cfgJSON []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, p.loadTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.AdminEndpoint, bytes.NewReader(cfgJSON))
 	if err != nil {
 		return err
