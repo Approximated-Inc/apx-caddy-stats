@@ -24,7 +24,6 @@ type AppRef interface {
 	VerifyPath() string
 	VerifyDifficulty() int
 	VerifyTokenTTL() time.Duration
-	VerifyMinFillMs() int64
 	VerifyScoring() string
 	VerifyBodyCap() int64
 	// ReplayLRU is the process-wide, app-owned set of recently-seen verify-token
@@ -45,15 +44,26 @@ type ChallengeApp struct {
 	SecretCfg     string `json:"secret,omitempty"`
 	VerifyPathCfg string `json:"verify_path,omitempty"`
 
-	// VerifyDifficultyCfg / VerifyTokenTTLSecondsCfg / VerifyMinFillMsCfg /
-	// VerifyScoringCfg / VerifyBodyCapBytesCfg carry the Edge Verify config
-	// keys verify_difficulty / verify_token_ttl_seconds / verify_min_fill_ms /
-	// verify_scoring / verify_body_cap_bytes. Same *Cfg-suffix convention as above.
+	// VerifyDifficultyCfg / VerifyTokenTTLSecondsCfg / VerifyScoringCfg /
+	// VerifyBodyCapBytesCfg carry the Edge Verify config keys verify_difficulty /
+	// verify_token_ttl_seconds / verify_scoring / verify_body_cap_bytes. Same
+	// *Cfg-suffix convention as above.
 	VerifyDifficultyCfg      int    `json:"verify_difficulty,omitempty"`
 	VerifyTokenTTLSecondsCfg int    `json:"verify_token_ttl_seconds,omitempty"`
-	VerifyMinFillMsCfg       int64  `json:"verify_min_fill_ms,omitempty"`
 	VerifyScoringCfg         string `json:"verify_scoring,omitempty"`
 	VerifyBodyCapBytesCfg    int64  `json:"verify_body_cap_bytes,omitempty"`
+
+	// DEPRECATED, ignored. The too_fast/fill_ms scoring it fed was removed (it
+	// blocked every real invisible-widget mint — fill_ms is just PoW-solve time).
+	// The field is retained ONLY so this binary still accepts a stored config
+	// blob that predates the removal: Caddy strict-unmarshals (DisallowUnknownFields)
+	// at machine boot, so an unknown key would crash-loop the machine, not just
+	// reject a /load. Phoenix no longer emits the key, but a deploy does NOT
+	// regenerate stored config blobs — drop this field only after verifying no
+	// cluster's stored config blob still contains verify_min_fill_ms (grep the
+	// stored blobs; force-regen any lingering cluster first), not after some
+	// number of releases.
+	VerifyMinFillMsCfg int64 `json:"verify_min_fill_ms,omitempty"`
 
 	logger     *zap.Logger
 	secret     string
@@ -62,7 +72,6 @@ type ChallengeApp struct {
 
 	verifyDifficulty int
 	verifyTokenTTL   time.Duration
-	verifyMinFillMs  int64
 	verifyScoring    string
 	verifyBodyCap    int64
 	replayLRU        *NonceLRU
@@ -103,9 +112,6 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	} else {
 		a.verifyTokenTTL = 600 * time.Second
 	}
-	if a.verifyMinFillMs = a.VerifyMinFillMsCfg; a.verifyMinFillMs <= 0 {
-		a.verifyMinFillMs = 800
-	}
 	switch a.VerifyScoringCfg {
 	case "off", "lenient", "strict":
 		a.verifyScoring = a.VerifyScoringCfg
@@ -129,7 +135,6 @@ func (a *ChallengeApp) VerifyPath() string { return a.verifyPath }
 
 func (a *ChallengeApp) VerifyDifficulty() int         { return a.verifyDifficulty }
 func (a *ChallengeApp) VerifyTokenTTL() time.Duration { return a.verifyTokenTTL }
-func (a *ChallengeApp) VerifyMinFillMs() int64        { return a.verifyMinFillMs }
 func (a *ChallengeApp) VerifyScoring() string         { return a.verifyScoring }
 func (a *ChallengeApp) VerifyBodyCap() int64          { return a.verifyBodyCap }
 func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }

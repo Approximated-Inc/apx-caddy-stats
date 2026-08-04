@@ -6,13 +6,13 @@ the widget → PoW → token → edge-enforce flow in a real browser. No Fly, no
 ## 1. Build a Caddy binary with the local module
 
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-    cd /Users/carter/dev/APX/apx-caddy-challenge
+    # from the repo root:
     xcaddy build --with github.com/Approximated-Inc/apx-caddy-challenge=$(pwd)
     # produces ./caddy in the repo root
 
 ## 2. Run it against this config
 
-    cd /Users/carter/dev/APX/apx-caddy-challenge/localtest
+    cd localtest
     ../caddy run --config caddy.json
 
 ## 3. Test in a browser — the happy path
@@ -39,8 +39,10 @@ the widget's PoW uses `crypto.subtle`, which browsers only expose in a secure co
 ## Knobs (edit caddy.json, restart)
 
 - `verify_scoring`: `"off"` (default here — passes any submit, best for the token happy-path)
-  → switch to `"lenient"` to also exercise the probe checks (webdriver / missing-APIs / too-fast).
-  With `"lenient"`, set `verify_min_fill_ms` to e.g. `800` and submit instantly to see a `too_fast` reject.
+  → switch to `"lenient"` (or `"strict"`) to also exercise the probe checks (webdriver / missing-APIs).
+  To see a reject, drive the widget from a headless browser (`navigator.webdriver === true` → `webdriver`),
+  or hand-POST `/__apx_verify/token` with a `probes` payload whose `missing_apis` lists ≥3 entries
+  (≥2 under `"strict"`) → `missing_apis` reject.
 - `mode` on the `/form` route: `"enforce"` (blocks) vs `"monitor"` (always passes, just records the outcome —
   locally there's no analytics sink so you won't see counts; use enforce to see the gate work).
 - `verify_difficulty`: 12 solves in well under a second; bump it to feel the PoW cost.

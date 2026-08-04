@@ -26,7 +26,6 @@ func (f fakeApp) VerifyPath() string { return f.vp }
 
 func (f fakeApp) VerifyDifficulty() int         { return 14 }
 func (f fakeApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
-func (f fakeApp) VerifyMinFillMs() int64        { return 800 }
 func (f fakeApp) VerifyScoring() string         { return "lenient" }
 func (f fakeApp) VerifyBodyCap() int64          { return 1048576 }
 func (f fakeApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }

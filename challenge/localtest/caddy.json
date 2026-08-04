@@ -7,7 +7,6 @@
       "verify_path": "/__apx_challenge/verify",
       "verify_difficulty": 12,
       "verify_token_ttl_seconds": 600,
-      "verify_min_fill_ms": 0,
       "verify_scoring": "off",
       "verify_body_cap_bytes": 1048576
     },

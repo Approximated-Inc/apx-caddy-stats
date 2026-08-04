@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -33,7 +34,7 @@ const (
 
 	// verifyWidgetVersion bumps whenever assets/verify_widget.js or the substituted
 	// paths change; it is the ETag basis so caches revalidate on a new build.
-	verifyWidgetVersion = "1"
+	verifyWidgetVersion = "2"
 )
 
 // ---------------------------------------------------------------------------
@@ -117,21 +118,22 @@ func (h *VerifyEndpointHandler) serveToken(w http.ResponseWriter, r *http.Reques
 
 	payload, err := CheckVerifyChallenge(h.app.Secret(), challenge, ip)
 	if err != nil {
-		return refuse(w, "challenge_invalid", "bad_challenge")
+		return h.refuse(w, r, "challenge_invalid", "bad_challenge")
 	}
 	if !VerifyPoW(challenge, solution, payload.Diff) {
-		return refuse(w, "pow_invalid", "bad_solution")
+		return h.refuse(w, r, "pow_invalid", "bad_solution")
 	}
 
 	var probes Probes
 	if err := json.Unmarshal([]byte(probesRaw), &probes); err != nil {
-		return refuse(w, "probes_invalid", "bad_probes")
+		return h.refuse(w, r, "probes_invalid", "bad_probes")
 	}
-	if ok, reason := ScoreProbes(probes, h.app.VerifyScoring(), h.app.VerifyMinFillMs()); !ok {
-		return refuse(w, "probe_failed", reason)
+	if ok, reason := ScoreProbes(probes, h.app.VerifyScoring()); !ok {
+		return h.refuse(w, r, "probe_failed", reason)
 	}
 
-	host := hostOnly(r.Host)
+	// Hostnames are case-insensitive; lowercase so mint and verify always match.
+	host := strings.ToLower(hostOnly(r.Host))
 	ttl := h.app.VerifyTokenTTL()
 	token := IssueVerifyToken(h.app.Secret(), ip, host, payload.Nonce, time.Now().Add(ttl))
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -144,7 +146,20 @@ func (h *VerifyEndpointHandler) serveToken(w http.ResponseWriter, r *http.Reques
 // refuse writes a 200 with {error, reason} and NO token. The widget injects
 // nothing, so the later protected POST is blocked. 200 (not 4xx) keeps the
 // widget's fail-open path from surfacing errors to the page.
-func refuse(w http.ResponseWriter, errCode, reason string) error {
+//
+// It logs the reason at Debug, so the line is visible only where the cluster's
+// log level includes Debug: the fleet default (ProxyServer.log_level) is ERROR,
+// so a default cluster stays silent; the dev cluster runs DEBUG. A fleet-visible
+// counter/metric is the real follow-up. The historical motivation stands: the
+// too_fast bug refused 100% of real mints yet left no server-side trace, so it
+// survived until hands-on testing — a sustained spike in probe_failed here means
+// real users are being blocked.
+func (h *VerifyEndpointHandler) refuse(w http.ResponseWriter, r *http.Request, errCode, reason string) error {
+	if h.logger != nil {
+		h.logger.Debug("apx_verify: token mint refused",
+			zap.String("error", errCode), zap.String("reason", reason),
+			zap.String("host", hostOnly(r.Host)))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"error": errCode, "reason": reason})
 	return nil
 }
@@ -193,7 +208,8 @@ func (h *VerifyHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { retur
 
 func (h *VerifyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
-	host := hostOnly(r.Host)
+	// Hostnames are case-insensitive; lowercase so mint and verify always match.
+	host := strings.ToLower(hostOnly(r.Host))
 
 	token := h.extractToken(r)
 	outcome := "missing"
