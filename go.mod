@@ -9,6 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/keilerkonzept/topk v1.1.4
 	github.com/mholt/caddy-l4 v0.0.0-00010101000000-000000000000
+	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.28.0

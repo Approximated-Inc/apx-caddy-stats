@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/oschwald/maxminddb-golang"
 	"go.uber.org/zap"
 )
 
@@ -29,10 +30,14 @@ type PullerConfig struct {
 
 type App struct {
 	Puller PullerConfig `json:"puller,omitempty"`
+	Geo    GeoConfig    `json:"geo,omitempty"`
 
 	logger *zap.Logger
 	state  *SharedState
 	puller *puller // nil unless enabled
+	// geo is mmap'd at Provision and never explicitly closed (see geo.go
+	// lifecycle note); nil when unconfigured or the file is unusable.
+	geo *maxminddb.Reader
 }
 
 func (App) CaddyModule() caddy.ModuleInfo {
@@ -52,6 +57,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx: loading shared state: %w", err)
 	}
 	a.state = st
+	a.provisionGeo()
 	return nil
 }
 
