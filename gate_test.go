@@ -164,6 +164,14 @@ func TestGate_ABRecordsIdenticallyToStatsHandler(t *testing.T) {
 			},
 			next: nextHandler(404),
 		},
+		{
+			name:   "edge verify outcome var set",
+			modeV2: true,
+			newReq: func() *http.Request {
+				return newRequestWithVerifyOutcome("POST", "/checkout/123", "Example.COM:8443", "invalid")
+			},
+			next: nextHandler(403),
+		},
 	}
 
 	for _, sc := range scenarios {
@@ -188,6 +196,7 @@ func TestGate_ABRecordsIdenticallyToStatsHandler(t *testing.T) {
 			require.Equal(t, normKeyRows(appA.snapshot()), normKeyRows(appB.snapshot()), "counter rows differ")
 			require.Equal(t, normEventRows(appA.reqEventSnapshot()), normEventRows(appB.reqEventSnapshot()), "request_events differ")
 			require.Equal(t, appA.challengeSnapshot(), appB.challengeSnapshot(), "challenge_attempts differ")
+			require.Equal(t, appA.edgeVerifySnapshot(), appB.edgeVerifySnapshot(), "edge_verify_attempts differ")
 			require.Equal(t, normUniqueRows(appA.uniqueSnapshot()), normUniqueRows(appB.uniqueSnapshot()), "unique-client rows differ")
 		})
 	}
