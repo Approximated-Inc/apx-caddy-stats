@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -87,22 +88,51 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	return servErr
 }
 
-// record reads context off the request after next.ServeHTTP returns.
-// vhost_id, country, and ASN come from placeholders set by handlers
-// earlier in the chain. Origin uses servErr (the bubbled handler error)
-// to detect reverse_proxy failures — see classifyOrigin.
+// record reads context off the request after next.ServeHTTP returns and
+// feeds the counter map, the challenge-attempt map, the request_events
+// track, and the unique-clients set.
+//
+// In legacy mode (mode_v2 off) request_events logs exactly one row per
+// SERVED request (blocked/challenged requests excluded), preserving the
+// original wire bytes. In mode_v2 every request — served, blocked,
+// rate-limited, or challenged — is logged with a disposition; terminal
+// challenges (no vhost_id) are logged under vhost_id=0 with a host field.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
-	vhostID, ok := readVhostID(r)
-	if !ok {
-		// No vhost_id set — request didn't match a vhost route. Skip;
-		// recording a counter under vhost_id=0 would pollute aggregates.
-		metricRequestsTotal.WithLabelValues("no_vhost").Inc()
-		return
+	modeV2 := h.app.RequestEventsModeV2()
+
+	// Challenge attempts record independently of vhost_id (see the original
+	// comment): a served challenge is terminal so vhost_id is unset. Read
+	// the outcome once — it also drives the request_event disposition below.
+	outcome := readChallengeOutcome(r)
+	if outcome != "" {
+		h.app.RecordChallengeAttempt(challengeAttemptKey{
+			vhost:   challengeVhost(r),
+			ip:      securityClientIP(r),
+			outcome: outcome,
+		})
 	}
 
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	origin := classifyOrigin(repl, servErr)
+	vhostID, ok := readVhostID(r)
+	if !ok {
+		// No vhost_id — the request didn't match a vhost route. Recording a
+		// counter under vhost_id=0 would pollute aggregates, so skip it.
+		metricRequestsTotal.WithLabelValues("no_vhost").Inc()
+		// mode_v2 exception: a terminal challenge is served WITHOUT a
+		// vhost_id (apx_challenge returns before the per-vhost vars handler
+		// runs). Log it keyed by host, vhost_id=0, so the customer sees
+		// challenge activity. Plain no-route requests stay dropped.
+		if modeV2 && outcome != "" {
+			reason := blockReason(repl, servErr)
+			disp := deriveDisposition(reason, outcome)
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
+		}
+		return
+	}
+
+	reason := blockReason(repl, servErr)
+	origin := classifyOrigin(repl, servErr, reason)
 	country := readCountry(repl)
 	asn := readASN(repl)
 	durationUs := uint64(dur.Microseconds())
@@ -126,6 +156,34 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
+	// request_events. In mode_v2, EVERY disposition is logged (served rows
+	// unsampled, blocked/challenge rows sampled — decided in the recorder);
+	// host is empty here because vhost_id resolves the vhost. In legacy
+	// mode, only SERVED requests (reason == "") produce a row, in the
+	// original wire shape (V2 unset).
+	if modeV2 {
+		disp := deriveDisposition(reason, outcome)
+		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
+	} else if reason == "" {
+		h.app.RecordRequestEvent(requestEventRow{
+			TsUnixSec:   uint32(time.Now().UTC().Unix()),
+			VhostID:     k.VhostID,
+			ClientIP:    securityClientIP(r),
+			ForwardedIP: forwardedIP(r),
+			FrontProxy:  frontProxy(r),
+			Method:      k.Method,
+			Path:        capPath(r.URL.Path),
+			PathBucket:  pathBucket(r.URL.Path),
+			Status:      k.Status,
+			HTTPVersion: httpVersionOrUnknown(r),
+			UA:          capUA(r.UserAgent()),
+			Origin:      origin,
+			BytesIn:     requestBytes(r),
+			BytesOut:    responseBytes(w),
+			DurationUs:  durationUs,
+		})
+	}
+
 	// Unique-clients tracking. Skipped entirely when the salt isn't
 	// configured (returns "" — see StatsApp.HashSalt). Hash inputs:
 	// client IP + user-agent + salt. Best-effort identity — same UA
@@ -135,6 +193,41 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	if salt := h.app.HashSalt(); salt != "" {
 		hash := ClientHash(clientIP(r), r.UserAgent(), salt)
 		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
+	}
+}
+
+// buildRequestEventRow assembles a mode_v2 request_event row. vhostID is 0
+// for terminal challenges; host is the lowercased/port-stripped Host header
+// (capped) for those rows and "" when a vhost_id resolves the vhost.
+// disposition is one of the disp* constants. SampleRate is stamped later by
+// the recorder. Origin/reason are recomputed from the same inputs the
+// counter path used, so the two stay consistent.
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
+	reason := blockReason(repl, servErr)
+	origin := classifyOrigin(repl, servErr, reason)
+	now := time.Now().UTC()
+	return requestEventRow{
+		TsUnixSec:   uint32(now.Unix()),
+		TsUnixMs:    now.UnixMilli(),
+		VhostID:     vhostID,
+		ClientIP:    securityClientIP(r),
+		ForwardedIP: forwardedIP(r),
+		FrontProxy:  frontProxy(r),
+		Method:      methodOrUnknown(r.Method),
+		Path:        capPath(r.URL.Path),
+		PathBucket:  pathBucket(r.URL.Path),
+		Status:      finalStatus(w, servErr),
+		HTTPVersion: httpVersionOrUnknown(r),
+		UA:          capUA(r.UserAgent()),
+		Origin:      origin,
+		BytesIn:     requestBytes(r),
+		BytesOut:    responseBytes(w),
+		DurationUs:  uint64(dur.Microseconds()),
+		MachineID:   truncateBytes(h.app.MachineID(), 64),
+		MachineSeq:  nextMachineSeq(),
+		Disposition: disposition,
+		Host:        host,
+		V2:          true,
 	}
 }
 
@@ -193,6 +286,78 @@ func readVhostID(r *http.Request) (uint32, bool) {
 	return uint32(n), true
 }
 
+// readChallengeOutcome reads the `apx_challenge_outcome` request var set
+// by the apx_challenge handler — one of "issued" | "passed" |
+// "passed_recently" | "failed", or "" when no challenge handler ran.
+// Readable here because apx_stats is the OUTERMOST handler wrapping the
+// subroute: the challenge handler mutates the shared vars map via
+// caddyhttp.SetVar before returning, and our deferred record() runs after
+// next.ServeHTTP returns, so the var is visible.
+func readChallengeOutcome(r *http.Request) string {
+	v := caddyhttp.GetVar(r.Context(), "apx_challenge_outcome")
+	s, _ := v.(string)
+	return s
+}
+
+// challengeVhost returns the lowercased Host header with any :port
+// stripped, width-capped to challengeVhostMaxBytes. A served challenge is
+// terminal (the apx_challenge handler returns without calling next), so
+// the per-vhost vars handler never runs and vhost_id is unset — the
+// challenge_attempt dimension is therefore the Host string, NOT vhost_id.
+//
+// The result may still slice a request-owned backing (truncateBytes is
+// copy-free under the cap, and r.Host can be a slice of the request line
+// for absolute-form URIs); RecordChallengeAttempt clones the key strings
+// on first insert, so steady-state increments stay copy-free.
+func challengeVhost(r *http.Request) string {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return truncateBytes(strings.ToLower(host), challengeVhostMaxBytes)
+}
+
+// blockReason reports why Caddy itself blocked this request before it
+// reached the upstream — "waf", "rate_limit", or "" (not blocked). It
+// feeds both the request_counters origin (cluster_blocked) and the
+// request_events served-only filter, so the two stay consistent.
+//
+// An explicit {http.vars.apx_block_reason} wins when a handler sets it
+// (override / future-proofing). Otherwise we infer from the error the
+// blocking handler returned: apx_stats is the OUTERMOST handler, so a
+// coraza interruption or a rate_limit reject bubbles up to us as servErr
+// (a caddyhttp.HandlerError) even though those handlers terminate the
+// chain before reverse_proxy:
+//
+//   - coraza (block mode) returns HandlerError{Err: errInterruptionTriggered}
+//     whose message is "interruption triggered" (coraza-caddy v2.5.0,
+//     coraza.go / interceptor.go). We key on that string.
+//   - the apx rate_limit fork returns caddyhttp.Error(429, nil).
+//
+// A reverse_proxy failure also returns a HandlerError, but with a 5xx/499
+// status and a proxy error message — never these signals — so it is
+// classified as cluster_proxy_error, not a block. An origin's own 429 is
+// served (response written, servErr nil) and never reaches here.
+func blockReason(repl *caddy.Replacer, servErr error) string {
+	if repl != nil {
+		if reason, _ := repl.GetString("http.vars.apx_block_reason"); reason != "" {
+			return reason
+		}
+	}
+
+	var he caddyhttp.HandlerError
+	if !errors.As(servErr, &he) {
+		return ""
+	}
+	if strings.Contains(he.Error(), "interruption triggered") {
+		return "waf"
+	}
+	if he.StatusCode == http.StatusTooManyRequests {
+		return "rate_limit"
+	}
+	return ""
+}
+
 // classifyOrigin maps a finished request to one of four origin classes.
 //
 //   - upstream: reverse_proxy attempted and the upstream returned. Caddy
@@ -225,11 +390,12 @@ func readVhostID(r *http.Request) (uint32, bool) {
 //
 // We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
 // it inside `handle_response` blocks, never for normal pass-through.
-func classifyOrigin(repl *caddy.Replacer, servErr error) string {
-	if repl != nil {
-		if reason, _ := repl.GetString("http.vars.apx_block_reason"); reason != "" {
-			return OriginClusterBlocked
-		}
+//
+// blockReason (computed once by the caller) decides cluster_blocked; an
+// empty reason falls through to the upstream/cluster classification below.
+func classifyOrigin(repl *caddy.Replacer, servErr error, blockReason string) string {
+	if blockReason != "" {
+		return OriginClusterBlocked
 	}
 
 	upstream := ""
@@ -319,12 +485,35 @@ func normalizeCountry(s string) string {
 // methodOrUnknown protects the cardinality of the method field. A
 // malformed request can land an arbitrary token in r.Method; clamp to
 // the standard verbs we'd expect to see in a reverse-proxy fleet.
+//
+// Returns the net/http package CONSTANT for matched verbs — never m
+// itself. On HTTP/1.1, m is a slice of the full request line (method +
+// URI + proto share one backing array), and the result is buffered in
+// the counter map Key and the request_events rows until flush; returning
+// m would pin the whole attacker-length-controlled line (~1MB under a
+// long-URI flood) per buffered entry while the governor's byte
+// accounting counts only len("POST"). Non-standard verbs clamp to the
+// static "OTHER" sentinel, which is equally pin-free.
 func methodOrUnknown(m string) string {
 	switch m {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
-		http.MethodDelete, http.MethodHead, http.MethodOptions,
-		http.MethodConnect, http.MethodTrace:
-		return m
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodOptions:
+		return http.MethodOptions
+	case http.MethodConnect:
+		return http.MethodConnect
+	case http.MethodTrace:
+		return http.MethodTrace
 	}
 	return "OTHER"
 }

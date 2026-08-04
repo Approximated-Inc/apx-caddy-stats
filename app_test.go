@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,6 +44,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		maxBuffer:       a.Ingest.MaxBufferRows,
 		maxUniqueHashes: intDefault(a.Ingest.MaxUniqueHashes, 500_000),
 		maxRetries:      a.Ingest.MaxRetries,
+		l4SniMaxKeys:    a.Ingest.L4SniMaxKeys,
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	for i := range a.shards {
@@ -50,6 +53,28 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 			uniques:  make(map[uniqueKey]map[uint64]struct{}),
 		}
 	}
+	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.challengeMap = make(map[challengeAttemptKey]uint64)
+	// Generous governor (4GB → 1.6GB share) so byte budgets never bind in
+	// tests that aren't about the governor; RSS stubbed to 0.
+	a.memGov = newMemGovernor(4<<30, func() (uint64, bool) { return 0, true }, nil)
+	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
+		if a.Ingest.RequestEvents.ModeV2 {
+			a.reqEventsModeV2 = true
+			a.requestEvents = newRequestEventRecorderV2(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				intDefault(a.Ingest.RequestEvents.BlockedSampleThreshold, 2000),
+				a.memGov,
+			)
+		} else {
+			a.requestEvents = newRequestEventRecorder(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				a.Ingest.RequestEvents.SampleThreshold,
+				a.memGov,
+			)
+		}
+	}
+	a.initL4IpState()
 	a.stopCh = make(chan struct{})
 	return a
 }
@@ -282,6 +307,9 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 	posts := captured()
 	require.Len(t, posts, 1)
 	require.Equal(t, "shared-secret", posts[0].headers.Get("apx-key"))
+	// Cluster id rides alongside the secret so the control plane can
+	// authenticate the derived-key arm before reading the body.
+	require.Equal(t, "42", posts[0].headers.Get("apx-proxy-server-id"))
 	require.Equal(t, "gzip", posts[0].headers.Get("Content-Encoding"))
 	require.Equal(t, "application/x-ndjson", posts[0].headers.Get("Content-Type"))
 
@@ -543,4 +571,206 @@ func TestFormatTs_RoundTripsViaIngest(t *testing.T) {
 	parsed, err := time.Parse(time.RFC3339, tsStr)
 	require.NoError(t, err)
 	require.Equal(t, now.Unix(), parsed.UTC().Unix())
+}
+
+func TestProvisionLike_BuildsRequestEventsRecorderWhenEnabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, SampleThreshold: 1000, MaxRows: 50_000}
+	})
+	require.NotNil(t, a.requestEvents)
+}
+
+func TestProvisionLike_NoRequestEventsRecorderWhenAbsentOrDisabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k")
+	require.Nil(t, a.requestEvents, "absent request_events config → nil recorder")
+
+	b := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: false}
+	})
+	require.Nil(t, b.requestEvents, "enabled:false → nil recorder")
+}
+
+// provisionApp runs the real Provision against a bare caddy.Context
+// (nil cfg → dev logger). Unlike newTestApp, this exercises the actual
+// secret-resolution path. Cleans up the corazaApp global that Provision
+// publishes.
+func provisionApp(t *testing.T, ingest *IngestConfig) (*StatsApp, error) {
+	t.Helper()
+	a := &StatsApp{ProxyServerIDValue: 42, Ingest: ingest}
+	err := a.Provision(caddy.Context{Context: context.Background()})
+	t.Cleanup(func() { corazaApp.CompareAndSwap(a, nil) })
+	return a, err
+}
+
+func TestProvision_AuthTokenFromConfig(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"})
+	require.NoError(t, err, "auth_token in config must not require the env var")
+	require.Equal(t, "cfg-token", a.secret)
+}
+
+func TestProvision_AuthTokenWinsOverEnvVar(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "env-secret")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"})
+	require.NoError(t, err)
+	require.Equal(t, "cfg-token", a.secret)
+}
+
+func TestProvision_EnvVarFallbackWhenAuthTokenEmpty(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "env-secret")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused"})
+	require.NoError(t, err)
+	require.Equal(t, "env-secret", a.secret)
+}
+
+func TestProvision_ErrorsWhenNoAuthTokenAndEnvVarEmpty(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	_, err := provisionApp(t, &IngestConfig{URL: "http://unused"})
+	require.ErrorContains(t, err, "APX_INTERNAL_KEY env var is empty")
+}
+
+func TestFlushOnce_PostsCarryConfigAuthToken(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a, err := provisionApp(t, &IngestConfig{URL: srv.URL, AuthToken: "cfg-token"})
+	require.NoError(t, err)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginUpstream}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	require.Equal(t, "cfg-token", posts[0].headers.Get("apx-key"))
+}
+
+func TestFlushOnce_ShipsRequestEventRows(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "shared-secret", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true}
+	})
+	require.NotNil(t, a.requestEvents)
+
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()),
+		VhostID:   100,
+		ClientIP:  "203.0.113.7",
+		Method:    "GET",
+		Path:      "/api/users",
+		Status:    200,
+		Origin:    OriginUpstream,
+	})
+
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var eventRows []map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			eventRows = append(eventRows, r)
+		}
+	}
+	require.Len(t, eventRows, 1)
+	row := eventRows[0]
+	require.Equal(t, float64(42), row["proxy_server_id"])
+	require.Equal(t, float64(100), row["vhost_id"])
+	require.Equal(t, "203.0.113.7", row["client_ip"])
+	require.Equal(t, "/api/users", row["path"])
+	require.Equal(t, float64(200), row["status"])
+	require.Equal(t, float64(1), row["sample_rate"]) // unsampled
+}
+
+func TestFlushOnce_NoRequestEventRowsWhenRecorderNil(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	require.Nil(t, a.requestEvents)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	for _, r := range posts[0].rows {
+		require.NotEqual(t, "request_event", r["_type"])
+	}
+}
+
+func TestProvisionLike_BuildsV2RecorderWhenModeV2(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, ModeV2: true}
+	})
+	require.NotNil(t, a.requestEvents)
+	require.True(t, a.requestEvents.modeV2, "mode_v2 config must build a v2 recorder")
+	require.True(t, a.RequestEventsModeV2())
+	require.Equal(t, 2000, a.requestEvents.blockedThreshold, "default blocked_sample_threshold is 2000/window")
+}
+
+func TestProvisionLike_LegacyRecorderWhenModeV2Off(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, SampleThreshold: 1000}
+	})
+	require.NotNil(t, a.requestEvents)
+	require.False(t, a.requestEvents.modeV2)
+	require.False(t, a.RequestEventsModeV2())
+	require.Equal(t, 1000, a.requestEvents.threshold, "legacy recorder keeps sample_threshold")
+}
+
+func TestFlushOnce_ModeV2Off_WireHasNoNewFields(t *testing.T) {
+	// mode_v2 off: a served row ships in the legacy wire shape — none of the
+	// new keys may appear (byte-identical wire for old configs).
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true}
+	})
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()), VhostID: 100,
+		ClientIP: "203.0.113.7", Method: "GET", Path: "/api", Status: 200, Origin: OriginUpstream,
+	})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var ev map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			ev = r
+		}
+	}
+	require.NotNil(t, ev)
+	for _, k := range []string{"ts_ms", "machine_id", "machine_seq", "disposition", "host"} {
+		_, present := ev[k]
+		require.False(t, present, "mode_v2-off wire must not carry %q", k)
+	}
+}
+
+func TestFlushOnce_ModeV2On_WireCarriesDisposition(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, ModeV2: true}
+	})
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()), TsUnixMs: time.Now().UnixMilli(),
+		VhostID: 0, ClientIP: "203.0.113.7", Method: "GET", Path: "/login", Status: 403,
+		Origin: OriginCluster, Disposition: dispChallengeIssued, Host: "example.com", V2: true,
+	})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var ev map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			ev = r
+		}
+	}
+	require.NotNil(t, ev)
+	require.Equal(t, "challenge_issued", ev["disposition"])
+	require.Equal(t, "example.com", ev["host"])
+	_, hasTsMs := ev["ts_ms"]
+	require.True(t, hasTsMs)
 }
