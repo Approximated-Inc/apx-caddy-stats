@@ -166,12 +166,31 @@ func (p *puller) checkOnce(ctx context.Context) {
 		p.fail(ctx, "check", err)
 		return
 	}
-	newStamp := resp.Header.Get("x-apx-config-stamp")
-	drain(resp)
-	if resp.StatusCode != http.StatusOK {
-		// Not newer (mirrors maybepull.sh: only exactly 200 pulls).
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// Newer config available; fall through to pull it.
+	case http.StatusNoContent, http.StatusNotModified:
+		// Up to date (mirrors maybepull.sh: only exactly 200 pulls).
+		drain(resp)
 		p.ok()
 		return
+	default:
+		// 401/400/5xx etc. are real failures, not "up to date".
+		code := resp.StatusCode
+		drain(resp)
+		p.fail(ctx, "check", fmt.Errorf("config check returned HTTP %d", code))
+		return
+	}
+
+	// The control plane sends the new stamp as the plain-text 200 body
+	// (an integer unix timestamp). Prefer it; fall back to the legacy
+	// x-apx-config-stamp header, then to local time below.
+	headerStamp := resp.Header.Get("x-apx-config-stamp")
+	stampBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+	resp.Body.Close()
+	newStamp := strings.TrimSpace(string(stampBytes))
+	if newStamp == "" {
+		newStamp = headerStamp
 	}
 
 	body, err := p.download(ctx)
