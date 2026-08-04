@@ -1,3 +1,5 @@
+> **Note:** This package was imported into `apx-caddy-stats` (the unified apx module) as of 2026-08-03. Do not build it standalone — use the single `--with github.com/Approximated-Inc/apx-caddy-stats` line documented in the root README's "Unified build" section. The instructions below are preserved from the standalone repo for historical reference.
+
 # apx-caddy-challenge
 
 Interactive proof-of-work (PoW) challenge handler for Caddy, used by the
