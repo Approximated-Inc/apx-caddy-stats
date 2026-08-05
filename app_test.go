@@ -55,6 +55,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.challengeMap = make(map[challengeAttemptKey]uint64)
+	a.edgeVerifyMap = make(map[edgeVerifyAttemptKey]uint64)
 	// Generous governor (4GB → 1.6GB share) so byte budgets never bind in
 	// tests that aren't about the governor; RSS stubbed to 0.
 	a.memGov = newMemGovernor(4<<30, func() (uint64, bool) { return 0, true }, nil)
