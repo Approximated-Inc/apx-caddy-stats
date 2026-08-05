@@ -17,6 +17,7 @@ import (
 // app.go so the app and the handler can be imported independently.
 func init() {
 	caddy.RegisterModule(&StatsHandler{})
+	caddy.RegisterModule(&GateHandler{})
 	caddy.RegisterModule(&L4Handler{})
 	caddy.RegisterModule(&FingerprintHandler{})
 }

@@ -57,23 +57,8 @@ func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return
 
 // ServeHTTP records one row's worth of stats per request. Hot path is
 // designed to avoid allocations beyond the wrapper struct.
-//
-// Approximated's own URL monitor probes carry an `apx-monitor: true`
-// request header. We don't record those — they're our health-check
-// traffic and would inflate every customer's request_count + skew the
-// status mix (a healthy vhost monitor is mostly 200s; an unhealthy one
-// is mostly 5xxs from us, not the customer's real users). Skip before
-// any wrapping work.
-//
-// Match against the exact "true" sentinel — same convention every
-// other apx-monitor check in the Phoenix app uses. An earlier version
-// matched any non-empty value as "defensive against the URL monitor
-// changing the sentinel," but that opened a counter-bypass for any
-// external client to mask their traffic from a customer's analytics
-// dashboard with a one-line header injection. The exact match closes
-// it.
 func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if r.Header.Get("apx-monitor") == "true" {
+	if monitorSkip(r) {
 		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
 		return next.ServeHTTP(w, r)
 	}
@@ -83,29 +68,48 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	wrapped := &recorder{ResponseWriter: w, status: 200}
 	servErr := next.ServeHTTP(wrapped, r)
 
-	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr)
+	recordCompletedRequest(h.app, h.logger, wrapped, r, servErr, start)
 	return servErr
 }
 
-// record reads context off the request after next.ServeHTTP returns and
-// feeds the counter map, the challenge-attempt map, the request_events
-// track, and the unique-clients set.
+// monitorSkip reports whether r is one of Approximated's own URL monitor
+// probes, carrying an `apx-monitor: true` request header. We don't record
+// those — they're our health-check traffic and would inflate every
+// customer's request_count + skew the status mix (a healthy vhost monitor
+// is mostly 200s; an unhealthy one is mostly 5xxs from us, not the
+// customer's real users). Checked before any wrapping work.
+//
+// Match against the exact "true" sentinel — same convention every
+// other apx-monitor check in the Phoenix app uses. An earlier version
+// matched any non-empty value as "defensive against the URL monitor
+// changing the sentinel," but that opened a counter-bypass for any
+// external client to mask their traffic from a customer's analytics
+// dashboard with a one-line header injection. The exact match closes
+// it.
+func monitorSkip(r *http.Request) bool {
+	return r.Header.Get("apx-monitor") == "true"
+}
+
+// recordCompletedRequest reads context off the request after
+// next.ServeHTTP returns and feeds the counter map, the challenge-attempt
+// map, the request_events track, and the unique-clients set. start is the
+// time next.ServeHTTP was invoked; the elapsed duration is derived here.
 //
 // In legacy mode (mode_v2 off) request_events logs exactly one row per
 // SERVED request (blocked/challenged requests excluded), preserving the
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
-	modeV2 := h.app.RequestEventsModeV2()
+func recordCompletedRequest(app AppRef, logger *zap.Logger, w *recorder, r *http.Request, servErr error, start time.Time) {
+	dur := time.Since(start)
+	modeV2 := app.RequestEventsModeV2()
 
 	// Challenge attempts record independently of vhost_id (see the original
 	// comment): a served challenge is terminal so vhost_id is unset. Read
 	// the outcome once — it also drives the request_event disposition below.
 	outcome := readChallengeOutcome(r)
 	if outcome != "" {
-		h.app.RecordChallengeAttempt(challengeAttemptKey{
+		app.RecordChallengeAttempt(challengeAttemptKey{
 			vhost:   challengeVhost(r),
 			ip:      securityClientIP(r),
 			outcome: outcome,
@@ -119,7 +123,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// edge for Edge Verify.
 	edgeVerifyOutcome := readEdgeVerifyOutcome(r)
 	if edgeVerifyOutcome != "" {
-		h.app.RecordEdgeVerifyAttempt(edgeVerifyAttemptKey{
+		app.RecordEdgeVerifyAttempt(edgeVerifyAttemptKey{
 			vhost:      challengeVhost(r),
 			pathBucket: pathBucket(r.URL.Path),
 			outcome:    edgeVerifyOutcome,
@@ -140,7 +144,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
+			app.RecordRequestEvent(buildRequestEventRow(app, r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
 		}
 		return
 	}
@@ -167,7 +171,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		LatBucket:  BucketForUs(durationUs),
 	}
 
-	h.app.Record(k, d)
+	app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
 	// request_events. In mode_v2, EVERY disposition is logged (served rows
@@ -177,9 +181,9 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
+		app.RecordRequestEvent(buildRequestEventRow(app, r, w, dur, servErr, repl, k.VhostID, "", disp))
 	} else if reason == "" {
-		h.app.RecordRequestEvent(requestEventRow{
+		app.RecordRequestEvent(requestEventRow{
 			TsUnixSec:   uint32(time.Now().UTC().Unix()),
 			VhostID:     k.VhostID,
 			ClientIP:    securityClientIP(r),
@@ -204,9 +208,9 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// from the same IP behind a NAT will collapse, mobile clients
 	// rotating IPs will split. Good enough for "rough number of
 	// distinct clients in this window."
-	if salt := h.app.HashSalt(); salt != "" {
+	if salt := app.HashSalt(); salt != "" {
 		hash := ClientHash(clientIP(r), r.UserAgent(), salt)
-		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
+		app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
 	}
 }
 
@@ -216,7 +220,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
+func buildRequestEventRow(app AppRef, r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
@@ -237,7 +241,7 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		BytesIn:     requestBytes(r),
 		BytesOut:    responseBytes(w),
 		DurationUs:  uint64(dur.Microseconds()),
-		MachineID:   truncateBytes(h.app.MachineID(), 64),
+		MachineID:   truncateBytes(app.MachineID(), 64),
 		MachineSeq:  nextMachineSeq(),
 		Disposition: disposition,
 		Host:        host,

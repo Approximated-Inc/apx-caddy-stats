@@ -1,0 +1,6 @@
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+.box { max-width: 28rem; text-align: center; padding: 2rem; }
+.spinner { width: 2rem; height: 2rem; border: 3px solid #8884; border-top-color: #888; border-radius: 50%; animation: spin 1s linear infinite; margin: 1rem auto; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.muted { color: #888; font-size: .9rem; }
