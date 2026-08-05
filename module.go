@@ -6,4 +6,6 @@ import "github.com/caddyserver/caddy/v2"
 // app.go so the app and the handler can be imported independently.
 func init() {
 	caddy.RegisterModule(&StatsHandler{})
+	caddy.RegisterModule(&L4Handler{})
+	caddy.RegisterModule(&FingerprintHandler{})
 }
