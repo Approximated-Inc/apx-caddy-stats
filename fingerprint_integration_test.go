@@ -27,7 +27,7 @@ func TestFingerprint_endToEnd(t *testing.T) {
 	fpSnap := a.fingerprintSnapshot()
 	fpIpSnap := a.fingerprintIpSnapshot()
 	body, err := encodeBatch(a.ProxyServerIDValue, uint32(time.Now().Unix()/60),
-		nil, nil, nil, l4IpSnap{}, fpSnap, fpIpSnap, nil, nil)
+		nil, nil, nil, l4IpSnap{}, fpSnap, fpIpSnap, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

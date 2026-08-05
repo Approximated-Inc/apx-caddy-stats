@@ -131,6 +131,11 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// client. Internally gated by l7Enabled — a cheap no-op when off.
 	h.app.RecordL7Httpversion(k.VhostID, httpVersionOrUnknown(r), statusBucket(k.Status))
 
+	// L7 per-path track. Same vhost_id + status the counter recorded;
+	// pathBucket buckets the raw request path. Gated inside RecordL7Path
+	// (nil recorder / breaker latch) — a cheap no-op when off.
+	h.app.RecordL7Path(k.VhostID, pathBucket(r.URL.Path), statusBucket(k.Status))
+
 	// Unique-clients tracking. Skipped entirely when the salt isn't
 	// configured (returns "" — see StatsApp.HashSalt). Hash inputs:
 	// client IP + user-agent + salt. Best-effort identity — same UA

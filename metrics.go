@@ -101,3 +101,14 @@ var metricCorazaOverflows = promauto.NewCounter(
 		Help: "Raw Coraza detection events dropped because the per-flush detection slice was at cap.",
 	},
 )
+
+// metricL7PathAggregateOnly is 1 while the L7 path recorder's edge circuit
+// breaker (G4) is latched to aggregate-only — per-vhost path recording is
+// suppressed under sustained overflow — and 0 otherwise. Set on each
+// transition in evaluateL7PathBreaker.
+var metricL7PathAggregateOnly = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "apx_stats_l7_path_aggregate_only",
+		Help: "1 when the L7 path recorder is latched to aggregate-only by the edge circuit breaker, 0 otherwise.",
+	},
+)

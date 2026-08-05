@@ -86,6 +86,86 @@ func TestRecordL7Httpversion_CapDropsNewKeysNoSentinel(t *testing.T) {
 	}
 }
 
+func TestL7Path_BuiltWhenEnabledWithKnobs(t *testing.T) {
+	// l7.enabled=true + tracked_vhosts/paths_per_vhost > 0 → recorder built.
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 500, PathsPerVhost: 20}
+		})
+	require.NotNil(t, a.l7Path, "recorder must be built when enabled + knobs > 0")
+}
+
+func TestL7Path_NilWhenTrackedVhostsZero(t *testing.T) {
+	// enabled but tracked_vhosts=0 → no recorder.
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 0, PathsPerVhost: 20}
+		})
+	require.Nil(t, a.l7Path)
+}
+
+func TestL7Path_NilWhenPathsPerVhostZero(t *testing.T) {
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 500, PathsPerVhost: 0}
+		})
+	require.Nil(t, a.l7Path)
+}
+
+func TestL7Path_NilWhenDisabled(t *testing.T) {
+	// enabled=false but knobs set → recorder still nil (track off).
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: false, TrackedVhosts: 500, PathsPerVhost: 20}
+		})
+	require.Nil(t, a.l7Path)
+}
+
+func TestL7Path_NilWhenL7Absent(t *testing.T) {
+	// No ingest.l7 block at all → recorder nil.
+	a := newTestApp(t, "http://unused", "secret")
+	require.Nil(t, a.l7Path)
+}
+
+func TestRecordL7Path_NoOpWhenNil(t *testing.T) {
+	// nil recorder → RecordL7Path is a safe no-op (no panic, nothing tracked).
+	a := newTestApp(t, "http://unused", "secret")
+	require.Nil(t, a.l7Path)
+	require.NotPanics(t, func() { a.RecordL7Path(100, "/api/users", 2) })
+}
+
+func TestRecordL7Path_RecordsWhenConfigured(t *testing.T) {
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 64, PathsPerVhost: 16}
+		})
+	require.NotNil(t, a.l7Path)
+
+	for i := 0; i < 5; i++ {
+		a.RecordL7Path(100, "/api/users", 2)
+	}
+	rows, _ := a.l7Path.drain(777)
+	m := drainMap(rows)
+	require.Equal(t, uint64(5),
+		m[L7PathKey{TsUnixMin: 777, VhostID: 100, PathBucket: "/api/users", StatusBucket: 2}])
+}
+
+func TestRecordL7Path_SkippedWhenAggregateOnlyLatched(t *testing.T) {
+	// G4 breaker latch: when l7PathAggregateOnly is set, RecordL7Path stops
+	// feeding the recorder so only aggregate counter rows ship.
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) {
+			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 64, PathsPerVhost: 16}
+		})
+	require.NotNil(t, a.l7Path)
+
+	a.l7PathAggregateOnly.Store(true)
+	a.RecordL7Path(100, "/api/users", 2)
+
+	rows, _ := a.l7Path.drain(777)
+	require.Empty(t, rows, "latch set — nothing should be recorded")
+}
+
 func TestL7HvSnapshot_ResetsMap(t *testing.T) {
 	a := newTestApp(t, "http://unused", "secret",
 		func(a *StatsApp) { a.Ingest.L7 = &L7Config{Enabled: true} })

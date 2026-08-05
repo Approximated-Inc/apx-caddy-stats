@@ -35,6 +35,10 @@ type AppRef interface {
 	// status_bucket) counter for the current minute. No-op when the L7
 	// track is disabled (gated internally).
 	RecordL7Httpversion(vhostID uint32, httpVersion string, statusBucket uint8)
+	// RecordL7Path feeds one (vhost, path_bucket, status_bucket) observation
+	// into the per-vhost-fair path recorder. No-op when the recorder is nil
+	// (track off) or the breaker latch is set (gated internally).
+	RecordL7Path(vhostID uint32, pathBucket string, statusBucket uint8)
 	// HashSalt returns the deployment salt for hashing client identifiers.
 	// Empty string disables the unique-clients tracking entirely.
 	HashSalt() string
@@ -128,9 +132,28 @@ type IngestConfig struct {
 
 // L7Config gates and bounds the L7 HTTP-version track. 4a Phoenix emits
 // only `{enabled:true}`; MaxKeys is a reserved 4b knob (0 → default).
+//
+// 4b adds the per-vhost-fair path track knobs: TrackedVhosts/PathsPerVhost
+// size the recorder (Phoenix emits these in the `ingest.l7` map), and the
+// recorder is built only when both are > 0. PathSketchWidth/PathSketchDepth
+// are reserved/optional TopK sketch dimensions; 0 → library defaults.
 type L7Config struct {
 	Enabled bool `json:"enabled,omitempty"`
 	MaxKeys int  `json:"max_keys,omitempty"`
+
+	TrackedVhosts   int `json:"tracked_vhosts,omitempty"`
+	PathsPerVhost   int `json:"paths_per_vhost,omitempty"`
+	PathSketchWidth int `json:"path_sketch_width,omitempty"`
+	PathSketchDepth int `json:"path_sketch_depth,omitempty"`
+
+	// BreakerOverflowThreshold / BreakerWindows tune the drain-time edge
+	// circuit breaker (G4). When a flush window's total path overflow stays
+	// >= BreakerOverflowThreshold for BreakerWindows consecutive windows, the
+	// recorder latches to aggregate-only (per-vhost path recording stops;
+	// request_counters still flow). Auto-recovers on a below-threshold window.
+	// 0 / unset → defaults (L7PathBreakerThresholdDefault / WindowsDefault).
+	BreakerOverflowThreshold int `json:"breaker_overflow_threshold,omitempty"`
+	BreakerWindows           int `json:"breaker_windows,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -250,6 +273,27 @@ type StatsApp struct {
 	l7HvMap      map[L7HttpversionKey]*l7HttpversionCounter
 	l7HvOverflow uint64 // dropped-due-to-cap count for the current minute window
 
+	// L7 per-path recorder (per-vhost-fair TopK). nil disables the track —
+	// RecordL7Path becomes a no-op with no allocation. Built at Provision
+	// only when l7Enabled and both TrackedVhosts/PathsPerVhost are > 0.
+	// l7PathAggregateOnly is the breaker latch (G4 sets it; G3 leaves it
+	// false): when true the handler stops feeding the recorder for the
+	// rest of the window so only the aggregate counter rows ship.
+	l7Path              *perVhostFair
+	l7PathAggregateOnly atomic.Bool
+
+	// l7PathOverflowStreak counts consecutive flush windows whose total path
+	// overflow stayed >= the breaker threshold. Touched ONLY in flushOnce
+	// (via evaluateL7PathBreaker), which the flush ticker runs single-
+	// threaded — so a plain int needs no atomic / no mutex. The latch it
+	// drives (l7PathAggregateOnly) IS atomic because the handler hot path
+	// Loads it lock-free.
+	l7PathOverflowStreak int
+	// l7BreakerLogMu / l7BreakerLoggedAt throttle the degrade log line so a
+	// sustained path-spray attack can't flood logs. Mirrors maybeLogL4IpOverflow.
+	l7BreakerLogMu    sync.Mutex
+	l7BreakerLoggedAt time.Time
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -299,7 +343,23 @@ type ingestRuntime struct {
 	// L7 HTTP-version map. Always positive when l7Enabled (defaults to
 	// L7HttpversionMaxKeysDefault).
 	l7HvMaxKeys int
+	// l7PathBreakerThreshold / l7PathBreakerWindows tune the drain-time edge
+	// circuit breaker (see evaluateL7PathBreaker). Resolved with defaults
+	// (L7PathBreakerThresholdDefault / L7PathBreakerWindowsDefault).
+	l7PathBreakerThreshold int
+	l7PathBreakerWindows   int
 }
+
+// L7PathBreakerThresholdDefault is the per-window path-overflow count that,
+// when sustained for L7PathBreakerWindowsDefault consecutive flush windows,
+// trips the edge circuit breaker to aggregate-only. Sized so steady-state
+// traffic never trips it; only a sustained path-spray attack (vhosts rejected
+// at the per-shard recorder cap, window after window) latches the breaker.
+const L7PathBreakerThresholdDefault = 50_000
+
+// L7PathBreakerWindowsDefault is the number of consecutive over-threshold flush
+// windows required before the breaker latches — debounces a one-off spike.
+const L7PathBreakerWindowsDefault = 3
 
 // L7HttpversionMaxKeysDefault is a per-machine-per-minute OOM backstop for
 // the L7 HTTP-version map — NOT the real cardinality bound. Distinct keys
@@ -375,6 +435,9 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		// MaxKeys is a generous OOM backstop, not the real bound (0 → default).
 		l7Enabled:   a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
 		l7HvMaxKeys: intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
+		// Edge circuit breaker (G4) — resolve with defaults. 0/≤0 → default.
+		l7PathBreakerThreshold: intDefault(l7BreakerThresholdFromConfig(a.Ingest.L7), L7PathBreakerThresholdDefault),
+		l7PathBreakerWindows:   intDefault(l7BreakerWindowsFromConfig(a.Ingest.L7), L7PathBreakerWindowsDefault),
 	}
 
 	a.client = &http.Client{
@@ -397,6 +460,17 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
+	// L7 per-path recorder: built only when the L7 track is on AND both
+	// sizing knobs are positive. Otherwise left nil → RecordL7Path no-ops.
+	if a.cfg.l7Enabled && a.Ingest.L7 != nil &&
+		a.Ingest.L7.TrackedVhosts > 0 && a.Ingest.L7.PathsPerVhost > 0 {
+		a.l7Path = newPerVhostFair(
+			a.Ingest.L7.TrackedVhosts,
+			a.Ingest.L7.PathsPerVhost,
+			a.Ingest.L7.PathSketchWidth,
+			a.Ingest.L7.PathSketchDepth,
+		)
+	}
 	a.initL4IpState()
 	if a.cfg.fingerprintMaxKeys > 0 {
 		a.fpMap = make(map[fingerprintKey]*fingerprintCounter)
@@ -781,6 +855,79 @@ func (a *StatsApp) l7HvSnapshot() map[L7HttpversionKey]*l7HttpversionCounter {
 	snap := a.l7HvMap
 	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
 	return snap
+}
+
+// RecordL7Path feeds one (vhost, path_bucket, status_bucket) observation
+// into the per-vhost-fair path recorder. Called once per recorded HTTP
+// request from the StatsHandler (see handler.record). The gating lives
+// here — same pattern as RecordL7Httpversion — so the handler stays a
+// thin caller:
+//
+//   - nil recorder (track off / sizing knobs unset) → no-op, no allocation;
+//   - l7PathAggregateOnly latch set (G4 breaker tripped this window) → skip
+//     feeding the recorder so only the aggregate counter rows ship.
+//
+// The recorder itself is internally bounded (first-mover admission per
+// shard), so even under the latch-off path this stays cheap.
+func (a *StatsApp) RecordL7Path(vhostID uint32, pathBucket string, statusBucket uint8) {
+	if a.l7Path == nil || a.l7PathAggregateOnly.Load() {
+		return
+	}
+	a.l7Path.record(vhostID, pathBucket, statusBucket)
+}
+
+// evaluateL7PathBreaker runs once per flush (single-threaded under the flush
+// ticker) with the window's total path overflow. It latches
+// l7PathAggregateOnly on sustained overflow — over-threshold for
+// l7PathBreakerWindows consecutive windows — and auto-recovers on the first
+// below-threshold window. Mutates l7PathOverflowStreak + the latch only;
+// returns nothing. The handler reads the latch lock-free via atomic.Bool.
+func (a *StatsApp) evaluateL7PathBreaker(overflow uint64) {
+	threshold := uint64(a.cfg.l7PathBreakerThreshold)
+	if threshold > 0 && overflow >= threshold {
+		a.l7PathOverflowStreak++
+		if a.l7PathOverflowStreak >= a.cfg.l7PathBreakerWindows && !a.l7PathAggregateOnly.Load() {
+			a.l7PathAggregateOnly.Store(true)
+			metricL7PathAggregateOnly.Set(1)
+			a.maybeLogL7BreakerDegrade(overflow)
+		}
+		return
+	}
+
+	// Below threshold (or breaker disabled): reset the streak and recover.
+	a.l7PathOverflowStreak = 0
+	if a.l7PathAggregateOnly.Load() {
+		a.l7PathAggregateOnly.Store(false)
+		metricL7PathAggregateOnly.Set(0)
+		if a.logger != nil {
+			a.logger.Info("apx_stats: L7 path recorder recovered — per-vhost recording resumed",
+				zap.Uint32("proxy_server_id", a.ProxyServerIDValue),
+				zap.Uint64("overflow", overflow))
+		}
+	}
+}
+
+// maybeLogL7BreakerDegrade emits the degrade warning at most once per minute
+// so a sustained attack that re-trips the breaker can't flood logs. Mirrors
+// maybeLogL4IpOverflow's throttle.
+func (a *StatsApp) maybeLogL7BreakerDegrade(overflow uint64) {
+	now := time.Now()
+
+	a.l7BreakerLogMu.Lock()
+	if !a.l7BreakerLoggedAt.IsZero() && now.Sub(a.l7BreakerLoggedAt) < time.Minute {
+		a.l7BreakerLogMu.Unlock()
+		return
+	}
+	a.l7BreakerLoggedAt = now
+	a.l7BreakerLogMu.Unlock()
+
+	if a.logger != nil {
+		a.logger.Warn("apx_stats: L7 path recorder degraded to aggregate-only — sustained overflow",
+			zap.Uint32("proxy_server_id", a.ProxyServerIDValue),
+			zap.Uint64("overflow", overflow),
+			zap.Int("threshold", a.cfg.l7PathBreakerThreshold),
+			zap.Int("windows", a.cfg.l7PathBreakerWindows))
+	}
 }
 
 // RecordL4Ip updates the four per-IP tracking structures for one
@@ -1193,6 +1340,18 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	l7HvSnap := a.l7HvSnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
 
+	// L7 per-path: drain returns the rows plus the per-window overflow count
+	// (vhosts rejected at the per-shard cap). G4 wires l7PathOverflow into
+	// the breaker; G3 only surfaces it in the debug summary below.
+	var l7PathRows []l7PathRow
+	var l7PathOverflow uint64
+	if a.l7Path != nil {
+		l7PathRows, l7PathOverflow = a.l7Path.drain(flushTs)
+		// G4: drain-time edge circuit breaker. Latches the recorder to
+		// aggregate-only under sustained per-window overflow; auto-recovers.
+		a.evaluateL7PathBreaker(l7PathOverflow)
+	}
+
 	if a.logger != nil {
 		a.logger.Debug("apx_stats: flushOnce summary",
 			zap.Int("http_counter_rows", len(snap)),
@@ -1205,24 +1364,27 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
 			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
-			zap.Int("l7_httpversion_rows", len(l7HvSnap)))
+			zap.Int("l7_httpversion_rows", len(l7HvSnap)),
+			zap.Int("l7_path_rows", len(l7PathRows)),
+			zap.Uint64("l7_path_overflow", l7PathOverflow))
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(l7HvSnap) == 0 {
+		len(l7HvSnap) == 0 && len(l7PathRows) == 0 {
 		return
 	}
 
 	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
-		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) + len(l7HvSnap)
+		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) + len(l7HvSnap) +
+		len(l7PathRows)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, l7HvSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, l7HvSnap, l7PathRows)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1334,7 +1496,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, l7HvSnap map[L7HttpversionKey]*l7HttpversionCounter) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, l7HvSnap map[L7HttpversionKey]*l7HttpversionCounter, l7PathRows []l7PathRow) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1401,6 +1563,12 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	}
 	for k, c := range l7HvSnap {
 		if err := encodeL7HttpversionRow(gz, proxyServerID, k, c); err != nil {
+			return nil, err
+		}
+	}
+	for _, r := range l7PathRows {
+		// Each path row carries its own drain-stamped TsUnixMin in r.Key.
+		if err := encodeL7PathRow(gz, proxyServerID, r.Key, r.Count); err != nil {
 			return nil, err
 		}
 	}
@@ -1744,6 +1912,23 @@ func l7MaxKeysFromConfig(c *L7Config) int {
 		return 0
 	}
 	return c.MaxKeys
+}
+
+// l7BreakerThresholdFromConfig / l7BreakerWindowsFromConfig pull the G4
+// breaker knobs, returning 0 when the L7 block is absent so intDefault falls
+// back to the package defaults.
+func l7BreakerThresholdFromConfig(c *L7Config) int {
+	if c == nil {
+		return 0
+	}
+	return c.BreakerOverflowThreshold
+}
+
+func l7BreakerWindowsFromConfig(c *L7Config) int {
+	if c == nil {
+		return 0
+	}
+	return c.BreakerWindows
 }
 
 func durationMs(n, def int) time.Duration {
