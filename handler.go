@@ -126,6 +126,11 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
+	// L7 HTTP-version track. Reuses the SAME vhost_id + status the counter
+	// recorded, so the bucket derives from the status that reached the
+	// client. Internally gated by l7Enabled — a cheap no-op when off.
+	h.app.RecordL7Httpversion(k.VhostID, httpVersionOrUnknown(r), statusBucket(k.Status))
+
 	// Unique-clients tracking. Skipped entirely when the salt isn't
 	// configured (returns "" — see StatsApp.HashSalt). Hash inputs:
 	// client IP + user-agent + salt. Best-effort identity — same UA
