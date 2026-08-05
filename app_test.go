@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -570,6 +572,60 @@ func TestProvisionLike_NoRequestEventsRecorderWhenAbsentOrDisabled(t *testing.T)
 		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: false}
 	})
 	require.Nil(t, b.requestEvents, "enabled:false → nil recorder")
+}
+
+// provisionApp runs the real Provision against a bare caddy.Context
+// (nil cfg → dev logger). Unlike newTestApp, this exercises the actual
+// secret-resolution path. Cleans up the corazaApp global that Provision
+// publishes.
+func provisionApp(t *testing.T, ingest *IngestConfig) (*StatsApp, error) {
+	t.Helper()
+	a := &StatsApp{ProxyServerIDValue: 42, Ingest: ingest}
+	err := a.Provision(caddy.Context{Context: context.Background()})
+	t.Cleanup(func() { corazaApp.CompareAndSwap(a, nil) })
+	return a, err
+}
+
+func TestProvision_AuthTokenFromConfig(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"})
+	require.NoError(t, err, "auth_token in config must not require the env var")
+	require.Equal(t, "cfg-token", a.secret)
+}
+
+func TestProvision_AuthTokenWinsOverEnvVar(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "env-secret")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"})
+	require.NoError(t, err)
+	require.Equal(t, "cfg-token", a.secret)
+}
+
+func TestProvision_EnvVarFallbackWhenAuthTokenEmpty(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "env-secret")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused"})
+	require.NoError(t, err)
+	require.Equal(t, "env-secret", a.secret)
+}
+
+func TestProvision_ErrorsWhenNoAuthTokenAndEnvVarEmpty(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	_, err := provisionApp(t, &IngestConfig{URL: "http://unused"})
+	require.ErrorContains(t, err, "APX_INTERNAL_KEY env var is empty")
+}
+
+func TestFlushOnce_PostsCarryConfigAuthToken(t *testing.T) {
+	t.Setenv("APX_INTERNAL_KEY", "")
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a, err := provisionApp(t, &IngestConfig{URL: srv.URL, AuthToken: "cfg-token"})
+	require.NoError(t, err)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginUpstream}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	require.Equal(t, "cfg-token", posts[0].headers.Get("apx-key"))
 }
 
 func TestFlushOnce_ShipsRequestEventRows(t *testing.T) {

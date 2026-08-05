@@ -75,9 +75,9 @@ func TestDrainL4SniRows_FiltersSingleOccurrence(t *testing.T) {
 		func(a *StatsApp) { a.Ingest.L4SniMaxKeys = 100 })
 	a.cfg.l4SniMaxKeys = 100
 
-	a.RecordL4Sni("once.example.com")           // count=1 → filtered
+	a.RecordL4Sni("once.example.com") // count=1 → filtered
 	a.RecordL4Sni("twice.example.com")
-	a.RecordL4Sni("twice.example.com")          // count=2 → kept
+	a.RecordL4Sni("twice.example.com") // count=2 → kept
 
 	rows := a.drainL4SniRows()
 
