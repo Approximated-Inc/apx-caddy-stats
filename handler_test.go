@@ -17,12 +17,13 @@ import (
 
 // fakeApp captures calls to Record so handler tests can assert.
 type fakeApp struct {
-	mu        sync.Mutex
-	records   []recorded
-	uniques   []recordedUnique
-	reqEvents []requestEventRow
-	psID      uint32
-	hashSalt  string
+	mu         sync.Mutex
+	records    []recorded
+	uniques    []recordedUnique
+	reqEvents  []requestEventRow
+	challenges []challengeAttemptKey
+	psID       uint32
+	hashSalt   string
 }
 
 type recorded struct {
@@ -54,9 +55,23 @@ func (f *fakeApp) RecordRequestEvent(row requestEventRow) {
 	f.mu.Unlock()
 }
 
+func (f *fakeApp) RecordChallengeAttempt(key challengeAttemptKey) {
+	f.mu.Lock()
+	f.challenges = append(f.challenges, key)
+	f.mu.Unlock()
+}
+
 func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
+
+func (f *fakeApp) challengeSnapshot() []challengeAttemptKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]challengeAttemptKey, len(f.challenges))
+	copy(out, f.challenges)
+	return out
+}
 
 func (f *fakeApp) reqEventSnapshot() []requestEventRow {
 	f.mu.Lock()
@@ -288,6 +303,87 @@ func TestServeHTTP_DropsRowWhenVhostIDAbsent(t *testing.T) {
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
 	require.Empty(t, app.snapshot())
+}
+
+// newRequestWithChallengeOutcome builds a request whose context carries a
+// caddyhttp vars map with `apx_challenge_outcome` set — mirroring what the
+// apx_challenge handler does via caddyhttp.SetVar. No vhost_id is set: a
+// served challenge is terminal, so the per-vhost vars handler never ran.
+func newRequestWithChallengeOutcome(method, target, host, outcome string) *http.Request {
+	r := httptest.NewRequest(method, target, nil)
+	r.Host = host
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, map[string]any{})
+	r = r.WithContext(ctx)
+	if outcome != "" {
+		caddyhttp.SetVar(r.Context(), "apx_challenge_outcome", outcome)
+	}
+	return r
+}
+
+func TestServeHTTP_RecordsChallengeAttemptWhenOutcomeVarSet(t *testing.T) {
+	// A request carrying apx_challenge_outcome records one challenge_attempt
+	// keyed by lowercased Host (port stripped) + security client IP +
+	// outcome — even though no vhost_id is set (served challenge is terminal).
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithChallengeOutcome("GET", "/some/path", "Example.COM:8443", "issued")
+	r.RemoteAddr = "203.0.113.7:54321"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	ch := app.challengeSnapshot()
+	require.Len(t, ch, 1)
+	require.Equal(t, "example.com", ch[0].vhost, "Host lowercased + port stripped")
+	require.Equal(t, "203.0.113.7", ch[0].ip, "security client IP, port stripped")
+	require.Equal(t, "issued", ch[0].outcome)
+}
+
+func TestServeHTTP_RecordsChallengeAttemptWithoutVhostID(t *testing.T) {
+	// Belt-and-suspenders: no vhost_id var at all (the served-challenge
+	// reality). The challenge_attempt must still record; the counter row
+	// is correctly skipped (no_vhost).
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithChallengeOutcome("GET", "/", "blocked.example.com", "failed")
+	r.RemoteAddr = "198.51.100.9:1234"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	require.Len(t, app.challengeSnapshot(), 1, "challenge recorded despite missing vhost_id")
+	require.Empty(t, app.snapshot(), "no counter row without vhost_id")
+}
+
+func TestServeHTTP_NoChallengeAttemptWhenVarUnset(t *testing.T) {
+	// A normal request (no apx_challenge_outcome var) records no
+	// challenge_attempt.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	require.Empty(t, app.challengeSnapshot(), "no challenge var → no challenge_attempt")
+}
+
+func TestServeHTTP_ChallengeVhostFallbackWhenNoPort(t *testing.T) {
+	// Host without a :port (the common HTTP/2 / default-port case) must
+	// still lowercase cleanly.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithChallengeOutcome("GET", "/", "API.Example.COM", "passed")
+	r.RemoteAddr = "203.0.113.7:443"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	ch := app.challengeSnapshot()
+	require.Len(t, ch, 1)
+	require.Equal(t, "api.example.com", ch[0].vhost)
 }
 
 func TestResponseBytes_ZeroOnHijackedConnection(t *testing.T) {

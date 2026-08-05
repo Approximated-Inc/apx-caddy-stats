@@ -52,6 +52,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
+	a.challengeMap = make(map[challengeAttemptKey]uint64)
 	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
 		a.requestEvents = newRequestEventRecorder(
 			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),

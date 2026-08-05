@@ -93,6 +93,20 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // earlier in the chain. Origin uses servErr (the bubbled handler error)
 // to detect reverse_proxy failures — see classifyOrigin.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+	// Challenge attempts are recorded independently of vhost_id: a served
+	// challenge is terminal (apx_challenge returns without calling next),
+	// so the per-vhost vars handler never runs and vhost_id is unset. Key
+	// by the Host header instead. Gated only on the outcome var being set,
+	// and done BEFORE the vhost_id early-return below so challenges aren't
+	// dropped.
+	if outcome := readChallengeOutcome(r); outcome != "" {
+		h.app.RecordChallengeAttempt(challengeAttemptKey{
+			vhost:   challengeVhost(r),
+			ip:      securityClientIP(r),
+			outcome: outcome,
+		})
+	}
+
 	vhostID, ok := readVhostID(r)
 	if !ok {
 		// No vhost_id set — request didn't match a vhost route. Skip;
@@ -218,6 +232,31 @@ func readVhostID(r *http.Request) (uint32, bool) {
 		return 0, false
 	}
 	return uint32(n), true
+}
+
+// readChallengeOutcome reads the `apx_challenge_outcome` request var set
+// by the apx_challenge handler — one of "issued" | "passed" |
+// "passed_recently" | "failed", or "" when no challenge handler ran.
+// Readable here because apx_stats is the OUTERMOST handler wrapping the
+// subroute: the challenge handler mutates the shared vars map via
+// caddyhttp.SetVar before returning, and our deferred record() runs after
+// next.ServeHTTP returns, so the var is visible.
+func readChallengeOutcome(r *http.Request) string {
+	v := caddyhttp.GetVar(r.Context(), "apx_challenge_outcome")
+	s, _ := v.(string)
+	return s
+}
+
+// challengeVhost returns the lowercased Host header with any :port
+// stripped. A served challenge is terminal (the apx_challenge handler
+// returns without calling next), so the per-vhost vars handler never runs
+// and vhost_id is unset — the challenge_attempt dimension is therefore
+// the Host string, NOT vhost_id.
+func challengeVhost(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.Host); err == nil {
+		return strings.ToLower(host)
+	}
+	return strings.ToLower(r.Host)
 }
 
 // blockReason reports why Caddy itself blocked this request before it
