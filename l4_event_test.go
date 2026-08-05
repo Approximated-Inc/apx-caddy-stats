@@ -4,10 +4,58 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestRecordL4Sni_OwnsStoredKey(t *testing.T) {
+	// The L4 SNI map is a long-lived buffer (drained per flush window).
+	// The SNI string today is a fresh allocation out of the l4tls
+	// ClientHello parser, but that provenance lives in a separate repo —
+	// the map must own its key strings so a fork change can't silently
+	// reintroduce backing-array pinning.
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) { a.Ingest.L4SniMaxKeys = 100 })
+	a.cfg.l4SniMaxKeys = 100
+
+	backing := "evil.example.com" + strings.Repeat("x", 1<<20)
+	a.RecordL4Sni(backing[:16])
+
+	a.l4SniMu.Lock()
+	defer a.l4SniMu.Unlock()
+	require.Len(t, a.l4SniMap, 1)
+	for k := range a.l4SniMap {
+		require.Equal(t, "evil.example.com", k.SNI)
+		if unsafe.StringData(k.SNI) == unsafe.StringData(backing) {
+			t.Error("stored L4 SNI key shares the caller's backing array; want an owned clone")
+		}
+	}
+}
+
+func TestRecordL4Sni_BoundsKeyWidth(t *testing.T) {
+	// RFC 6066 caps host_name at 255 bytes; a hand-rolled ClientHello can
+	// claim up to 64KB. Bound the stored key so a junk-SNI flood can't
+	// balloon the (count-capped, byte-unaccounted) map. Same over-cap SNI
+	// must keep accumulating into the one truncated key.
+	a := newTestApp(t, "http://unused", "secret",
+		func(a *StatsApp) { a.Ingest.L4SniMaxKeys = 100 })
+	a.cfg.l4SniMaxKeys = 100
+
+	long := strings.Repeat("s", 300)
+	a.RecordL4Sni(long)
+	a.RecordL4Sni(long)
+
+	a.l4SniMu.Lock()
+	defer a.l4SniMu.Unlock()
+	require.Len(t, a.l4SniMap, 1)
+	for k, c := range a.l4SniMap {
+		require.Len(t, k.SNI, 255)
+		require.Equal(t, uint64(2), c.ConnectionCount)
+	}
+}
 
 func TestRecordL4Sni_DisabledWhenCapZero(t *testing.T) {
 	a := newTestApp(t, "http://unused", "secret")

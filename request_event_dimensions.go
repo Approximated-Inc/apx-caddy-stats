@@ -3,6 +3,7 @@ package apxstats
 import (
 	"net"
 	"net/http"
+	"strings"
 )
 
 // securityClientIP returns the PROXY-decoded real client IP from
@@ -63,31 +64,31 @@ func frontProxy(r *http.Request) string {
 }
 
 // capPath strips the query (and fragment) from a raw request path, then
-// truncates the result to <=1024 bytes UTF-8-safe. pathBucket already strips
-// the query itself, so this is for the raw `path` field. The fragment is
-// almost never present in a request-line path, but trimmed defensively.
+// returns an OWNED copy truncated to <=1024 bytes UTF-8-safe. pathBucket
+// already strips the query itself, so this is for the raw `path` field.
+// The fragment is almost never present in a request-line path, but
+// trimmed defensively.
+//
+// Always cloned (ownedTruncate, never a copy-free passthrough): r.URL.Path
+// is typically a slice of the request line, and even a short query-less
+// path can share a huge backing — absolute-form URI with a long host, or
+// a junk long method, both attacker-craftable — which a buffered
+// passthrough would pin for the whole flush window.
 func capPath(p string) string {
-	if i := indexByte(p, '?'); i >= 0 {
+	if i := strings.IndexByte(p, '?'); i >= 0 {
 		p = p[:i]
 	}
-	if i := indexByte(p, '#'); i >= 0 {
+	if i := strings.IndexByte(p, '#'); i >= 0 {
 		p = p[:i]
 	}
-	return truncateBytes(p, 1024)
+	return ownedTruncate(p, 1024)
 }
 
-// capUA truncates a user-agent to <=512 bytes UTF-8-safe.
+// capUA truncates a user-agent to <=512 bytes UTF-8-safe. Copy-free under
+// the cap (truncateBytes, not ownedTruncate) is safe here: header VALUES
+// are right-sized allocations out of net/textproto / hpack (each value is
+// a string([]byte) copy), never request-line slices — buffering one pins
+// only its own bytes.
 func capUA(ua string) string {
 	return truncateBytes(ua, 512)
-}
-
-// indexByte returns the index of the first c in s, or -1. Local helper to
-// avoid pulling in strings just for this.
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

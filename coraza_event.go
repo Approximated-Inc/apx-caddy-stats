@@ -23,6 +23,41 @@ const CorazaMaxEventsDefault = 200_000
 // here keeps the wire payload bounded. Byte-safe (UTF-8 boundary aware).
 const corazaMatchDataMaxBytes = 512
 
+// Row-width caps applied BEFORE buffering (Phoenix re-caps on ingest,
+// but the Go buffer holds raw values until flush — the memory hazard).
+// Truncating up front means the governor's byte budget buys more rows
+// and a long-URI flood can't bloat each one. Same truncateBytes
+// discipline as corazaMatchDataMaxBytes.
+const (
+	corazaRuleMsgMaxBytes     = 256
+	corazaRequestURIMaxBytes  = 2048
+	corazaRequestHostMaxBytes = 255
+	// corazaRequestMethodMaxBytes bounds the method field: real verbs are
+	// <=16 bytes (VERSION-CONTROL is 15); anything longer is a junk token
+	// flood that net/http's validMethod happily passes through.
+	corazaRequestMethodMaxBytes = 32
+)
+
+// corazaDetectionFixedBytes over-approximates the in-memory fixed cost of
+// one buffered detection: unsafe.Sizeof(corazaDetection{}) (~176 on
+// 64-bit) plus a little append slack. Pinned by a test against the real
+// Sizeof so struct growth can't silently undercount the byte budget.
+const corazaDetectionFixedBytes = 184
+
+// corazaDetectionBytes approximates the resident bytes one buffered
+// detection holds: the fixed struct size, every string field's backing
+// bytes, and per-tag string headers + bytes.
+func corazaDetectionBytes(ev *corazaDetection) int {
+	n := corazaDetectionFixedBytes +
+		len(ev.Severity) + len(ev.RuleMsg) + len(ev.TxID) +
+		len(ev.RequestURI) + len(ev.RequestMethod) + len(ev.RequestHost) +
+		len(ev.ClientIP) + len(ev.MatchData)
+	for _, tag := range ev.Tags {
+		n += len(tag) + 16 // string header in the backing array + bytes
+	}
+	return n
+}
+
 // corazaDetection is one raw per-(request, rule) WAF detection event.
 // NOT aggregated — each fired rule on each request is its own event,
 // carrying its own tx_id / ts / match_data. Stored append-only in a
@@ -91,7 +126,23 @@ func truncateBytes(s string, max int) string {
 	for end > 0 && s[end]&0xC0 == 0x80 {
 		end--
 	}
-	return s[:end]
+	// Clone into a right-sized allocation: s[:end] would share (pin) the
+	// parent's full backing array while the byte accounting counts only
+	// the truncated length.
+	return strings.Clone(s[:end])
+}
+
+// ownedTruncate is truncateBytes for inputs of UNTRUSTED PROVENANCE: the
+// result NEVER shares s's backing array, even under the cap. Use it for
+// any string headed into a long-lived buffer when the input may be a
+// short slice of a large parent (request line, raw URI, parsed-buffer
+// substring) — truncateBytes's under-cap early return is deliberately
+// copy-free and would pin the parent. strings.Clone of "" is alloc-free.
+func ownedTruncate(s string, max int) string {
+	if len(s) <= max {
+		return strings.Clone(s)
+	}
+	return truncateBytes(s, max)
 }
 
 // encodeCorazaDetectionRow emits one `_type: "coraza_detection"` NDJSON

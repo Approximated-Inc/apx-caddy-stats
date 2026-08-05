@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/corazawaf/coraza/v3/types"
 )
@@ -139,6 +140,57 @@ func TestTruncateBytes(t *testing.T) {
 	got := truncateBytes(over, 512)
 	if len(got) != 512 {
 		t.Errorf("len = %d, want 512", len(got))
+	}
+}
+
+func TestTruncateBytes_cloneReleasesParentBacking(t *testing.T) {
+	// Truncation must copy into a right-sized allocation: returning
+	// s[:end] would share (pin) the parent's full backing array while the
+	// governor's byte accounting counts only the truncated length.
+	parent := strings.Repeat("a", 1<<20)
+	got := truncateBytes(parent, 512)
+	if len(got) != 512 {
+		t.Fatalf("len = %d, want 512", len(got))
+	}
+	if unsafe.StringData(got) == unsafe.StringData(parent) {
+		t.Errorf("truncated result shares the parent's backing array; want a clone")
+	}
+	// The common short-string path must stay copy-free: same backing.
+	short := "hello"
+	if got := truncateBytes(short, 512); unsafe.StringData(got) != unsafe.StringData(short) {
+		t.Errorf("short string was needlessly copied")
+	}
+}
+
+func TestOwnedTruncate_neverSharesBacking(t *testing.T) {
+	parent := strings.Repeat("a", 1<<20)
+
+	// Under-cap input: content preserved, backing NOT shared (this is the
+	// difference from truncateBytes, whose under-cap path is copy-free).
+	short := parent[:10]
+	got := ownedTruncate(short, 512)
+	if got != short {
+		t.Errorf("got %q, want %q", got, short)
+	}
+	if unsafe.StringData(got) == unsafe.StringData(parent) {
+		t.Errorf("under-cap result shares the parent's backing array; want an owned copy")
+	}
+
+	// Over-cap input: truncated to the cap, backing not shared.
+	got2 := ownedTruncate(parent, 512)
+	if len(got2) != 512 {
+		t.Errorf("len = %d, want 512", len(got2))
+	}
+	if unsafe.StringData(got2) == unsafe.StringData(parent) {
+		t.Errorf("truncated result shares the parent's backing array; want an owned copy")
+	}
+
+	// UTF-8 boundary safety matches truncateBytes (511 ASCII + 2-byte é,
+	// cut at 512 drops the partial é).
+	s := strings.Repeat("a", 511) + "é"
+	got3 := ownedTruncate(s, 512)
+	if len(got3) != 511 || !utf8.ValidString(got3) {
+		t.Errorf("utf8 boundary: len=%d valid=%v", len(got3), utf8.ValidString(got3))
 	}
 }
 

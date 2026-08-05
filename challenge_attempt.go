@@ -20,6 +20,20 @@ type challengeAttemptKey struct {
 	outcome string // issued | passed | passed_recently | failed
 }
 
+// challengeMaxKeys caps distinct (vhost, ip, outcome) keys per flush
+// window. A count cap (not the byte governor) is enough here: rows are
+// tiny and bounded-width, so 50K keys is a few MB worst case. New keys
+// past the cap are dropped + counted (challengeOverflow + metric),
+// mirroring the MaxUniqueHashes overflow-telemetry pattern; existing
+// keys keep counting.
+const challengeMaxKeys = 50_000
+
+// challengeVhostMaxBytes bounds the vhost key width: the Host header is
+// attacker-supplied and unbounded on the wire, while real hostnames cap
+// at 253 bytes (DNS). Keeps the "rows are tiny and bounded-width" premise
+// of the count cap above true. Mirrors corazaRequestHostMaxBytes.
+const challengeVhostMaxBytes = 255
+
 // encodeChallengeAttemptRow writes one NDJSON line for an aggregated
 // challenge_attempt counter entry. Format (field order is part of the
 // Phoenix contract — `_type` MUST be first):

@@ -3,7 +3,9 @@ package apxstats
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"unsafe"
 )
 
 // newReq builds a GET request with the given RemoteAddr and headers.
@@ -193,5 +195,31 @@ func TestFrontProxy(t *testing.T) {
 				t.Errorf("frontProxy() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCapPath_QueryStripReleasesParentBacking(t *testing.T) {
+	// A short path in front of a huge stripped query must not keep the
+	// parent string's backing array alive once buffered.
+	parent := "/api/users?" + strings.Repeat("q", 1<<20)
+	got := capPath(parent)
+	if got != "/api/users" {
+		t.Fatalf("got %q, want %q", got, "/api/users")
+	}
+	if unsafe.StringData(got) == unsafe.StringData(parent) {
+		t.Errorf("stripped path shares the parent's backing array; want a clone")
+	}
+	// Unstripped short path: must STILL be an owned copy. Even a short
+	// query-less path can be a slice of a huge request line (absolute-form
+	// URI with a long host, junk long method) — capPath can't see the
+	// backing, so it must always clone before the row is buffered.
+	p := "/health" + strings.Repeat("x", 1<<20)
+	short := p[:7]
+	got2 := capPath(short)
+	if got2 != "/health" {
+		t.Fatalf("got %q, want %q", got2, "/health")
+	}
+	if unsafe.StringData(got2) == unsafe.StringData(p) {
+		t.Errorf("unstripped short path shares the caller's backing array; want an owned copy")
 	}
 }

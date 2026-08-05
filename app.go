@@ -45,6 +45,13 @@ type AppRef interface {
 	HashSalt() string
 	// ProxyServerID returns the cluster id this Caddy instance serves.
 	ProxyServerID() uint32
+	// MachineID returns the emitting machine's identifier (app MachineID
+	// config), stamped on mode_v2 request_event rows. May be "".
+	MachineID() string
+	// RequestEventsModeV2 reports whether the request_events track runs in
+	// mode_v2 (unsampled served rows, blocked/challenge rows logged with a
+	// disposition, extra wire fields). False → legacy behavior.
+	RequestEventsModeV2() bool
 }
 
 // CounterDelta is what a single request contributes. The handler builds
@@ -143,6 +150,18 @@ type RequestEventsConfig struct {
 	Enabled         bool `json:"enabled,omitempty"`
 	SampleThreshold int  `json:"sample_threshold,omitempty"`
 	MaxRows         int  `json:"max_rows,omitempty"`
+
+	// ModeV2 turns on customer-facing cluster request logs: served rows are
+	// UNSAMPLED, blocked/rate-limited/challenge requests are logged with a
+	// disposition (non-served rows sampled via BlockedSampleThreshold), and
+	// each row carries the extra wire fields (ts_ms, machine_id, machine_seq,
+	// disposition, host). Emitted by the Phoenix config generator only for
+	// new-enough images, so old configs (ModeV2 false) stay byte-identical.
+	ModeV2 bool `json:"mode_v2,omitempty"`
+	// BlockedSampleThreshold is the per-window emit count above which
+	// NON-served rows sample under load (mode_v2 only). <=0 → default 2000.
+	// Served rows ignore this entirely (unsampled).
+	BlockedSampleThreshold int `json:"blocked_sample_threshold,omitempty"`
 }
 
 // StatsApp is the top-level Caddy App. One per Caddy process. Owns the
@@ -156,7 +175,7 @@ type StatsApp struct {
 	// MachineID identifies which Caddy machine in the cluster this is.
 	// Currently unused by the wire format (the app server tags by sender);
 	// kept here for log/metric labels.
-	MachineID string `json:"machine_id,omitempty"`
+	MachineIDValue string `json:"machine_id,omitempty"`
 
 	// HashSaltValue is the per-deployment salt for hashing client
 	// identifiers. Stamped into the Caddy config by the app's
@@ -240,8 +259,9 @@ type StatsApp struct {
 	// fan-out) and the record rate is far below HTTP-request rates, so a
 	// single mutex doesn't contend meaningfully. The minute is stamped at
 	// drain/encode time (flush minute), so the key carries no ts field.
-	challengeMu  sync.Mutex
-	challengeMap map[challengeAttemptKey]uint64
+	challengeMu       sync.Mutex
+	challengeMap      map[challengeAttemptKey]uint64
+	challengeOverflow uint64 // new keys dropped because the map was at challengeMaxKeys
 
 	// Fingerprint maps: (ja3, ja4, outcome) traffic and (ja4, ip) join.
 	// Both share a single mutex (fpMu) — cardinality is low (bounded by
@@ -258,14 +278,25 @@ type StatsApp struct {
 	// store is therefore a capped append-only SLICE, drained at flush.
 	// Overflow drops the new event and counts it (matching the
 	// fingerprint overflow accounting, but for a slice not a counter map).
-	corazaMu       sync.Mutex
-	corazaEvents   []corazaDetection
-	corazaOverflow uint64 // dropped events because the slice was at cap
+	corazaMu            sync.Mutex
+	corazaEvents        []corazaDetection
+	corazaOverflow      uint64 // dropped events (slice at cap, or governor reject)
+	corazaReservedBytes int    // governor bytes reserved by corazaEvents; released at snapshot
+
+	// memGov byte-bounds the two byte-heavy drainable buffers
+	// (request_events + corazaEvents) to fit the machine's detected RAM.
+	// Built once at Provision; its RSS cache refreshes on a goroutine
+	// started by Start. nil only in tests that bypass Provision.
+	memGov *memGovernor
 
 	// requestEvents accumulates raw per-(served)-request analytics rows. nil
 	// disables the track — RecordRequestEvent becomes a no-op with no
 	// allocation. Built at Provision only when ingest.request_events.enabled.
 	requestEvents *requestEventRecorder
+
+	// reqEventsModeV2 mirrors ingest.request_events.mode_v2, resolved at
+	// Provision. Gates the handler's disposition/host/unsampled-served path.
+	reqEventsModeV2 bool
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -401,15 +432,37 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
 	a.challengeMap = make(map[challengeAttemptKey]uint64)
+
+	// Memory governor: self-sized from the machine's RAM detected at
+	// runtime (the autoscaler resizes machines per-machine, so config-gen
+	// can't know it). Byte-bounds the request_events + coraza buffers.
+	totalRAM := clampTotalRAM(detectTotalRAM())
+	a.memGov = newMemGovernor(totalRAM, readProcessRSS, a.logger)
+	a.logger.Info("apx_stats: memory governor sized",
+		zap.Uint64("total_ram_bytes", totalRAM),
+		zap.Uint64("buffer_share_budget_bytes", a.memGov.shareBudget),
+		zap.Uint64("rss_ceiling_bytes", a.memGov.rssCeiling))
+
 	// request_events recorder: built only when the track is explicitly
 	// enabled. SampleThreshold passes through as-is (<=0 → never sample);
 	// MaxRows defaults to 200_000. Otherwise left nil → RecordRequestEvent
-	// no-ops.
+	// no-ops. ModeV2 builds the v2 recorder instead (unsampled served rows,
+	// disposition-sampled non-served rows) and resolves reqEventsModeV2.
 	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
-		a.requestEvents = newRequestEventRecorder(
-			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
-			a.Ingest.RequestEvents.SampleThreshold,
-		)
+		if a.Ingest.RequestEvents.ModeV2 {
+			a.reqEventsModeV2 = true
+			a.requestEvents = newRequestEventRecorderV2(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				intDefault(a.Ingest.RequestEvents.BlockedSampleThreshold, 2000),
+				a.memGov,
+			)
+		} else {
+			a.requestEvents = newRequestEventRecorder(
+				intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+				a.Ingest.RequestEvents.SampleThreshold,
+				a.memGov,
+			)
+		}
 	}
 	a.initL4IpState()
 	if a.cfg.fingerprintMaxKeys > 0 {
@@ -491,10 +544,18 @@ func mixString(h uint64, s string) uint64 {
 	return h
 }
 
-// Start launches the periodic flush goroutine.
+// Start launches the periodic flush goroutine and the governor's RSS
+// refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
 	a.wg.Add(1)
 	go a.flushLoop()
+	if a.memGov != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.memGov.refreshLoop(a.stopCh)
+		}()
+	}
 	return nil
 }
 
@@ -512,6 +573,13 @@ func (a *StatsApp) Stop() error {
 
 // ProxyServerID exposes the cluster id to handlers.
 func (a *StatsApp) ProxyServerID() uint32 { return a.ProxyServerIDValue }
+
+// MachineID exposes the configured machine identifier to handlers. May be "".
+func (a *StatsApp) MachineID() string { return a.MachineIDValue }
+
+// RequestEventsModeV2 reports whether the request_events track is in
+// mode_v2. Resolved at Provision (G5 wiring); false by default.
+func (a *StatsApp) RequestEventsModeV2() bool { return a.reqEventsModeV2 }
 
 // Test-only accessors. The counters / uniques maps are sharded for
 // contention reduction; tests want to peek at aggregate state without
@@ -705,6 +773,11 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 	if sni == "" {
 		sni = L4SniEmptySNI
 	}
+	// Bound the key width BEFORE the lookup so lookups and stored keys
+	// agree: RFC 6066 caps host_name at 255 bytes, but a hand-rolled
+	// ClientHello can claim up to 64KB, and this map is count-capped, not
+	// byte-accounted. Copy-free under the cap.
+	sni = truncateBytes(sni, l4SniMaxBytes)
 
 	if a.logger != nil {
 		a.logger.Debug("apx_stats: RecordL4Sni",
@@ -739,6 +812,13 @@ func (a *StatsApp) RecordL4Sni(sni string) {
 		return
 	}
 
+	// First retention of this SNI: own the key string before it enters
+	// the long-lived (flush-window) map. The l4tls parser hands us a
+	// fresh allocation today, but that provenance lives in the caddy-l4
+	// fork — clone-on-insert (new keys only; increments above stay
+	// alloc-free) makes the map immune to a fork change reintroducing a
+	// shared backing.
+	k.SNI = strings.Clone(sni)
 	a.l4SniMap[k] = &l4SniCounter{ConnectionCount: 1}
 }
 
@@ -761,13 +841,33 @@ func (a *StatsApp) RecordRequestEvent(row requestEventRow) {
 //
 // Single mutexed map, mirroring the L4 SNI track. The minute is stamped
 // at drain time, so the key carries no ts dimension and same-minute
-// (vhost, ip, outcome) tuples merge into one row.
+// (vhost, ip, outcome) tuples merge into one row. New keys past
+// challengeMaxKeys are dropped + counted; existing keys keep counting.
 func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
 	a.challengeMu.Lock()
 	defer a.challengeMu.Unlock()
 	if a.challengeMap == nil {
 		return
 	}
+	if _, ok := a.challengeMap[key]; !ok && len(a.challengeMap) >= challengeMaxKeys {
+		a.challengeOverflow++
+		metricChallengeOverflows.Inc()
+		return
+	}
+	// Own every key string before it enters the long-lived (flush-window)
+	// map. The caller hands us slices of request-owned backings — vhost is
+	// a SplitHostPort slice of r.Host (itself possibly a slice of the full
+	// request line for absolute-form URIs), outcome is another module's
+	// request var — and retaining them would pin the parent allocations.
+	// Cloned on EVERY call, not just inserts: `m[key]++` is a map
+	// assignment, and the runtime re-stores string-containing keys on
+	// every assignment (needkeyupdate), so a clone-on-insert would be
+	// silently undone by the next increment. Unlike the pointer-valued
+	// SNI/fingerprint maps there is no assignment-free increment here;
+	// three small clones per challenge attempt is acceptable.
+	key.vhost = strings.Clone(key.vhost)
+	key.ip = strings.Clone(key.ip)
+	key.outcome = strings.Clone(key.outcome)
 	a.challengeMap[key]++
 }
 
@@ -818,6 +918,10 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	if sni == "" {
 		sni = L4SniEmptySNI
 	}
+	// Same width bound as RecordL4Sni: the (IP, SNI, outcome) composite
+	// keys are built fresh but EMBED the SNI, so an unbounded junk SNI
+	// would balloon the count-capped map's resident bytes.
+	sni = truncateBytes(sni, l4SniMaxBytes)
 
 	a.l4IpMu.Lock()
 	defer a.l4IpMu.Unlock()
@@ -894,6 +998,13 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 			a.fpOverflow++
 			metricFingerprintOverflows.Inc()
 		} else {
+			// First retention: own the key strings before they enter the
+			// long-lived map. ja3/ja4 are fixed-width hashes built by the
+			// caddy-l4 fork (fresh today), but their provenance is outside
+			// this repo — clone-on-insert (new keys only) keeps the map
+			// immune to a fork change sharing a larger backing.
+			k.JA3 = strings.Clone(ja3)
+			k.JA4 = strings.Clone(ja4)
 			a.fpMap[k] = &fingerprintCounter{ConnectionCount: 1}
 		}
 		a.fpMu.Unlock()
@@ -909,6 +1020,9 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 			a.fpIpOverflow++
 			metricFingerprintIpOverflows.Inc()
 		} else {
+			// Same clone-on-insert ownership as the traffic map above.
+			k.JA4 = strings.Clone(ja4)
+			k.IP = strings.Clone(ip)
 			a.fpIpMap[k] = &fingerprintCounter{ConnectionCount: 1}
 		}
 		a.fpMu.Unlock()
@@ -1068,8 +1182,11 @@ func (a *StatsApp) fingerprintIpSnapshot() map[fingerprintIpKey]*fingerprintCoun
 // RecordCorazaDetection appends one raw per-(request, rule) WAF detection
 // event to the capped slice. Called by the Coraza audit-log writer once
 // per fired rule per transaction. NOT aggregated — every call adds a row.
-// At the cap the event is dropped and counted (corazaOverflow + metric),
-// mirroring the fingerprint overflow accounting but for a slice.
+// At the count cap OR when the memory governor rejects the event's bytes,
+// the event is dropped and counted (corazaOverflow + metric). Hard drop,
+// no sampling: there is no sample_rate on the coraza wire format for
+// Phoenix to upscale, and a deterministic keep-until-full preserves the
+// earliest (strongest) signal of a window.
 func (a *StatsApp) RecordCorazaDetection(ev corazaDetection) {
 	a.corazaMu.Lock()
 	if a.cfg.corazaMaxEvents > 0 && len(a.corazaEvents) >= a.cfg.corazaMaxEvents {
@@ -1078,16 +1195,29 @@ func (a *StatsApp) RecordCorazaDetection(ev corazaDetection) {
 		metricCorazaOverflows.Inc()
 		return
 	}
+	n := corazaDetectionBytes(&ev)
+	if a.memGov != nil && !a.memGov.tryReserve(n) {
+		a.corazaOverflow++
+		a.corazaMu.Unlock()
+		metricCorazaOverflows.Inc()
+		return
+	}
+	a.corazaReservedBytes += n
 	a.corazaEvents = append(a.corazaEvents, ev)
 	a.corazaMu.Unlock()
 }
 
-// corazaSnapshot atomically takes and resets the detection slice. Returns
-// nil when empty so flushOnce can cheaply skip the track. The returned
-// slice is owned by the caller (the app starts a fresh one).
+// corazaSnapshot atomically takes and resets the detection slice,
+// releasing the window's governor reservation. Returns nil when empty so
+// flushOnce can cheaply skip the track. The returned slice is owned by
+// the caller (the app starts a fresh one).
 func (a *StatsApp) corazaSnapshot() []corazaDetection {
 	a.corazaMu.Lock()
 	defer a.corazaMu.Unlock()
+	if a.memGov != nil && a.corazaReservedBytes > 0 {
+		a.memGov.release(a.corazaReservedBytes)
+	}
+	a.corazaReservedBytes = 0
 	if len(a.corazaEvents) == 0 {
 		return nil
 	}
@@ -1290,6 +1420,11 @@ func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
 	return lastErr
 }
 
+// proxyServerIDHeader carries the module's cluster id on every ingest
+// POST so the control plane can authenticate the per-cluster derived
+// key without reading the request body first.
+const proxyServerIDHeader = "apx-proxy-server-id"
+
 func (a *StatsApp) shipOnce(body []byte) error {
 	start := time.Now()
 	defer func() {
@@ -1311,6 +1446,9 @@ func (a *StatsApp) shipOnce(body []byte) error {
 	// APX_INTERNAL_KEY on the env fallback — to invalidate stolen
 	// secrets.
 	req.Header.Set(a.cfg.authHeader, a.secret)
+	// Cluster id alongside the secret lets the control plane verify the
+	// per-cluster derived key BEFORE reading the body (pre-body 401).
+	req.Header.Set(proxyServerIDHeader, strconv.FormatUint(uint64(a.ProxyServerIDValue), 10))
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("Content-Encoding", "gzip")
 

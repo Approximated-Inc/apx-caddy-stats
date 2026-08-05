@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,25 @@ import (
 func l4IpEnabled(cap int) func(*StatsApp) {
 	return func(a *StatsApp) {
 		a.Ingest.L4SniMaxKeys = cap
+	}
+}
+
+func TestRecordL4Ip_BoundsSniWidthInKeys(t *testing.T) {
+	// The (IP, SNI, outcome) composite keys are built fresh (no backing
+	// shared with the caller), but their WIDTH embeds the SNI — a junk
+	// 64KB SNI flood would balloon the count-capped map. Same 255-byte
+	// bound as the L4 SNI track.
+	a := newTestApp(t, "http://unused", "secret", l4IpEnabled(100))
+	a.cfg.l4SniMaxKeys = 100
+
+	long := strings.Repeat("s", 300)
+	a.RecordL4Ip("203.0.113.7:4444", long)
+
+	snap := a.l4IpSnapshot()
+	require.Len(t, snap.ipSni, 1)
+	want := l4IpSniKeyString("203.0.113.7", long[:255], L4IpOutcomeAllowed)
+	for k := range snap.ipSni {
+		require.Equal(t, want, k)
 	}
 }
 

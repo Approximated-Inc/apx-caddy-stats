@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -24,6 +25,8 @@ type fakeApp struct {
 	challenges []challengeAttemptKey
 	psID       uint32
 	hashSalt   string
+	machineID  string
+	modeV2     bool
 }
 
 type recorded struct {
@@ -64,6 +67,9 @@ func (f *fakeApp) RecordChallengeAttempt(key challengeAttemptKey) {
 func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
+
+func (f *fakeApp) MachineID() string         { return f.machineID }
+func (f *fakeApp) RequestEventsModeV2() bool { return f.modeV2 }
 
 func (f *fakeApp) challengeSnapshot() []challengeAttemptKey {
 	f.mu.Lock()
@@ -500,6 +506,74 @@ func TestServeHTTP_ClampsExoticMethodToOTHER(t *testing.T) {
 	require.Equal(t, "OTHER", app.snapshot()[0].k.Method)
 }
 
+func TestMethodOrUnknown_returnsStaticVerbNotRequestLineSlice(t *testing.T) {
+	// On HTTP/1.1, r.Method is a slice of the FULL request line (method +
+	// URI + proto share one backing array, experimentally confirmed). The
+	// returned method is buffered in both the counter map Key and the
+	// request_events rows, so returning m itself would pin the whole
+	// (attacker-length-controlled, up to ~1MB) line per buffered entry
+	// while the byte accounting counts only len("POST"). The function must
+	// return the static net/http package constant instead.
+	backing := "POST" + strings.Repeat("a", 1<<20) // runtime-built, never rodata
+	m := backing[:4]
+	got := methodOrUnknown(m)
+	require.Equal(t, "POST", got)
+	if unsafe.StringData(got) == unsafe.StringData(backing) {
+		t.Error("methodOrUnknown returned the request-line slice; want the static verb constant")
+	}
+	// Non-standard methods already clamp to the static "OTHER" sentinel.
+	junk := backing[:5] // "POSTa" — not a standard verb
+	require.Equal(t, "OTHER", methodOrUnknown(junk))
+}
+
+func TestServeHTTP_bufferedMethodAndPathDoNotPinRequestLine(t *testing.T) {
+	// End-to-end through the real handler: the Method buffered in the
+	// counter Key and the Method/Path buffered in the request_event row
+	// must not share the request-line backing array.
+	app := &fakeApp{}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("POST", "/api/users", "100", upstreamSelected("10.0.0.1:8080"))
+	methodBacking := "POST" + strings.Repeat("a", 1<<20)
+	r.Method = methodBacking[:4]
+	// A short query-less path can still be a slice of a huge request line
+	// (absolute-form URI host, junk long method) — model that directly.
+	pathBacking := "/api/users" + strings.Repeat("b", 1<<20)
+	r.URL.Path = pathBacking[:10]
+
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	rec := app.snapshot()[0]
+	require.Equal(t, "POST", rec.k.Method)
+	if unsafe.StringData(rec.k.Method) == unsafe.StringData(methodBacking) {
+		t.Error("buffered Key.Method shares the request-line backing; want the static verb constant")
+	}
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, "POST", evs[0].Method)
+	if unsafe.StringData(evs[0].Method) == unsafe.StringData(methodBacking) {
+		t.Error("buffered request_event Method shares the request-line backing; want the static verb constant")
+	}
+	require.Equal(t, "/api/users", evs[0].Path)
+	if unsafe.StringData(evs[0].Path) == unsafe.StringData(pathBacking) {
+		t.Error("buffered request_event Path shares the request-line backing; want an owned copy")
+	}
+}
+
+func TestChallengeVhost_boundsHostWidth(t *testing.T) {
+	// The challenge map keys by the Host header — attacker-supplied and,
+	// unlike real hostnames (DNS caps at 253), unbounded on the wire. Cap
+	// the buffered key width like the coraza host field (255).
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = strings.Repeat("h", 300)
+	require.Len(t, challengeVhost(r), 255)
+	// Normal hosts pass through lowercased + port-stripped, as before.
+	r.Host = "EXAMPLE.com:8443"
+	require.Equal(t, "example.com", challengeVhost(r))
+}
+
 func TestServeHTTP_SkipsApxMonitorRequests(t *testing.T) {
 	app := &fakeApp{}
 	h := &StatsHandler{app: app}
@@ -682,4 +756,93 @@ func TestServeHTTP_RequestEventTruncatesLongPathAndUA(t *testing.T) {
 	require.LessOrEqual(t, len(evs[0].UA), 512)
 	require.True(t, utf8.ValidString(evs[0].Path))
 	require.True(t, utf8.ValidString(evs[0].UA))
+}
+
+func TestServeHTTP_V2RecordsBlockedRequestEventWithDisposition(t *testing.T) {
+	// mode_v2: a WAF-blocked request (apx_block_reason=waf) is now LOGGED as
+	// a request_event with disposition=waf_blocked (legacy mode skipped it).
+	app := &fakeApp{modeV2: true, machineID: "mach-1"}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/wp-login.php", "100", map[string]any{
+		"http.vars.apx_block_reason": "waf",
+	})
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1, "v2 logs blocked requests")
+	require.Equal(t, dispWafBlocked, evs[0].Disposition)
+	require.Equal(t, uint32(100), evs[0].VhostID)
+	require.Equal(t, "", evs[0].Host, "host empty when vhost_id>0")
+	require.True(t, evs[0].V2)
+	require.Equal(t, "mach-1", evs[0].MachineID)
+	require.NotZero(t, evs[0].TsUnixMs)
+	require.NotZero(t, evs[0].MachineSeq)
+}
+
+func TestServeHTTP_V2RecordsRateLimitedDisposition(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/", "100", nil)
+	w := httptest.NewRecorder()
+	rateLimited := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return caddyhttp.Error(http.StatusTooManyRequests, nil)
+	})
+	_ = h.ServeHTTP(w, r, rateLimited)
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, dispRateLimited, evs[0].Disposition)
+	require.Equal(t, uint16(429), evs[0].Status)
+}
+
+func TestServeHTTP_V2RecordsTerminalChallengeWithHostAndZeroVhost(t *testing.T) {
+	// mode_v2: a terminal challenge has NO vhost_id (apx_challenge returns
+	// before the per-vhost vars handler). It must still be logged with
+	// vhost_id=0, host set (lowercased/port-stripped), disposition mapped.
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithChallengeOutcome("GET", "/", "Example.COM:8443", "issued")
+	r.RemoteAddr = "203.0.113.7:54321"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1, "terminal challenge logged despite missing vhost_id")
+	require.Equal(t, uint32(0), evs[0].VhostID)
+	require.Equal(t, "example.com", evs[0].Host)
+	require.Equal(t, dispChallengeIssued, evs[0].Disposition)
+	// The challenge_attempt counter is still recorded too.
+	require.Len(t, app.challengeSnapshot(), 1)
+}
+
+func TestServeHTTP_V2ServedDispositionAndEmptyHost(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := newRequestWithReplacer("GET", "/api", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, dispServed, evs[0].Disposition)
+	require.Equal(t, "", evs[0].Host, "served rows with a vhost_id omit host")
+	require.True(t, evs[0].V2)
+}
+
+func TestServeHTTP_V2NoChallengeNoVhost_DoesNotLog(t *testing.T) {
+	// mode_v2: a plain no-route request (no vhost_id, no challenge outcome)
+	// must still be dropped — logging it under vhost_id=0 would pollute the
+	// per-vhost log. Only terminal challenges relax the vhost gate.
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(404)))
+	require.Empty(t, app.reqEventSnapshot())
 }
