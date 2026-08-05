@@ -36,17 +36,13 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.secret = secret
 	a.cfg = ingestRuntime{
-		url:                    a.Ingest.URL,
-		authHeader:             "apx-key",
-		flushInterval:          time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
-		maxBuffer:              a.Ingest.MaxBufferRows,
-		maxUniqueHashes:        intDefault(a.Ingest.MaxUniqueHashes, 500_000),
-		maxRetries:             a.Ingest.MaxRetries,
-		l4SniMaxKeys:           a.Ingest.L4SniMaxKeys,
-		l7Enabled:              a.Ingest.L7 != nil && a.Ingest.L7.Enabled,
-		l7HvMaxKeys:            intDefault(l7MaxKeysFromConfig(a.Ingest.L7), L7HttpversionMaxKeysDefault),
-		l7PathBreakerThreshold: intDefault(l7BreakerThresholdFromConfig(a.Ingest.L7), L7PathBreakerThresholdDefault),
-		l7PathBreakerWindows:   intDefault(l7BreakerWindowsFromConfig(a.Ingest.L7), L7PathBreakerWindowsDefault),
+		url:             a.Ingest.URL,
+		authHeader:      "apx-key",
+		flushInterval:   time.Duration(a.Ingest.FlushIntervalMs) * time.Millisecond,
+		maxBuffer:       a.Ingest.MaxBufferRows,
+		maxUniqueHashes: intDefault(a.Ingest.MaxUniqueHashes, 500_000),
+		maxRetries:      a.Ingest.MaxRetries,
+		l4SniMaxKeys:    a.Ingest.L4SniMaxKeys,
 	}
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	for i := range a.shards {
@@ -56,14 +52,10 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 		}
 	}
 	a.l4SniMap = make(map[L4SniKey]*l4SniCounter)
-	a.l7HvMap = make(map[L7HttpversionKey]*l7HttpversionCounter)
-	if a.cfg.l7Enabled && a.Ingest.L7 != nil &&
-		a.Ingest.L7.TrackedVhosts > 0 && a.Ingest.L7.PathsPerVhost > 0 {
-		a.l7Path = newPerVhostFair(
-			a.Ingest.L7.TrackedVhosts,
-			a.Ingest.L7.PathsPerVhost,
-			a.Ingest.L7.PathSketchWidth,
-			a.Ingest.L7.PathSketchDepth,
+	if a.Ingest.RequestEvents != nil && a.Ingest.RequestEvents.Enabled {
+		a.requestEvents = newRequestEventRecorder(
+			intDefault(a.Ingest.RequestEvents.MaxRows, 200_000),
+			a.Ingest.RequestEvents.SampleThreshold,
 		)
 	}
 	a.initL4IpState()
@@ -330,57 +322,6 @@ func TestFlushOnce_PostsGzippedNDJSON(t *testing.T) {
 	}
 }
 
-func TestFlushOnce_ShipsL7PathRows(t *testing.T) {
-	srv, captured := captureServer(t, 204)
-	defer srv.Close()
-	a := newTestApp(t, srv.URL, "shared-secret",
-		func(a *StatsApp) {
-			a.Ingest.L7 = &L7Config{Enabled: true, TrackedVhosts: 64, PathsPerVhost: 16}
-		})
-	require.NotNil(t, a.l7Path)
-
-	for i := 0; i < 3; i++ {
-		a.RecordL7Path(100, "/api/users", 2)
-	}
-
-	a.flushOnce(a.cfg.maxRetries)
-
-	posts := captured()
-	require.Len(t, posts, 1)
-
-	var pathRows []map[string]any
-	for _, r := range posts[0].rows {
-		if r["_type"] == "l7_path" {
-			pathRows = append(pathRows, r)
-		}
-	}
-	require.Len(t, pathRows, 1, "one l7_path row for the single (vhost,path,status) key")
-	row := pathRows[0]
-	require.Equal(t, float64(42), row["proxy_server_id"])
-	require.Equal(t, float64(100), row["vhost_id"])
-	require.Equal(t, "/api/users", row["path_bucket"])
-	require.Equal(t, float64(2), row["status_bucket"])
-	require.Equal(t, float64(3), row["request_count"])
-}
-
-func TestFlushOnce_NoL7PathRowsWhenRecorderNil(t *testing.T) {
-	// No l7 config → recorder nil → flush ships no l7_path rows (and doesn't
-	// trip the all-empty early return for an otherwise-populated batch).
-	srv, captured := captureServer(t, 204)
-	defer srv.Close()
-	a := newTestApp(t, srv.URL, "k")
-	require.Nil(t, a.l7Path)
-
-	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}, CounterDelta{})
-	a.flushOnce(a.cfg.maxRetries)
-
-	posts := captured()
-	require.Len(t, posts, 1)
-	for _, r := range posts[0].rows {
-		require.NotEqual(t, "l7_path", r["_type"])
-	}
-}
-
 func TestFlushOnce_ResetsCountersBetweenFlushes(t *testing.T) {
 	srv, captured := captureServer(t, 204)
 	defer srv.Close()
@@ -611,4 +552,75 @@ func TestFormatTs_RoundTripsViaIngest(t *testing.T) {
 	parsed, err := time.Parse(time.RFC3339, tsStr)
 	require.NoError(t, err)
 	require.Equal(t, now.Unix(), parsed.UTC().Unix())
+}
+
+func TestProvisionLike_BuildsRequestEventsRecorderWhenEnabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true, SampleThreshold: 1000, MaxRows: 50_000}
+	})
+	require.NotNil(t, a.requestEvents)
+}
+
+func TestProvisionLike_NoRequestEventsRecorderWhenAbsentOrDisabled(t *testing.T) {
+	a := newTestApp(t, "http://example", "k")
+	require.Nil(t, a.requestEvents, "absent request_events config → nil recorder")
+
+	b := newTestApp(t, "http://example", "k", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: false}
+	})
+	require.Nil(t, b.requestEvents, "enabled:false → nil recorder")
+}
+
+func TestFlushOnce_ShipsRequestEventRows(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "shared-secret", func(a *StatsApp) {
+		a.Ingest.RequestEvents = &RequestEventsConfig{Enabled: true}
+	})
+	require.NotNil(t, a.requestEvents)
+
+	a.RecordRequestEvent(requestEventRow{
+		TsUnixSec: uint32(time.Now().Unix()),
+		VhostID:   100,
+		ClientIP:  "203.0.113.7",
+		Method:    "GET",
+		Path:      "/api/users",
+		Status:    200,
+		Origin:    OriginUpstream,
+	})
+
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	var eventRows []map[string]any
+	for _, r := range posts[0].rows {
+		if r["_type"] == "request_event" {
+			eventRows = append(eventRows, r)
+		}
+	}
+	require.Len(t, eventRows, 1)
+	row := eventRows[0]
+	require.Equal(t, float64(42), row["proxy_server_id"])
+	require.Equal(t, float64(100), row["vhost_id"])
+	require.Equal(t, "203.0.113.7", row["client_ip"])
+	require.Equal(t, "/api/users", row["path"])
+	require.Equal(t, float64(200), row["status"])
+	require.Equal(t, float64(1), row["sample_rate"]) // unsampled
+}
+
+func TestFlushOnce_NoRequestEventRowsWhenRecorderNil(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "k")
+	require.Nil(t, a.requestEvents)
+
+	a.Record(Key{VhostID: 1, Method: "GET", Status: 200, Origin: OriginCluster}, CounterDelta{})
+	a.flushOnce(a.cfg.maxRetries)
+
+	posts := captured()
+	require.Len(t, posts, 1)
+	for _, r := range posts[0].rows {
+		require.NotEqual(t, "request_event", r["_type"])
+	}
 }
