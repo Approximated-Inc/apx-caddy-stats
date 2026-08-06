@@ -581,10 +581,15 @@ func (a *StatsApp) Stop() error {
 	// clear if we're still the published app (a hot-reload may have
 	// already swapped in the replacement app's pointer at its Provision).
 	corazaApp.CompareAndSwap(a, nil)
-	// After the old config drains (grace_period is 1s), return the freed
-	// WAF/ruleset pages to the OS instead of waiting for kernel pressure.
-	scheduleFreeOSMemory(10 * time.Second)
-	a.stopOnce.Do(func() { close(a.stopCh) })
+	a.stopOnce.Do(func() {
+		close(a.stopCh)
+		// After the old config drains (grace_period is 1s), return the freed
+		// WAF/ruleset pages to the OS instead of waiting for kernel pressure.
+		// Inside stopOnce so a repeated Stop on this app can't keep pushing
+		// the call out; rapid reloads still coalesce across app instances
+		// (separate stopOnce) via the package-level debounce timer.
+		scheduleFreeOSMemory(10 * time.Second)
+	})
 	a.wg.Wait()
 	return nil
 }
