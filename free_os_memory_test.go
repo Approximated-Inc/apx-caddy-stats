@@ -1,6 +1,7 @@
 package apxstats
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -99,17 +100,29 @@ func TestScheduleFreeOSMemoryFiresOncePerBurst(t *testing.T) {
 // gets false from Timer.Stop and cannot cancel it, so the superseded
 // callback still runs — the generation check is what keeps it from calling
 // FreeOSMemory a second time within the burst.
+//
+// The interleaving is forced, not raced: freeOSMemBeforeLockHook runs inside
+// the first callback after it has fired but before it takes the mutex, which
+// is exactly the window Stop() can no longer close. The reschedule there
+// bumps the generation, so the first callback must find itself stale and the
+// second burst owns the single call. Without the generation check the first
+// callback calls fn immediately and the reschedule's timer calls it again
+// 20ms later, inside the quiet window.
 func TestScheduleFreeOSMemoryStaleTimerDoesNotDoubleFire(t *testing.T) {
 	calls := installFreeOSMemoryProbe(t)
 
-	// Repeat: each iteration is a coin flip on whether the zero-duration
-	// timer has already entered its callback when the reschedule runs, and
-	// we want to hit that window at least once.
-	for i := 0; i < 10; i++ {
-		scheduleFreeOSMemory(0)                     // fires ~immediately
-		scheduleFreeOSMemory(20 * time.Millisecond) // supersedes it, maybe too late to Stop
-
-		awaitFreeOSMemoryCall(t, calls, "stale-timer race")
-		assertNoFreeOSMemoryCall(t, calls, "stale-timer race")
+	var once sync.Once
+	freeOSMemBeforeLockHook = func() {
+		// Only the superseding schedule; its own callback must run normally.
+		once.Do(func() { scheduleFreeOSMemory(20 * time.Millisecond) })
 	}
+	t.Cleanup(func() {
+		resetFreeOSMemoryState() // orders against any in-flight callback
+		freeOSMemBeforeLockHook = nil
+	})
+
+	scheduleFreeOSMemory(0)
+
+	awaitFreeOSMemoryCall(t, calls, "stale-timer race")
+	assertNoFreeOSMemoryCall(t, calls, "stale-timer race")
 }

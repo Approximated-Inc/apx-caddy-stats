@@ -20,6 +20,12 @@ var (
 	freeOSMemTimer *time.Timer
 	freeOSMemGen   uint64
 	freeOSMemoryFn = debug.FreeOSMemory // swapped in tests
+
+	// Test-only: runs at the top of the timer callback, before it takes the
+	// mutex, so a test can deterministically slip a reschedule into that
+	// window and force the stale branch. Always nil in production; the nil
+	// check costs nothing on a path that runs once per config reload.
+	freeOSMemBeforeLockHook func()
 )
 
 func scheduleFreeOSMemory(d time.Duration) {
@@ -32,6 +38,9 @@ func scheduleFreeOSMemory(d time.Duration) {
 	gen := freeOSMemGen
 	fn := freeOSMemoryFn
 	freeOSMemTimer = time.AfterFunc(d, func() {
+		if hook := freeOSMemBeforeLockHook; hook != nil {
+			hook()
+		}
 		freeOSMemMu.Lock()
 		stale := gen != freeOSMemGen
 		if !stale {
