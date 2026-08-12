@@ -112,3 +112,25 @@ func TestTraceTransport_Error_EmitsUpstreamError(t *testing.T) {
 	require.Equal(t, EventUpstreamRequest, events[0].Type)
 	require.Equal(t, EventUpstreamError, events[1].Type)
 }
+
+func TestTraceTransport_NilResponseNilError_SynthesizesError(t *testing.T) {
+	app := newFakeTraceApp("s")
+	tc := newTraceContextFor(t, "tok", app)
+	tt := &TraceTransport{
+		inner:    &stubRT{}, // (nil, nil): a misbehaving inner transport
+		redactor: DefaultRedactor(),
+		app:      app,
+	}
+
+	r := httptest.NewRequest("GET", "http://up.local/foo", nil)
+	r = r.WithContext(withTrace(r.Context(), tc))
+
+	resp, err := tt.RoundTrip(r)
+	require.Error(t, err)
+	require.Nil(t, resp)
+
+	require.Equal(t, 2, app.eventCount())
+	events := app.eventsCopy()
+	require.Equal(t, EventUpstreamRequest, events[0].Type)
+	require.Equal(t, EventUpstreamError, events[1].Type)
+}

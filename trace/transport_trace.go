@@ -99,6 +99,12 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.inner.RoundTrip(r)
 	duration := time.Since(start)
 
+	// A misbehaving inner transport can return (nil, nil); synthesize an error
+	// instead of panicking on resp.StatusCode below.
+	if err == nil && resp == nil {
+		err = fmt.Errorf("apx_trace transport: inner transport returned neither response nor error")
+	}
+
 	if err != nil {
 		tc.App.EmitEvent(Event{
 			Type:   EventUpstreamError,

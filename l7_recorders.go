@@ -77,7 +77,7 @@ func (p *perVhostFair) newSketch() *topk.Sketch {
 // don't), so a NUL separator lets drain split it back unambiguously.
 func combineItem(pathBucket string, statusBucket uint8) string {
 	var b strings.Builder
-	b.Grow(len(pathBucket) + 1)
+	b.Grow(len(pathBucket) + 2)
 	b.WriteString(pathBucket)
 	b.WriteByte(0)
 	b.WriteByte(statusBucket)
