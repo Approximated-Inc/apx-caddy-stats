@@ -21,6 +21,15 @@ import (
 // Do NOT register or reference this under layer4.matchers.tls:
 // l4tls.ClientHelloInfo shadows the embedded Extensions field, so an
 // L4-invoked matcher would see Extensions == nil and compute a wrong JA4.
+//
+// FORWARD-LOOKING CONSTRAINT — not a problem today. Above 30 connection
+// policies on one server, caddytls builds an indexedBySNI fast path
+// (connpolicy.go), and an SNI-bearing handshake then only considers policies
+// carrying a MatchServerName matcher — a policy without one stops being
+// reached at all. Approximated generates ONE connection-policy list per
+// server (two entries once the catch-all lands), so that path is unreachable.
+// If the list ever grows past 30, this matcher must ride the SNI-matched
+// policies instead of sitting in a policy of its own.
 type JA4Matcher struct {
 	// Blocklist is the set of JA4 strings that match. Empty means the matcher
 	// never matches — record-only mode.

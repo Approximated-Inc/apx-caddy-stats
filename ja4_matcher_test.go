@@ -15,6 +15,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 // ja4TestConn is a net.Conn stub that only answers the address questions the
@@ -331,8 +332,15 @@ func TestStatsHandler_ja4ConnContextConcurrentAccepts(t *testing.T) {
 	}
 }
 
+// connContextFuncCount reads the registered-hook count off a caddyhttp.Server.
+// The field is unexported and caddy exposes no reader, but Len() is legal on a
+// read-only reflect.Value.
+func connContextFuncCount(srv *caddyhttp.Server) int {
+	return reflect.ValueOf(srv).Elem().FieldByName("connContextFuncs").Len()
+}
+
 func TestStatsHandler_ProvisionRegistersConnContext(t *testing.T) {
-	srv := new(caddyhttp.Server)
+	srv := &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{}}}
 	ctx := caddy.Context{Context: context.WithValue(context.Background(), caddyhttp.ServerCtxKey, srv)}
 
 	h := &StatsHandler{app: &fakeApp{}}
@@ -340,9 +348,25 @@ func TestStatsHandler_ProvisionRegistersConnContext(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 
-	n := reflect.ValueOf(srv).Elem().FieldByName("connContextFuncs").Len()
-	if n != 1 {
+	if n := connContextFuncCount(srv); n != 1 {
 		t.Errorf("connContextFuncs = %d, want 1", n)
+	}
+}
+
+func TestStatsHandler_ProvisionSkipsNonTLSServer(t *testing.T) {
+	// A plain :80 redirect server terminates no TLS, so its connections can
+	// never reach the matcher. Registering there would churn the shared LRU
+	// with holders that never fill and evict entries for live handshakes.
+	srv := new(caddyhttp.Server) // no TLSConnPolicies
+	ctx := caddy.Context{Context: context.WithValue(context.Background(), caddyhttp.ServerCtxKey, srv)}
+
+	h := &StatsHandler{app: &fakeApp{}}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	if n := connContextFuncCount(srv); n != 0 {
+		t.Errorf("connContextFuncs = %d on a non-TLS server, want 0", n)
 	}
 }
 
@@ -353,10 +377,10 @@ func TestStatsHandler_ProvisionWithoutServerIsSafe(t *testing.T) {
 	}
 }
 
-func TestStatsHandler_recordReadsJA4FromContext(t *testing.T) {
-	// The fingerprint must be readable at request time. It is deliberately
-	// unused by record() for now (record-only scope), so assert the value the
-	// handler's request context actually carries.
+func TestStatsHandler_recordStagesJA4FromContext(t *testing.T) {
+	// End of the chain: accept hook -> registry -> matcher fill -> the value
+	// record() stages on the recorder. Asserting record()'s EFFECT (not the
+	// context it read from) is what makes deleting the read turn this red.
 	h := &StatsHandler{app: &fakeApp{}}
 	conn := newJA4TestConn("203.0.113.9:52002")
 	connCtx := h.ja4ConnContext(context.Background(), conn)
@@ -373,7 +397,20 @@ func TestStatsHandler_recordReadsJA4FromContext(t *testing.T) {
 	w := &recorder{ResponseWriter: httptest.NewRecorder(), status: 200}
 	h.record(r, w, time.Millisecond, nil)
 
-	if got := ja4FromContext(r.Context()); got != "t13d1516h2_aaaabbbbcccc_ddddeeeeffff" {
-		t.Errorf("ja4 on the request = %q, want the filled value", got)
+	if w.ja4 != "t13d1516h2_aaaabbbbcccc_ddddeeeeffff" {
+		t.Errorf("record() staged ja4 = %q, want the filled value", w.ja4)
+	}
+}
+
+func TestStatsHandler_recordStagesEmptyJA4WithoutAHandshake(t *testing.T) {
+	// No matcher ran. record() must stage "" rather than leave a stale value,
+	// and must not panic on a context carrying no holder.
+	h := &StatsHandler{app: &fakeApp{}}
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	w := &recorder{ResponseWriter: httptest.NewRecorder(), status: 200, ja4: "stale"}
+	h.record(r, w, time.Millisecond, nil)
+
+	if w.ja4 != "" {
+		t.Errorf("record() staged ja4 = %q, want \"\"", w.ja4)
 	}
 }

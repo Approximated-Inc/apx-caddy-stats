@@ -497,9 +497,12 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.stopCh = make(chan struct{})
 
-	// JA4 handoff registry. Sized well above the in-flight-handshake count of
-	// any single machine; entries live only between accept and handshake.
-	a.ja4Registry = newJA4Registry(ja4RegistryMaxEntries)
+	// JA4 handoff registry. Built through the accessor so ja4RegistryOnce is
+	// the single authority on when the field is written. Assigning directly
+	// here would be safe only because caddy happens to provision apps before
+	// anything can call JA4Registry() — ordering enforced by caddy rather
+	// than by a lock, which -race cannot verify.
+	a.JA4Registry()
 
 	// Publish this app to the global Coraza audit-log writer. The writer
 	// is registered by a package init() with no app handle, so it loads

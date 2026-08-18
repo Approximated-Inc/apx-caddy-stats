@@ -103,12 +103,14 @@ func TestJA4Registry_concurrentPutFillDistinctKeys(t *testing.T) {
 	const goroutines = 64
 	r := newJA4Registry(4096)
 
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	errs := make([]string, goroutines)
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			<-start
 			key := netip.AddrPortFrom(netip.MustParseAddr("203.0.113.9"), uint16(1024+i))
 			want := fmt.Sprintf("t13d1516h2_%012d_ffffffffffff", i)
 			h := &ja4Holder{}
@@ -122,6 +124,7 @@ func TestJA4Registry_concurrentPutFillDistinctKeys(t *testing.T) {
 			}
 		}(i)
 	}
+	close(start) // release together — a bare loop lets early workers finish first
 	wg.Wait()
 
 	for i, e := range errs {
@@ -149,6 +152,7 @@ func TestJA4Registry_concurrentPutFillSharedKeys(t *testing.T) {
 		valid[fmt.Sprintf("t13d1516h2_%012d_ffffffffffff", i)] = struct{}{}
 	}
 
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var bad []string
@@ -156,6 +160,7 @@ func TestJA4Registry_concurrentPutFillSharedKeys(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			<-start
 			key := netip.AddrPortFrom(netip.MustParseAddr("203.0.113.9"), uint16(1024+i%keys))
 			h := &ja4Holder{}
 			r.put(key, h)
@@ -171,6 +176,7 @@ func TestJA4Registry_concurrentPutFillSharedKeys(t *testing.T) {
 			}
 		}(i)
 	}
+	close(start) // release together — a bare loop lets early workers finish first
 	wg.Wait()
 
 	if len(bad) > 0 {
@@ -189,15 +195,18 @@ func TestJA4Registry_concurrentPutAtCap(t *testing.T) {
 	const max = 8
 	r := newJA4Registry(max)
 
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			<-start
 			r.put(netip.AddrPortFrom(netip.MustParseAddr("203.0.113.9"), uint16(1024+i)), &ja4Holder{})
 		}(i)
 	}
-	wg.Wait()
+	close(start) // release together — this is the eviction path, the one place
+	wg.Wait()    // put() mutates both the list and the map
 
 	m, l := r.sizes()
 	if m != l {

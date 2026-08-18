@@ -64,7 +64,21 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 	// by remote address — see ja4_handoff.go. Absent a server on the context
 	// (Caddyfile-less embedding, tests) request correlation is simply off; the
 	// matcher still records.
+	//
+	// Skip servers that terminate no TLS. Their connections can never reach
+	// the matcher, so every holder they register would sit in the registry
+	// until evicted — a plain :80 redirect server would otherwise churn the
+	// LRU and push out entries belonging to live handshakes. TLSConnPolicies
+	// is populated from config before route provisioning (caddyhttp/app.go
+	// provisions routes at :346, policies only at :372), so len() is readable
+	// here even though the policies themselves aren't provisioned yet.
 	if srv, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && srv != nil {
+		if len(srv.TLSConnPolicies) == 0 {
+			if h.logger != nil {
+				h.logger.Debug("apx_stats: server terminates no TLS; JA4 request correlation disabled")
+			}
+			return nil
+		}
 		h.ja4Registry() // resolve here, single-threaded, before any accept
 		srv.RegisterConnContext(h.ja4ConnContext)
 	} else if h.logger != nil {
@@ -156,14 +170,13 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	modeV2 := h.app.RequestEventsModeV2()
 
 	// JA4 for this connection, as computed by the TLS handshake matcher.
-	// Deliberately unused for now: this plan is record-only, and putting the
-	// value on the request_event row is a ClickHouse migration plus an ingest
-	// change that ships with the Client Classification work. The read stays
-	// here to keep the handoff path live and covered.
+	// Staged on the recorder rather than written to a row: this plan is
+	// record-only, and adding a ja4 column is a ClickHouse migration plus an
+	// ingest change that ships with the Client Classification work. The
+	// recorder is where buildRequestEventRow will read it from when it does.
 	// "" is the normal state — no matcher configured, non-TLS, or a
 	// connection whose registry entry was evicted.
-	ja4 := ja4FromContext(r.Context())
-	_ = ja4
+	w.ja4 = ja4FromContext(r.Context())
 
 	// Challenge attempts record independently of vhost_id (see the original
 	// comment): a served challenge is terminal so vhost_id is unset. Read
@@ -674,6 +687,11 @@ type recorder struct {
 	bytes    int
 	wrote    bool
 	hijacked bool
+
+	// ja4 is the connection's TLS fingerprint, staged by record() from the
+	// connection context. Nothing consumes it yet — see record(). Written
+	// after the response is finished, so it never races the write path.
+	ja4 string
 }
 
 func (r *recorder) WriteHeader(code int) {
