@@ -312,6 +312,15 @@ type StatsApp struct {
 	// Provision. Gates the handler's disposition/host/unsampled-served path.
 	reqEventsModeV2 bool
 
+	// ja4Registry hands a per-connection fingerprint holder from the HTTP
+	// server's accept hook to the TLS handshake matcher. One per process,
+	// shared by every JA4Matcher and the StatsHandler — the matcher runs on
+	// the caddytls path, outside any handler chain, so an address-keyed
+	// registry is the only way it can reach the holder the accept side
+	// installed.
+	ja4Registry     *ja4Registry
+	ja4RegistryOnce sync.Once
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -488,6 +497,10 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.stopCh = make(chan struct{})
 
+	// JA4 handoff registry. Sized well above the in-flight-handshake count of
+	// any single machine; entries live only between accept and handshake.
+	a.ja4Registry = newJA4Registry(ja4RegistryMaxEntries)
+
 	// Publish this app to the global Coraza audit-log writer. The writer
 	// is registered by a package init() with no app handle, so it loads
 	// the live app from here. Set last, after all state is initialized.
@@ -603,6 +616,23 @@ func (a *StatsApp) MachineID() string { return a.MachineIDValue }
 // RequestEventsModeV2 reports whether the request_events track is in
 // mode_v2. Resolved at Provision (G5 wiring); false by default.
 func (a *StatsApp) RequestEventsModeV2() bool { return a.reqEventsModeV2 }
+
+// ja4RegistryMaxEntries bounds the JA4 handoff registry. Entries are created
+// on accept and removed on handshake, so the live set is the in-flight
+// handshake count; anything beyond this is a connection that never reached the
+// matcher, and evicting it costs exactly one fingerprint.
+const ja4RegistryMaxEntries = 4096
+
+// JA4Registry returns the per-handshake fingerprint handoff registry, creating
+// it on first use so tests that construct StatsApp directly still work.
+func (a *StatsApp) JA4Registry() *ja4Registry {
+	a.ja4RegistryOnce.Do(func() {
+		if a.ja4Registry == nil {
+			a.ja4Registry = newJA4Registry(ja4RegistryMaxEntries)
+		}
+	})
+	return a.ja4Registry
+}
 
 // Test-only accessors. The counters / uniques maps are sharded for
 // contention reduction; tests want to peek at aggregate state without

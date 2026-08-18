@@ -19,4 +19,5 @@ func init() {
 	caddy.RegisterModule(&StatsHandler{})
 	caddy.RegisterModule(&L4Handler{})
 	caddy.RegisterModule(&FingerprintHandler{})
+	caddy.RegisterModule(&JA4Matcher{})
 }

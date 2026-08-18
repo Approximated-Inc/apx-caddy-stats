@@ -99,6 +99,18 @@ func newJA4Registry(max int) *ja4Registry {
 	return &ja4Registry{max: max, ll: list.New(), m: make(map[netip.AddrPort]*list.Element)}
 }
 
+// put registers h under key, replacing any holder already there.
+//
+// LIMITATION, inherent to keying on ip:port: if the kernel hands the same
+// ephemeral port to a second connection before the first one's handshake
+// reaches fill(), this overwrite redirects the first connection's fingerprint
+// to the second connection's holder — the first request then reads "". The
+// window is one handshake wide and the failure mode is a missing fingerprint,
+// never a wrong one attributed to a different connection's REQUEST (the holder
+// that receives the value is the one the live connection reads from). Callers
+// must already treat "" as normal, so this needs no extra handling; the fix,
+// if it ever matters, is to key on the *net.Conn identity rather than its
+// address, which caddytls does not expose to a ConnectionMatcher.
 func (r *ja4Registry) put(key netip.AddrPort, h *ja4Holder) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

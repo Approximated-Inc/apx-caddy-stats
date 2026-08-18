@@ -1,0 +1,379 @@
+package apxstats
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+)
+
+// ja4TestConn is a net.Conn stub that only answers the address questions the
+// matcher and the conn-context hook ask of it.
+type ja4TestConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (c *ja4TestConn) LocalAddr() net.Addr  { return c.local }
+func (c *ja4TestConn) RemoteAddr() net.Addr { return c.remote }
+
+func newJA4TestConn(remote string) *ja4TestConn {
+	ra, err := net.ResolveTCPAddr("tcp", remote)
+	if err != nil {
+		panic(err)
+	}
+	return &ja4TestConn{
+		local:  &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 443},
+		remote: ra,
+	}
+}
+
+// testHello is the minimal ClientHello every matcher test fingerprints.
+func testHello() *tls.ClientHelloInfo {
+	return &tls.ClientHelloInfo{
+		CipherSuites:      []uint16{0x1301},
+		Extensions:        []uint16{0x0000},
+		SignatureSchemes:  []tls.SignatureScheme{0x0403},
+		SupportedVersions: []uint16{0x0304},
+	}
+}
+
+func TestJA4Matcher_CaddyModuleID(t *testing.T) {
+	got := (&JA4Matcher{}).CaddyModule().ID
+	if string(got) != "tls.handshake_match.apx_ja4" {
+		t.Errorf("module ID = %q, want tls.handshake_match.apx_ja4", got)
+	}
+}
+
+func TestJA4Matcher_registered(t *testing.T) {
+	m, err := caddy.GetModule("tls.handshake_match.apx_ja4")
+	if err != nil {
+		t.Fatalf("module not registered: %v", err)
+	}
+	if _, ok := m.New().(*JA4Matcher); !ok {
+		t.Errorf("registered module is not *JA4Matcher")
+	}
+}
+
+func TestJA4Matcher_emptyBlocklistNeverMatches(t *testing.T) {
+	// Record-only mode. A caddytls ConnectionMatcher returning true SELECTS
+	// its policy; with an empty blocklist this matcher must never do that, so
+	// the catch-all policy always serves the connection.
+	m := &JA4Matcher{app: newTestAppWithFP(10, 10), registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if m.Match(testHello()) {
+		t.Error("empty blocklist matched — record-only mode must never match")
+	}
+}
+
+func TestJA4Matcher_blankBlocklistEntriesAreIgnored(t *testing.T) {
+	// A config that emits [""] must stay record-only, not match a hello whose
+	// fingerprint failed to compute.
+	m := &JA4Matcher{Blocklist: []string{"", ""}, app: newTestAppWithFP(10, 10), registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(m.set) != 0 {
+		t.Errorf("compiled set = %v, want empty", m.set)
+	}
+	if m.Match(testHello()) {
+		t.Error("blank-only blocklist matched")
+	}
+}
+
+func TestJA4Matcher_recordsEvenWhenNotMatching(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	_ = m.Match(testHello())
+
+	if len(app.fpMap) == 0 {
+		t.Error("Match did not record the fingerprint")
+	}
+}
+
+func TestJA4Matcher_blocklistedMatches(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	hello := testHello()
+	ja4 := ja4FromClientHello(hello)
+
+	m := &JA4Matcher{Blocklist: []string{ja4}, app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !m.Match(hello) {
+		t.Errorf("blocklisted JA4 %q did not match", ja4)
+	}
+}
+
+func TestJA4Matcher_nonBlocklistedDoesNotMatch(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{Blocklist: []string{"t13d1516h2_deadbeefdead_cafecafecafe"}, app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if m.Match(testHello()) {
+		t.Error("a non-blocklisted fingerprint matched")
+	}
+	if len(app.fpMap) == 0 {
+		t.Error("a non-blocklisted fingerprint was not recorded")
+	}
+}
+
+func TestJA4Matcher_nilHelloIsSafe(t *testing.T) {
+	m := &JA4Matcher{app: newTestAppWithFP(10, 10), registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if m.Match(nil) {
+		t.Error("nil hello matched")
+	}
+}
+
+func TestJA4Matcher_fillsRegisteredHolder(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	reg := newJA4Registry(8)
+	m := &JA4Matcher{app: app, registry: reg}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	conn := newJA4TestConn("203.0.113.9:52000")
+	key, ok := normalizeAddrPort(conn.RemoteAddr())
+	if !ok {
+		t.Fatal("normalizeAddrPort failed for the test conn")
+	}
+	holder := &ja4Holder{}
+	reg.put(key, holder)
+
+	hello := testHello()
+	hello.Conn = conn
+	want := ja4FromClientHello(hello)
+
+	_ = m.Match(hello)
+
+	if got := holder.get(); got != want {
+		t.Errorf("holder = %q, want %q", got, want)
+	}
+}
+
+func TestJA4Matcher_recordsIPFromConn(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	hello := testHello()
+	hello.Conn = newJA4TestConn("203.0.113.9:52000")
+	_ = m.Match(hello)
+
+	found := false
+	for k := range app.fpIpMap {
+		if k.IP == "203.0.113.9" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no (ja4, ip) row for the conn's remote IP; map = %v", app.fpIpMap)
+	}
+}
+
+func TestJA4Matcher_noConnStillRecords(t *testing.T) {
+	// QUIC delivers a nil hello.Conn. The fingerprint must still be recorded,
+	// just without an IP, and the matcher must not panic.
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if m.Match(testHello()) {
+		t.Error("record-only matcher matched")
+	}
+	if len(app.fpMap) == 0 {
+		t.Error("fingerprint not recorded when hello.Conn was nil")
+	}
+	if len(app.fpIpMap) != 0 {
+		t.Errorf("an ip row was recorded without a conn: %v", app.fpIpMap)
+	}
+}
+
+func TestJA4Matcher_ProvisionResolvesRegistryFromApp(t *testing.T) {
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{app: app}
+	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if m.registry == nil {
+		t.Fatal("Provision left the registry nil")
+	}
+	if m.registry != app.JA4Registry() {
+		t.Error("Provision did not resolve the app's shared registry")
+	}
+	if m.set == nil {
+		t.Error("Provision did not compile the blocklist set")
+	}
+}
+
+// NOTE: the "Provision without the apx_stats app returns an error" path is not
+// unit-testable here — caddy.Context.App dereferences the context's config,
+// which a bare caddy.Context{} does not have, so the call panics inside caddy
+// before our error branch runs. Building a full caddy config to reach it would
+// test caddy's plumbing, not ours.
+
+func TestStatsApp_JA4RegistryIsStable(t *testing.T) {
+	a := &StatsApp{}
+	first := a.JA4Registry()
+	if first == nil {
+		t.Fatal("JA4Registry returned nil")
+	}
+	if a.JA4Registry() != first {
+		t.Error("JA4Registry returned a different registry on the second call")
+	}
+}
+
+// --- handler wiring: accept goroutine -> registry -> matcher -> request ---
+
+func TestStatsHandler_ja4ConnContextRoundTrip(t *testing.T) {
+	h := &StatsHandler{app: &fakeApp{}}
+	reg := h.ja4Registry()
+
+	conn := newJA4TestConn("203.0.113.9:52001")
+	ctx := h.ja4ConnContext(context.Background(), conn)
+
+	if got := ja4FromContext(ctx); got != "" {
+		t.Errorf("ja4 before the handshake = %q, want \"\"", got)
+	}
+
+	app := newTestAppWithFP(10, 10)
+	m := &JA4Matcher{app: app, registry: reg}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	hello := testHello()
+	hello.Conn = conn
+	want := ja4FromClientHello(hello)
+	_ = m.Match(hello)
+
+	if got := ja4FromContext(ctx); got != want {
+		t.Errorf("ja4 on the request context = %q, want %q", got, want)
+	}
+}
+
+func TestStatsHandler_ja4ConnContextUnaddressableConn(t *testing.T) {
+	h := &StatsHandler{app: &fakeApp{}}
+	conn := &ja4TestConn{local: nil, remote: nil}
+	ctx := h.ja4ConnContext(context.Background(), conn)
+	if got := ja4FromContext(ctx); got != "" {
+		t.Errorf("ja4 = %q, want \"\"", got)
+	}
+}
+
+func TestStatsHandler_ja4ConnContextConcurrentAccepts(t *testing.T) {
+	// A caddyhttp.Server runs one accept goroutine PER LISTENER, so the hook
+	// has concurrent callers from the first connection — including on the
+	// very first call, which resolves the registry. All of them must land in
+	// the SAME registry or the matcher's fill misses.
+	const goroutines = 64
+	h := &StatsHandler{app: &fakeApp{}}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	regs := make([]*ja4Registry, goroutines)
+	ctxs := make([]context.Context, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			conn := newJA4TestConn(fmt.Sprintf("203.0.113.9:%d", 20000+i))
+			ctxs[i] = h.ja4ConnContext(context.Background(), conn)
+			regs[i] = h.ja4Registry()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, r := range regs {
+		if r != regs[0] {
+			t.Fatalf("goroutine %d resolved a different registry", i)
+		}
+	}
+
+	// Every connection must still be fillable through the shared registry.
+	for i := 0; i < goroutines; i++ {
+		key := netip.AddrPortFrom(netip.MustParseAddr("203.0.113.9"), uint16(20000+i))
+		want := fmt.Sprintf("t13d1516h2_%012d_ffffffffffff", i)
+		if !regs[0].fill(key, want) {
+			t.Errorf("conn %d: no holder registered", i)
+			continue
+		}
+		if got := ja4FromContext(ctxs[i]); got != want {
+			t.Errorf("conn %d: ja4 = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestStatsHandler_ProvisionRegistersConnContext(t *testing.T) {
+	srv := new(caddyhttp.Server)
+	ctx := caddy.Context{Context: context.WithValue(context.Background(), caddyhttp.ServerCtxKey, srv)}
+
+	h := &StatsHandler{app: &fakeApp{}}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	n := reflect.ValueOf(srv).Elem().FieldByName("connContextFuncs").Len()
+	if n != 1 {
+		t.Errorf("connContextFuncs = %d, want 1", n)
+	}
+}
+
+func TestStatsHandler_ProvisionWithoutServerIsSafe(t *testing.T) {
+	h := &StatsHandler{app: &fakeApp{}}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision without a server on the context: %v", err)
+	}
+}
+
+func TestStatsHandler_recordReadsJA4FromContext(t *testing.T) {
+	// The fingerprint must be readable at request time. It is deliberately
+	// unused by record() for now (record-only scope), so assert the value the
+	// handler's request context actually carries.
+	h := &StatsHandler{app: &fakeApp{}}
+	conn := newJA4TestConn("203.0.113.9:52002")
+	connCtx := h.ja4ConnContext(context.Background(), conn)
+
+	key, ok := normalizeAddrPort(conn.RemoteAddr())
+	if !ok {
+		t.Fatal("normalizeAddrPort failed")
+	}
+	if !h.ja4Registry().fill(key, "t13d1516h2_aaaabbbbcccc_ddddeeeeffff") {
+		t.Fatal("fill found no holder for the registered conn")
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(connCtx)
+	w := &recorder{ResponseWriter: httptest.NewRecorder(), status: 200}
+	h.record(r, w, time.Millisecond, nil)
+
+	if got := ja4FromContext(r.Context()); got != "t13d1516h2_aaaabbbbcccc_ddddeeeeffff" {
+		t.Errorf("ja4 on the request = %q, want the filled value", got)
+	}
+}
