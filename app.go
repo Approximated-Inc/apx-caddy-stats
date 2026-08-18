@@ -1053,14 +1053,14 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 // recordFingerprintMaps writes the (ja3, ja4, outcome) and (ja4, ip) rows.
 // ja3 may be the empty-JA3 sentinel when the caller has no JA3 available.
 //
-// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja4 or ip
-// are dropped per-map. Caps are enforced at insert; new keys past the cap
-// are dropped + counted in the overflow metric (NO sentinel row).
+// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja3/ja4 or
+// ip are dropped per-map. Caps are enforced at insert; new keys past the
+// cap are dropped + counted in the overflow metric (NO sentinel row).
 func (a *StatsApp) recordFingerprintMaps(ja3, ja4, ip string) {
 	tsMin := timeNowUnixMin()
 
 	// --- (ja3, ja4, outcome) traffic map ---
-	if a.cfg.fingerprintMaxKeys > 0 && ja4 != "" {
+	if a.cfg.fingerprintMaxKeys > 0 && ja3 != "" && ja4 != "" {
 		k := fingerprintKey{TsUnixMin: tsMin, JA3: ja3, JA4: ja4, Outcome: FingerprintOutcomeAllowed}
 		a.fpMu.Lock()
 		if c, ok := a.fpMap[k]; ok {
@@ -1103,8 +1103,12 @@ func (a *StatsApp) recordFingerprintMaps(ja3, ja4, ip string) {
 // RecordFingerprint counts one accepted L4 TLS connection into both
 // fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
 // connection from the FingerprintHandler hot path.
+//
+// An empty ja3 skips the traffic-map write (that map's identity requires a
+// JA3) but not the ip-map write, which only needs ja4 — see
+// recordFingerprintMaps.
 func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
-	if ja3 == "" || ja4 == "" {
+	if ja4 == "" {
 		return
 	}
 	a.recordFingerprintMaps(ja3, ja4, ip)
