@@ -1050,18 +1050,17 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	}
 }
 
-// RecordFingerprint counts one accepted L4 TLS connection into both
-// fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
-// connection from the FingerprintHandler hot path.
+// recordFingerprintMaps writes the (ja3, ja4, outcome) and (ja4, ip) rows.
+// ja3 may be the empty-JA3 sentinel when the caller has no JA3 available.
 //
-// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja3/ja4
-// or ip are dropped per-map. Caps are enforced at insert; new keys past
-// the cap are dropped + counted in the overflow metric (NO sentinel row).
-func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
+// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja4 or ip
+// are dropped per-map. Caps are enforced at insert; new keys past the cap
+// are dropped + counted in the overflow metric (NO sentinel row).
+func (a *StatsApp) recordFingerprintMaps(ja3, ja4, ip string) {
 	tsMin := timeNowUnixMin()
 
 	// --- (ja3, ja4, outcome) traffic map ---
-	if a.cfg.fingerprintMaxKeys > 0 && ja3 != "" && ja4 != "" {
+	if a.cfg.fingerprintMaxKeys > 0 && ja4 != "" {
 		k := fingerprintKey{TsUnixMin: tsMin, JA3: ja3, JA4: ja4, Outcome: FingerprintOutcomeAllowed}
 		a.fpMu.Lock()
 		if c, ok := a.fpMap[k]; ok {
@@ -1099,6 +1098,27 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 		}
 		a.fpMu.Unlock()
 	}
+}
+
+// RecordFingerprint counts one accepted L4 TLS connection into both
+// fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
+// connection from the FingerprintHandler hot path.
+func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
+	if ja3 == "" || ja4 == "" {
+		return
+	}
+	a.recordFingerprintMaps(ja3, ja4, ip)
+}
+
+// RecordJA4 records an observation with no JA3 — the caddytls path cannot
+// produce one, because crypto/tls does not expose the legacy client version or
+// compression methods. The JA3 column carries EmptyJA3Sentinel so these rows
+// are distinguishable downstream from genuine JA3+JA4 observations.
+func (a *StatsApp) RecordJA4(ja4, ip string) {
+	if ja4 == "" {
+		return
+	}
+	a.recordFingerprintMaps(EmptyJA3Sentinel, ja4, ip)
 }
 
 // maybeLogL4IpOverflow throttles per-IP overflow log lines — only one

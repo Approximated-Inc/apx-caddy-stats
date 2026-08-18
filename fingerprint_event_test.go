@@ -204,3 +204,34 @@ func TestFingerprintIpSnapshot_resetsAndKeepsCount1(t *testing.T) {
 		t.Errorf("fpIpMap not reset after snapshot: %d", n)
 	}
 }
+
+func TestRecordJA4_writesBothMaps(t *testing.T) {
+	a := newTestAppWithFP(10, 10)
+	a.RecordJA4("t13d1516h2_8daaf6152771_b0da82dd1658", "203.0.113.7")
+
+	if len(a.fpMap) != 1 {
+		t.Errorf("fpMap size = %d, want 1 (a JA4-only observation must still record a traffic row)", len(a.fpMap))
+	}
+	if len(a.fpIpMap) != 1 {
+		t.Errorf("fpIpMap size = %d, want 1", len(a.fpIpMap))
+	}
+}
+
+func TestRecordJA4_ignoresEmpty(t *testing.T) {
+	a := newTestAppWithFP(10, 10)
+	a.RecordJA4("", "203.0.113.7")
+
+	if len(a.fpMap) != 0 || len(a.fpIpMap) != 0 {
+		t.Errorf("empty ja4 recorded something: fpMap=%d fpIpMap=%d", len(a.fpMap), len(a.fpIpMap))
+	}
+}
+
+func TestRecordJA4_respectsCap(t *testing.T) {
+	a := newTestAppWithFP(1, 1)
+	a.RecordJA4("ja4-one", "203.0.113.1")
+	a.RecordJA4("ja4-two", "203.0.113.2")
+
+	if len(a.fpMap) != 1 {
+		t.Errorf("fpMap size = %d, want 1 — the cap must drop new keys", len(a.fpMap))
+	}
+}
