@@ -175,4 +175,4 @@ require (
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
 
-replace github.com/mholt/caddy-l4 => github.com/Approximated-Inc/caddy-l4 v0.0.0-20260515224343-e0ffe22888a3
+replace github.com/mholt/caddy-l4 => github.com/Approximated-Inc/caddy-l4 v0.0.0-20260818074414-6ad61e78ec21
