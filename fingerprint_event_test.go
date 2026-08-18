@@ -204,3 +204,64 @@ func TestFingerprintIpSnapshot_resetsAndKeepsCount1(t *testing.T) {
 		t.Errorf("fpIpMap not reset after snapshot: %d", n)
 	}
 }
+
+func TestRecordJA4_writesBothMaps(t *testing.T) {
+	a := newTestAppWithFP(10, 10)
+	a.RecordJA4("t13d1516h2_8daaf6152771_b0da82dd1658", "203.0.113.7")
+
+	a.fpMu.Lock()
+	nfp, nip := len(a.fpMap), len(a.fpIpMap)
+	a.fpMu.Unlock()
+	if nfp != 1 {
+		t.Errorf("fpMap size = %d, want 1 (a JA4-only observation must still record a traffic row)", nfp)
+	}
+	if nip != 1 {
+		t.Errorf("fpIpMap size = %d, want 1", nip)
+	}
+}
+
+func TestRecordJA4_ignoresEmpty(t *testing.T) {
+	a := newTestAppWithFP(10, 10)
+	a.RecordJA4("", "203.0.113.7")
+
+	a.fpMu.Lock()
+	nfp, nip := len(a.fpMap), len(a.fpIpMap)
+	a.fpMu.Unlock()
+	if nfp != 0 || nip != 0 {
+		t.Errorf("empty ja4 recorded something: fpMap=%d fpIpMap=%d", nfp, nip)
+	}
+}
+
+func TestRecordJA4_respectsCap(t *testing.T) {
+	a := newTestAppWithFP(1, 1)
+	a.RecordJA4("ja4-one", "203.0.113.1")
+	a.RecordJA4("ja4-two", "203.0.113.2")
+
+	a.fpMu.Lock()
+	n := len(a.fpMap)
+	a.fpMu.Unlock()
+	if n != 1 {
+		t.Errorf("fpMap size = %d, want 1 — the cap must drop new keys", n)
+	}
+}
+
+// TestRecordFingerprint_EmptyJA3SkipsTrafficMapButWritesIpMap pins
+// RecordFingerprint's original external behavior: an empty ja3 with a
+// valid ja4+ip still writes the (ja4, ip) join row — only the
+// (ja3, ja4, outcome) traffic map requires ja3. No test previously called
+// RecordFingerprint with an empty ja3, which is how a refactor regression
+// here went uncaught; this test exists specifically to catch it again.
+func TestRecordFingerprint_EmptyJA3SkipsTrafficMapButWritesIpMap(t *testing.T) {
+	a := newTestAppWithFP(10, 10)
+	a.RecordFingerprint("", "t13d1516h2_8daaf6152771_b0da82dd1658", "203.0.113.7")
+
+	a.fpMu.Lock()
+	nfp, nip := len(a.fpMap), len(a.fpIpMap)
+	a.fpMu.Unlock()
+	if nfp != 0 {
+		t.Errorf("fpMap size = %d, want 0 (empty ja3 must skip the traffic row)", nfp)
+	}
+	if nip != 1 {
+		t.Errorf("fpIpMap size = %d, want 1 (empty ja3 must NOT skip the ip-map row)", nip)
+	}
+}

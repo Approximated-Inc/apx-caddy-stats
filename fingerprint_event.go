@@ -16,6 +16,10 @@ const (
 	// v1 (D1) — connections reaching this recorder were allowed; block
 	// routes close blocked connections upstream. Mirrors L4IpOutcomeAllowed.
 	FingerprintOutcomeAllowed = "allowed"
+
+	// EmptyJA3Sentinel marks a fingerprint row recorded without a JA3, i.e.
+	// observed on the caddytls connection-policy path rather than at layer 4.
+	EmptyJA3Sentinel = "__no_ja3__"
 )
 
 // fingerprintKey is the natural identity of an aggregated fingerprint

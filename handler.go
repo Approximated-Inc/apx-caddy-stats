@@ -2,12 +2,14 @@ package apxstats
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -21,6 +23,13 @@ import (
 type StatsHandler struct {
 	logger *zap.Logger
 	app    AppRef
+
+	// ja4Reg is the fingerprint handoff registry this handler's accept hook
+	// installs holders into. Resolved once by ja4Registry() — under a Once
+	// because a caddyhttp.Server runs one accept goroutine PER LISTENER, so
+	// ja4ConnContext has concurrent callers from the very first connection.
+	ja4Reg     *ja4Registry
+	ja4RegOnce sync.Once
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -36,19 +45,101 @@ func (*StatsHandler) CaddyModule() caddy.ModuleInfo {
 // silently drop counters, which is worse than a clear startup error.
 func (h *StatsHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
-	if h.app != nil {
-		return nil
+	// h.app already set = test injection; skip the lookup but still wire the
+	// accept hook so the handoff path is exercised the same way.
+	if h.app == nil {
+		app, err := ctx.App("apx_stats")
+		if err != nil {
+			return fmt.Errorf("apx_stats handler requires apx_stats app: %w", err)
+		}
+		sa, ok := app.(*StatsApp)
+		if !ok {
+			return fmt.Errorf("apx_stats handler: unexpected app type %T", app)
+		}
+		h.app = sa
 	}
-	app, err := ctx.App("apx_stats")
-	if err != nil {
-		return fmt.Errorf("apx_stats handler requires apx_stats app: %w", err)
+
+	// Install a fingerprint holder on every accepted connection. The JA4
+	// matcher runs later, on the caddytls handshake path, and fills the holder
+	// by remote address — see ja4_handoff.go. Absent a server on the context
+	// (Caddyfile-less embedding, tests) request correlation is simply off; the
+	// matcher still records.
+	//
+	// Register ONLY on servers that actually carry the matcher. Without one,
+	// no holder can ever be filled, yet each accepted connection would still
+	// allocate a holder, take the registry mutex, and churn an eviction out of
+	// a permanently-full LRU. This module ships to the whole fleet flag-off,
+	// so an unconditional hook would make the image bump alone change
+	// accept-path behavior everywhere — see serverHasJA4Matcher.
+	if srv, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && srv != nil {
+		if !serverHasJA4Matcher(srv) {
+			if h.logger != nil {
+				h.logger.Debug("apx_stats: no apx_ja4 connection policy on this server; JA4 request correlation disabled")
+			}
+			return nil
+		}
+		h.ja4Registry() // resolve here, single-threaded, before any accept
+		srv.RegisterConnContext(h.ja4ConnContext)
+	} else if h.logger != nil {
+		h.logger.Debug("apx_stats: no caddyhttp server on context; JA4 request correlation disabled")
 	}
-	sa, ok := app.(*StatsApp)
-	if !ok {
-		return fmt.Errorf("apx_stats handler: unexpected app type %T", app)
-	}
-	h.app = sa
 	return nil
+}
+
+// serverHasJA4Matcher reports whether any of this server's connection policies
+// carries the apx_ja4 handshake matcher — i.e. whether a fingerprint can ever
+// reach a holder installed on this server's connections. A server terminating
+// no TLS has no policies and so answers false, which also covers the plain :80
+// redirect server.
+//
+// MatchersRaw is the JSON-decoded `match` object and is populated well before
+// this runs: caddyhttp provisions routes (app.go:346) — which is what
+// provisions this handler — before it provisions TLSConnPolicies (app.go:372),
+// and only the latter turns MatchersRaw into loaded matcher modules. So the
+// raw map is readable here even though p.matchers is still empty.
+func serverHasJA4Matcher(srv *caddyhttp.Server) bool {
+	for _, p := range srv.TLSConnPolicies {
+		if p == nil {
+			continue
+		}
+		if _, ok := p.MatchersRaw[ja4MatcherModuleKey]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ja4Registry resolves the handoff registry. Production handlers hold the
+// concrete *StatsApp and share its process-wide registry; tests inject an
+// AppRef stub, in which case we keep a handler-local one so the hook is still
+// exercised. Resolved once — the matcher and the accept hook must agree on the
+// same registry or every handoff misses.
+func (h *StatsHandler) ja4Registry() *ja4Registry {
+	h.ja4RegOnce.Do(func() {
+		if sa, ok := h.app.(*StatsApp); ok && sa != nil {
+			h.ja4Reg = sa.JA4Registry()
+		} else {
+			h.ja4Reg = newJA4Registry(ja4RegistryMaxEntries)
+		}
+	})
+	return h.ja4Reg
+}
+
+// ja4ConnContext is the net/http ConnContext hook: it registers a holder for
+// the connection's remote address and stashes it on the connection context, so
+// every request served over that connection can read the fingerprint the TLS
+// matcher computed. Unaddressable conns pass through untouched.
+func (h *StatsHandler) ja4ConnContext(cctx context.Context, c net.Conn) context.Context {
+	if c == nil {
+		return cctx
+	}
+	ap, ok := normalizeAddrPort(c.RemoteAddr())
+	if !ok {
+		return cctx
+	}
+	holder := &ja4Holder{}
+	h.ja4Registry().put(ap, holder)
+	return ja4WithContext(cctx, holder)
 }
 
 // UnmarshalCaddyfile parses an empty block. The handler takes no config
@@ -99,6 +190,15 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
 	modeV2 := h.app.RequestEventsModeV2()
+
+	// JA4 for this connection, as computed by the TLS handshake matcher.
+	// Staged on the recorder rather than written to a row: this plan is
+	// record-only, and adding a ja4 column is a ClickHouse migration plus an
+	// ingest change that ships with the Client Classification work. The
+	// recorder is where buildRequestEventRow will read it from when it does.
+	// "" is the normal state — no matcher configured, non-TLS, or a
+	// connection whose registry entry was evicted.
+	w.ja4 = ja4FromContext(r.Context())
 
 	// Challenge attempts record independently of vhost_id (see the original
 	// comment): a served challenge is terminal so vhost_id is unset. Read
@@ -609,6 +709,11 @@ type recorder struct {
 	bytes    int
 	wrote    bool
 	hijacked bool
+
+	// ja4 is the connection's TLS fingerprint, staged by record() from the
+	// connection context. Nothing consumes it yet — see record(). Written
+	// after the response is finished, so it never races the write path.
+	ja4 string
 }
 
 func (r *recorder) WriteHeader(code int) {

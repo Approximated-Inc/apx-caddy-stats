@@ -312,6 +312,15 @@ type StatsApp struct {
 	// Provision. Gates the handler's disposition/host/unsampled-served path.
 	reqEventsModeV2 bool
 
+	// ja4Registry hands a per-connection fingerprint holder from the HTTP
+	// server's accept hook to the TLS handshake matcher. One per process,
+	// shared by every JA4Matcher and the StatsHandler — the matcher runs on
+	// the caddytls path, outside any handler chain, so an address-keyed
+	// registry is the only way it can reach the holder the accept side
+	// installed.
+	ja4Registry     *ja4Registry
+	ja4RegistryOnce sync.Once
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -488,6 +497,13 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	}
 	a.stopCh = make(chan struct{})
 
+	// JA4 handoff registry. Built through the accessor so ja4RegistryOnce is
+	// the single authority on when the field is written. Assigning directly
+	// here would be safe only because caddy happens to provision apps before
+	// anything can call JA4Registry() — ordering enforced by caddy rather
+	// than by a lock, which -race cannot verify.
+	a.JA4Registry()
+
 	// Publish this app to the global Coraza audit-log writer. The writer
 	// is registered by a package init() with no app handle, so it loads
 	// the live app from here. Set last, after all state is initialized.
@@ -603,6 +619,23 @@ func (a *StatsApp) MachineID() string { return a.MachineIDValue }
 // RequestEventsModeV2 reports whether the request_events track is in
 // mode_v2. Resolved at Provision (G5 wiring); false by default.
 func (a *StatsApp) RequestEventsModeV2() bool { return a.reqEventsModeV2 }
+
+// ja4RegistryMaxEntries bounds the JA4 handoff registry. Entries are created
+// on accept and removed on handshake, so the live set is the in-flight
+// handshake count; anything beyond this is a connection that never reached the
+// matcher, and evicting it costs exactly one fingerprint.
+const ja4RegistryMaxEntries = 4096
+
+// JA4Registry returns the per-handshake fingerprint handoff registry, creating
+// it on first use so tests that construct StatsApp directly still work.
+func (a *StatsApp) JA4Registry() *ja4Registry {
+	a.ja4RegistryOnce.Do(func() {
+		if a.ja4Registry == nil {
+			a.ja4Registry = newJA4Registry(ja4RegistryMaxEntries)
+		}
+	})
+	return a.ja4Registry
+}
 
 // Test-only accessors. The counters / uniques maps are sharded for
 // contention reduction; tests want to peek at aggregate state without
@@ -1050,14 +1083,13 @@ func (a *StatsApp) RecordL4Ip(ip, sni string) {
 	}
 }
 
-// RecordFingerprint counts one accepted L4 TLS connection into both
-// fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
-// connection from the FingerprintHandler hot path.
+// recordFingerprintMaps writes the (ja3, ja4, outcome) and (ja4, ip) rows.
+// ja3 may be the empty-JA3 sentinel when the caller has no JA3 available.
 //
-// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja3/ja4
-// or ip are dropped per-map. Caps are enforced at insert; new keys past
-// the cap are dropped + counted in the overflow metric (NO sentinel row).
-func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
+// Outcome is always FingerprintOutcomeAllowed in v1 (D1). Empty ja3/ja4 or
+// ip are dropped per-map. Caps are enforced at insert; new keys past the
+// cap are dropped + counted in the overflow metric (NO sentinel row).
+func (a *StatsApp) recordFingerprintMaps(ja3, ja4, ip string) {
 	tsMin := timeNowUnixMin()
 
 	// --- (ja3, ja4, outcome) traffic map ---
@@ -1099,6 +1131,31 @@ func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
 		}
 		a.fpMu.Unlock()
 	}
+}
+
+// RecordFingerprint counts one accepted L4 TLS connection into both
+// fingerprint maps: (ja3, ja4, outcome) and (ja4, ip). Called per
+// connection from the FingerprintHandler hot path.
+//
+// An empty ja3 skips the traffic-map write (that map's identity requires a
+// JA3) but not the ip-map write, which only needs ja4 — see
+// recordFingerprintMaps.
+func (a *StatsApp) RecordFingerprint(ja3, ja4, ip string) {
+	if ja4 == "" {
+		return
+	}
+	a.recordFingerprintMaps(ja3, ja4, ip)
+}
+
+// RecordJA4 records an observation with no JA3 — the caddytls path cannot
+// produce one, because crypto/tls does not expose the legacy client version or
+// compression methods. The JA3 column carries EmptyJA3Sentinel so these rows
+// are distinguishable downstream from genuine JA3+JA4 observations.
+func (a *StatsApp) RecordJA4(ja4, ip string) {
+	if ja4 == "" {
+		return
+	}
+	a.recordFingerprintMaps(EmptyJA3Sentinel, ja4, ip)
 }
 
 // maybeLogL4IpOverflow throttles per-IP overflow log lines — only one
