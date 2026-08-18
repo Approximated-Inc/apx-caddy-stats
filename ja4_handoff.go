@@ -103,14 +103,19 @@ func newJA4Registry(max int) *ja4Registry {
 //
 // LIMITATION, inherent to keying on ip:port: if the kernel hands the same
 // ephemeral port to a second connection before the first one's handshake
-// reaches fill(), this overwrite redirects the first connection's fingerprint
-// to the second connection's holder — the first request then reads "". The
-// window is one handshake wide and the failure mode is a missing fingerprint,
-// never a wrong one attributed to a different connection's REQUEST (the holder
-// that receives the value is the one the live connection reads from). Callers
-// must already treat "" as normal, so this needs no extra handling; the fix,
-// if it ever matters, is to key on the *net.Conn identity rather than its
-// address, which caddytls does not expose to a ConnectionMatcher.
+// reaches fill(), this overwrite redirects the map entry to the second
+// connection's holder. When the first connection's fill() then runs, it finds
+// the entry pointing at the SECOND connection's holder and writes the first
+// connection's fingerprint into it — first-write-wins means that value sticks.
+// The first connection's own holder is never touched, so its request reads ""
+// (missing, the normal/expected case). The second connection's later fill()
+// finds the entry already removed and no-ops, so its request reads the FIRST
+// connection's fingerprint — a wrong value misattributed to it, not merely a
+// missing one. The window is one handshake wide (requires actual ephemeral
+// port reuse before fill() runs, which needs sustained connection churn to
+// hit) and there is no code-level fix available today: it would require
+// keying on the *net.Conn identity rather than its address, which caddytls
+// does not expose to a ConnectionMatcher.
 func (r *ja4Registry) put(key netip.AddrPort, h *ja4Holder) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
