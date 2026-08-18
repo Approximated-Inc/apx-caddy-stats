@@ -13,12 +13,28 @@ import (
 // the L4 path for the same handshake. That equivalence is asserted against the
 // FoxIO corpus in ja4_clienthello_test.go.
 //
-// LegacyVersion is deliberately left zero: ja4Version consults it only when
-// SupportedVersions carries no non-GREASE entry, and crypto/tls always
-// populates SupportedVersions (falling back to supportedVersionsFromMax when
-// the extension is absent). The tls12_alpn_h2 FoxIO vector is the regression
-// test for that omission — it has no supported_versions extension yet still
-// fingerprints as "t12d", proving the stdlib fallback fires.
+// LegacyVersion is left zero because *tls.ClientHelloInfo does not expose the
+// ClientHello's legacy_version at all — irreducible information loss in the
+// stdlib API, not a mapping choice. When the supported_versions extension is
+// absent, crypto/tls synthesizes SupportedVersions via
+// supportedVersionsFromMax(legacy) (handshake_server.go clientHelloInfo), which
+// keeps only {0x0304,0x0303,0x0302,0x0301} entries <= legacy. So
+// SupportedVersions is populated for legacy >= 0x0301 and comes back EMPTY
+// below it.
+//
+// That leaves a bounded parity gap against the L4 path, which does carry
+// LegacyVersion. For a hello with no supported_versions extension:
+//
+//	legacy 0x0300 (SSLv3): L4 "s3" vs here "00"
+//	legacy 0x0002 (SSLv2): L4 "s2" vs here "00"
+//	legacy  > 0x0304:      L4 "00" vs here "13"
+//
+// The 0x0301–0x0304 range — every ClientHello that can actually complete a
+// handshake — agrees exactly, and Go rejects the divergent ones right after
+// GetConfigForClient returns, so JA4_a codes "s3"/"s2" are unreachable here.
+// Pinned by TestJA4FromClientHello_legacyVersionDivergence; the tls12_alpn_h2
+// FoxIO vector covers the in-range fallback (no supported_versions ext, still
+// fingerprints "t12d").
 func ja4FromClientHello(hello *tls.ClientHelloInfo) string {
 	if hello == nil {
 		return ""
@@ -54,10 +70,22 @@ func containsUint16(haystack []uint16, needle uint16) bool {
 	return false
 }
 
-// ja4Transport returns the JA4_a leading character. quic-go populates
-// hello.Conn on the QUIC path, so LocalAddr().Network() distinguishes the
-// transport; extension 0x0039 (quic_transport_parameters) corroborates and
-// covers the case where Conn is absent.
+// ja4Transport returns the JA4_a leading character.
+//
+// Extension 0x0039 (quic_transport_parameters, RFC 9001) is the branch that
+// actually fires on the QUIC path: crypto/tls builds a QUIC server with
+// Server(nil, cfg) (quic.go QUICServer) and then sets Conn: c.conn, so
+// hello.Conn is NIL under QUIC and the LocalAddr().Network() check never runs
+// there. That check is kept only as a corroborating fallback for transports
+// that do supply a Conn — do not mistake it for the primary QUIC signal.
+//
+// Two known limits, both bounded:
+//   - Draft QUIC used extension 0xffa5 rather than 0x0039; such a hello is
+//     classified 't'. Only pre-RFC-9001 clients are affected.
+//   - A TCP hello that carries 0x0039 yields "q…" here while the L4 path always
+//     yields "t…" (it never sets Transport). RFC 9001 §8.2 forbids that
+//     extension outside QUIC, so this is a spec violation by the client, but it
+//     is a real second parity gap alongside the LegacyVersion one above.
 func ja4Transport(hello *tls.ClientHelloInfo) byte {
 	if hello.Conn != nil {
 		if la := hello.Conn.LocalAddr(); la != nil {
