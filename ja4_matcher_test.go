@@ -3,6 +3,7 @@ package apxstats
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -198,8 +199,10 @@ func TestJA4Matcher_recordsIPFromConn(t *testing.T) {
 }
 
 func TestJA4Matcher_noConnStillRecords(t *testing.T) {
-	// QUIC delivers a nil hello.Conn. The fingerprint must still be recorded,
-	// just without an IP, and the matcher must not panic.
+	// A nil hello.Conn is an unusual embedding rather than a transport — both
+	// crypto/tls (TCP) and quic-go (QUIC, via an injected stub conn) populate
+	// it. Whatever produces one, the fingerprint must still be recorded, just
+	// without an IP, and the matcher must not panic.
 	app := newTestAppWithFP(10, 10)
 	m := &JA4Matcher{app: app, registry: newJA4Registry(8)}
 	if err := m.compile(); err != nil {
@@ -339,8 +342,19 @@ func connContextFuncCount(srv *caddyhttp.Server) int {
 	return reflect.ValueOf(srv).Elem().FieldByName("connContextFuncs").Len()
 }
 
+// ja4Policy builds a connection policy carrying the apx_ja4 matcher, in the
+// shape caddy's JSON decode produces before ConnectionPolicies.Provision loads
+// the matcher modules.
+func ja4Policy() *caddytls.ConnectionPolicy {
+	return &caddytls.ConnectionPolicy{
+		MatchersRaw: caddy.ModuleMap{ja4MatcherModuleKey: json.RawMessage(`{}`)},
+	}
+}
+
 func TestStatsHandler_ProvisionRegistersConnContext(t *testing.T) {
-	srv := &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{}}}
+	// Registration is gated on the matcher being present, so the policy has to
+	// carry it — a bare policy is the flag-off fleet case, covered below.
+	srv := &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{ja4Policy(), {}}}
 	ctx := caddy.Context{Context: context.WithValue(context.Background(), caddyhttp.ServerCtxKey, srv)}
 
 	h := &StatsHandler{app: &fakeApp{}}
@@ -350,6 +364,57 @@ func TestStatsHandler_ProvisionRegistersConnContext(t *testing.T) {
 
 	if n := connContextFuncCount(srv); n != 1 {
 		t.Errorf("connContextFuncs = %d, want 1", n)
+	}
+}
+
+func TestStatsHandler_ProvisionSkipsServerWithoutMatcher(t *testing.T) {
+	// The flag-off fleet case: a TLS-terminating server whose policies carry
+	// no apx_ja4 matcher. Nothing can ever fill a holder there, so the accept
+	// path must stay untouched — the image bump alone must not change it.
+	srv := &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{}}}
+	ctx := caddy.Context{Context: context.WithValue(context.Background(), caddyhttp.ServerCtxKey, srv)}
+
+	h := &StatsHandler{app: &fakeApp{}}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	if n := connContextFuncCount(srv); n != 0 {
+		t.Errorf("connContextFuncs = %d without an apx_ja4 policy, want 0", n)
+	}
+}
+
+func TestServerHasJA4Matcher(t *testing.T) {
+	tests := []struct {
+		name string
+		srv  *caddyhttp.Server
+		want bool
+	}{
+		{"no policies", new(caddyhttp.Server), false},
+		{"catch-all only", &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{}}}, false},
+		{"matcher policy first", &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{ja4Policy(), {}}}, true},
+		{"matcher policy last", &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{}, ja4Policy()}}, true},
+		{"nil policy entry is skipped", &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{nil, ja4Policy()}}, true},
+		{"a different matcher does not count", &caddyhttp.Server{TLSConnPolicies: caddytls.ConnectionPolicies{{
+			MatchersRaw: caddy.ModuleMap{"sni": json.RawMessage(`["example.com"]`)},
+		}}}, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serverHasJA4Matcher(tc.srv); got != tc.want {
+				t.Errorf("serverHasJA4Matcher = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ja4MatcherModuleKey must stay the last segment of the module ID, or the
+// accept-path gate silently stops recognizing its own matcher.
+func TestJA4MatcherModuleKeyMatchesModuleID(t *testing.T) {
+	id := string((&JA4Matcher{}).CaddyModule().ID)
+	if want := "tls.handshake_match." + ja4MatcherModuleKey; id != want {
+		t.Errorf("module ID = %q, want %q", id, want)
 	}
 }
 
@@ -399,6 +464,112 @@ func TestStatsHandler_recordStagesJA4FromContext(t *testing.T) {
 
 	if w.ja4 != "t13d1516h2_aaaabbbbcccc_ddddeeeeffff" {
 		t.Errorf("record() staged ja4 = %q, want the filled value", w.ja4)
+	}
+}
+
+// --- Record: suppressing the duplicate write on L4 clusters ---
+
+func TestJA4Matcher_recordFalseSkipsRecording(t *testing.T) {
+	// On an l4_enabled cluster the FingerprintHandler already records this
+	// exact handshake. fpIpMap is keyed (ja4, ip) on both paths, so recording
+	// here too would double connection_count.
+	app := newTestAppWithFP(10, 10)
+	no := false
+	m := &JA4Matcher{Record: &no, app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	hello := testHello()
+	hello.Conn = newJA4TestConn("203.0.113.9:52003")
+	_ = m.Match(hello)
+
+	if len(app.fpMap) != 0 || len(app.fpIpMap) != 0 {
+		t.Errorf("record:false still recorded: fpMap=%d fpIpMap=%d", len(app.fpMap), len(app.fpIpMap))
+	}
+}
+
+func TestJA4Matcher_recordFalseStillHandsOff(t *testing.T) {
+	// Suppressing the duplicate recording must NOT suppress the handoff: the
+	// L4 recorder cannot reach the HTTP request context, so this is the only
+	// path that puts a fingerprint on the request.
+	app := newTestAppWithFP(10, 10)
+	reg := newJA4Registry(8)
+	no := false
+	m := &JA4Matcher{Record: &no, app: app, registry: reg}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	conn := newJA4TestConn("203.0.113.9:52004")
+	key, ok := normalizeAddrPort(conn.RemoteAddr())
+	if !ok {
+		t.Fatal("normalizeAddrPort failed for the test conn")
+	}
+	holder := &ja4Holder{}
+	reg.put(key, holder)
+
+	hello := testHello()
+	hello.Conn = conn
+	want := ja4FromClientHello(hello)
+	_ = m.Match(hello)
+
+	if got := holder.get(); got != want {
+		t.Errorf("holder = %q, want %q — the handoff must survive record:false", got, want)
+	}
+}
+
+func TestJA4Matcher_recordFalseStillBlocklists(t *testing.T) {
+	// Record is about duplicate rows, not about matching.
+	app := newTestAppWithFP(10, 10)
+	hello := testHello()
+	no := false
+	m := &JA4Matcher{Blocklist: []string{ja4FromClientHello(hello)}, Record: &no, app: app, registry: newJA4Registry(8)}
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !m.Match(hello) {
+		t.Error("record:false suppressed a blocklist match")
+	}
+}
+
+func TestJA4Matcher_recordDefaultsOn(t *testing.T) {
+	// An absent `record` key must RECORD. Defaulting to off would make a
+	// cluster that omits the field silently produce no fingerprint rows.
+	var m JA4Matcher
+	if err := json.Unmarshal([]byte(`{}`), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !m.recordEnabled() {
+		t.Error("recordEnabled() = false for a config with no `record` key, want true")
+	}
+
+	app := newTestAppWithFP(10, 10)
+	m.app, m.registry = app, newJA4Registry(8)
+	if err := m.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	_ = m.Match(testHello())
+	if len(app.fpMap) == 0 {
+		t.Error("default config did not record")
+	}
+}
+
+func TestJA4Matcher_recordRoundTripsThroughJSON(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  string
+		want bool
+	}{
+		{`{"record":true}`, true},
+		{`{"record":false}`, false},
+	} {
+		var m JA4Matcher
+		if err := json.Unmarshal([]byte(tc.cfg), &m); err != nil {
+			t.Fatalf("unmarshal %s: %v", tc.cfg, err)
+		}
+		if got := m.recordEnabled(); got != tc.want {
+			t.Errorf("%s: recordEnabled() = %v, want %v", tc.cfg, got, tc.want)
+		}
 	}
 }
 

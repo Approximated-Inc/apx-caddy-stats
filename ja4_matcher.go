@@ -35,15 +35,35 @@ type JA4Matcher struct {
 	// never matches — record-only mode.
 	Blocklist []string `json:"blocklist,omitempty"`
 
+	// Record controls whether Match writes the fingerprint to the app's
+	// fingerprint maps. Set it FALSE on clusters where the layer-4
+	// FingerprintHandler is already recording: both paths see the same
+	// handshake and fpIpMap is keyed (ja4, ip) on both, so leaving them both
+	// on doubles connection_count and burns two fpMap keys per fingerprint
+	// against one shared cap.
+	//
+	// nil (absent from config) means RECORD. Defaulting to off would make a
+	// cluster that omits the field silently stop producing the very rows this
+	// module exists for; double counting is the cheaper failure.
+	//
+	// This never gates the handoff to the request context — that happens on
+	// every handshake regardless, because the L4 recorder cannot supply it.
+	Record *bool `json:"record,omitempty"`
+
 	set      map[string]struct{}
 	app      *StatsApp
 	registry *ja4Registry
 	logger   *zap.Logger
 }
 
+// ja4MatcherModuleKey is this matcher's key within a connection policy's
+// `match` object — the last segment of the module ID, which is how
+// caddy.ModuleMap names entries in the tls.handshake_match namespace.
+const ja4MatcherModuleKey = "apx_ja4"
+
 func (*JA4Matcher) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "tls.handshake_match.apx_ja4",
+		ID:  caddy.ModuleID("tls.handshake_match." + ja4MatcherModuleKey),
 		New: func() caddy.Module { return new(JA4Matcher) },
 	}
 }
@@ -73,9 +93,16 @@ func (m *JA4Matcher) Provision(ctx caddy.Context) error {
 		// an empty set is record-only and can never select this policy.
 		m.logger.Info("apx_ja4 matcher provisioned",
 			zap.Int("blocklist_size", len(m.set)),
-			zap.Bool("record_only", len(m.set) == 0))
+			zap.Bool("record_only", len(m.set) == 0),
+			zap.Bool("record", m.recordEnabled()))
 	}
 	return nil
+}
+
+// recordEnabled reports whether Match should record into the fingerprint maps.
+// See the Record field: absent config means yes.
+func (m *JA4Matcher) recordEnabled() bool {
+	return m.Record == nil || *m.Record
 }
 
 // compile builds the blocklist lookup set.
@@ -100,18 +127,23 @@ func (m *JA4Matcher) Match(hello *tls.ClientHelloInfo) bool {
 		return false
 	}
 
-	if m.app != nil {
-		var ip string
-		// hello.Conn is nil on the QUIC path (crypto/tls builds the QUIC
-		// server with a nil conn), so no IP and no handoff there.
-		if hello.Conn != nil {
-			if ap, ok := normalizeAddrPort(hello.Conn.RemoteAddr()); ok {
-				ip = ap.Addr().String()
-				if m.registry != nil {
-					m.registry.fill(ap, ja4)
-				}
+	var ip string
+	// hello.Conn is populated on BOTH transports: crypto/tls sets it for TLS
+	// over TCP, and quic-go injects a stub conn carrying the real UDP
+	// addresses before delegating to GetConfigForClient (see ja4Transport).
+	// A nil Conn is therefore an unusual embedding, not the QUIC path.
+	if hello.Conn != nil {
+		if ap, ok := normalizeAddrPort(hello.Conn.RemoteAddr()); ok {
+			ip = ap.Addr().String()
+			// The handoff runs even when Record is off: the L4 recorder
+			// records but cannot reach the HTTP request context, so this is
+			// the only path that puts a fingerprint on the request.
+			if m.registry != nil {
+				m.registry.fill(ap, ja4)
 			}
 		}
+	}
+	if m.app != nil && m.recordEnabled() {
 		m.app.RecordJA4(ja4, ip)
 	}
 

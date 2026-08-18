@@ -65,17 +65,16 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 	// (Caddyfile-less embedding, tests) request correlation is simply off; the
 	// matcher still records.
 	//
-	// Skip servers that terminate no TLS. Their connections can never reach
-	// the matcher, so every holder they register would sit in the registry
-	// until evicted — a plain :80 redirect server would otherwise churn the
-	// LRU and push out entries belonging to live handshakes. TLSConnPolicies
-	// is populated from config before route provisioning (caddyhttp/app.go
-	// provisions routes at :346, policies only at :372), so len() is readable
-	// here even though the policies themselves aren't provisioned yet.
+	// Register ONLY on servers that actually carry the matcher. Without one,
+	// no holder can ever be filled, yet each accepted connection would still
+	// allocate a holder, take the registry mutex, and churn an eviction out of
+	// a permanently-full LRU. This module ships to the whole fleet flag-off,
+	// so an unconditional hook would make the image bump alone change
+	// accept-path behavior everywhere — see serverHasJA4Matcher.
 	if srv, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && srv != nil {
-		if len(srv.TLSConnPolicies) == 0 {
+		if !serverHasJA4Matcher(srv) {
 			if h.logger != nil {
-				h.logger.Debug("apx_stats: server terminates no TLS; JA4 request correlation disabled")
+				h.logger.Debug("apx_stats: no apx_ja4 connection policy on this server; JA4 request correlation disabled")
 			}
 			return nil
 		}
@@ -85,6 +84,29 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 		h.logger.Debug("apx_stats: no caddyhttp server on context; JA4 request correlation disabled")
 	}
 	return nil
+}
+
+// serverHasJA4Matcher reports whether any of this server's connection policies
+// carries the apx_ja4 handshake matcher — i.e. whether a fingerprint can ever
+// reach a holder installed on this server's connections. A server terminating
+// no TLS has no policies and so answers false, which also covers the plain :80
+// redirect server.
+//
+// MatchersRaw is the JSON-decoded `match` object and is populated well before
+// this runs: caddyhttp provisions routes (app.go:346) — which is what
+// provisions this handler — before it provisions TLSConnPolicies (app.go:372),
+// and only the latter turns MatchersRaw into loaded matcher modules. So the
+// raw map is readable here even though p.matchers is still empty.
+func serverHasJA4Matcher(srv *caddyhttp.Server) bool {
+	for _, p := range srv.TLSConnPolicies {
+		if p == nil {
+			continue
+		}
+		if _, ok := p.MatchersRaw[ja4MatcherModuleKey]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ja4Registry resolves the handoff registry. Production handlers hold the

@@ -103,14 +103,39 @@ func TestJA4FromClientHello_nilIsEmpty(t *testing.T) {
 }
 
 // TestJA4Transport covers the JA4_a leading character without needing a QUIC
-// stack. hello.Conn is nil under QUIC (see ja4Transport's comment), so the
-// ext-0x0039 branch is the one that matters in production.
+// stack. In production the LocalAddr().Network() branch is the primary signal —
+// quic-go injects a stub conn carrying the real *net.UDPAddr before caddytls's
+// GetConfigForClient runs (see ja4Transport's comment) — and the ext-0x0039
+// branch corroborates it. Both are exercised here; both yield 'q'.
 func TestJA4Transport(t *testing.T) {
+	udpConn := &ja4TestConn{
+		local:  &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 443},
+		remote: &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 52000},
+	}
+
 	tests := []struct {
 		name  string
 		hello *tls.ClientHelloInfo
 		want  byte
 	}{
+		{
+			name:  "udp LocalAddr yields q with no quic extension",
+			hello: &tls.ClientHelloInfo{Conn: udpConn, Extensions: []uint16{0x0000, 0x002b}},
+			want:  'q',
+		},
+		{
+			name:  "udp LocalAddr and the quic extension agree on q",
+			hello: &tls.ClientHelloInfo{Conn: udpConn, Extensions: []uint16{0x0039}},
+			want:  'q',
+		},
+		{
+			name: "tcp LocalAddr yields t",
+			hello: &tls.ClientHelloInfo{
+				Conn:       newJA4TestConn("203.0.113.9:52000"),
+				Extensions: []uint16{0x0000, 0x002b},
+			},
+			want: 't',
+		},
 		{
 			name:  "quic_transport_parameters ext yields q",
 			hello: &tls.ClientHelloInfo{Extensions: []uint16{0x0039}},

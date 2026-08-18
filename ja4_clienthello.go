@@ -72,12 +72,18 @@ func containsUint16(haystack []uint16, needle uint16) bool {
 
 // ja4Transport returns the JA4_a leading character.
 //
-// Extension 0x0039 (quic_transport_parameters, RFC 9001) is the branch that
-// actually fires on the QUIC path: crypto/tls builds a QUIC server with
-// Server(nil, cfg) (quic.go QUICServer) and then sets Conn: c.conn, so
-// hello.Conn is NIL under QUIC and the LocalAddr().Network() check never runs
-// there. That check is kept only as a corroborating fallback for transports
-// that do supply a Conn — do not mistake it for the primary QUIC signal.
+// LocalAddr().Network() is the PRIMARY QUIC signal. caddytls runs connection
+// matchers from GetConfigForClient (connpolicy.go:143), and quic-go explicitly
+// chains that callback and injects a stub conn carrying the real addresses
+// before delegating — "since crypto/tls doesn't do it, we need to make sure to
+// set the Conn field with a fake net.Conn that allows the caller to get the
+// local and the remote address" (quic-go internal/handshake/tls_config.go
+// setupConfigForServer; the stub is internal/handshake/fake_conn.go). Those
+// addresses are the listener's *net.UDPAddr, so Network() reports "udp" and
+// this branch fires on every HTTP/3 handshake.
+//
+// The 0x0039 (quic_transport_parameters, RFC 9001) check below is the
+// CORROBORATING FALLBACK, for a QUIC stack that does not populate Conn.
 //
 // Two known limits, both bounded:
 //   - Draft QUIC used extension 0xffa5 rather than 0x0039; such a hello is
