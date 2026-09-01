@@ -973,3 +973,14 @@ func TestRecorder_103ThroughReverseProxyPreservesFinalStatus(t *testing.T) {
 		t.Fatalf("recorder.status: want 500, got %d", got.status)
 	}
 }
+
+// 101 Switching Protocols is a final status in Go's HTTP stack (the
+// WebSocket upgrade path), not an informational one — the 1xx-passthrough
+// guard must not swallow it.
+func TestRecorder_101SwitchingProtocolsIsFinal(t *testing.T) {
+	rec := &recorder{ResponseWriter: httptest.NewRecorder(), status: 200}
+	rec.WriteHeader(http.StatusSwitchingProtocols)
+	if rec.status != http.StatusSwitchingProtocols || !rec.wrote {
+		t.Fatalf("101 must finalize: got status=%d wrote=%v", rec.status, rec.wrote)
+	}
+}

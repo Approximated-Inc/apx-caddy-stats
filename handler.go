@@ -615,9 +615,10 @@ func (r *recorder) WriteHeader(code int) {
 	if r.wrote {
 		return
 	}
-	// 1xx (e.g. 103 Early Hints forwarded by reverse_proxy) is informational:
-	// pass it through and keep waiting for the final status.
-	if 100 <= code && code <= 199 {
+	// 1xx other than 101 Switching Protocols (which is final) is
+	// informational — e.g. 103 Early Hints forwarded by reverse_proxy: pass
+	// it through and keep waiting for the final status.
+	if 100 <= code && code <= 199 && code != http.StatusSwitchingProtocols {
 		r.ResponseWriter.WriteHeader(code)
 		return
 	}
