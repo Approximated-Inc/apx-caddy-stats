@@ -615,6 +615,12 @@ func (r *recorder) WriteHeader(code int) {
 	if r.wrote {
 		return
 	}
+	// 1xx (e.g. 103 Early Hints forwarded by reverse_proxy) is informational:
+	// pass it through and keep waiting for the final status.
+	if 100 <= code && code <= 199 {
+		r.ResponseWriter.WriteHeader(code)
+		return
+	}
 	r.status = code
 	r.wrote = true
 	r.ResponseWriter.WriteHeader(code)

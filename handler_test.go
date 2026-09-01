@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -906,4 +908,68 @@ func TestServeHTTP_V2NoChallengeNoVhost_DoesNotLog(t *testing.T) {
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandler(404)))
 	require.Empty(t, app.reqEventSnapshot())
+}
+
+// A 103 Early Hints forwarded by reverse_proxy must not finalize the
+// response: the later real status has to reach the client and the stats row.
+func TestRecorder_103EarlyHintsDoesNotFinalizeStatus(t *testing.T) {
+	var got *recorder
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &recorder{ResponseWriter: w, status: 200}
+		rec.Header().Set("Link", "</x.css>; rel=preload; as=style")
+		rec.WriteHeader(http.StatusEarlyHints)
+		rec.Header().Set("Location", "/login")
+		rec.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = rec.Write(nil)
+		got = rec
+	}))
+	defer srv.Close()
+
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("client status: want 307, got %d", res.StatusCode)
+	}
+	if res.Header.Get("Location") != "/login" {
+		t.Fatalf("Location lost: %q", res.Header.Get("Location"))
+	}
+	if got.status != http.StatusTemporaryRedirect || !got.wrote {
+		t.Fatalf("recorder: want status=307 wrote=true, got status=%d wrote=%v", got.status, got.wrote)
+	}
+}
+
+// Same thing through a real reverse proxy (Go's httputil forwards 1xx the
+// same way Caddy's reverse_proxy does), with a 500 to show it is not
+// redirect-specific.
+func TestRecorder_103ThroughReverseProxyPreservesFinalStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	rp := httputil.NewSingleHostReverseProxy(u)
+
+	var got *recorder
+	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &recorder{ResponseWriter: w, status: 200}
+		rp.ServeHTTP(rec, r)
+		got = rec
+	}))
+	defer edge.Close()
+
+	res, err := http.Get(edge.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("client status: want 500, got %d", res.StatusCode)
+	}
+	if got.status != http.StatusInternalServerError {
+		t.Fatalf("recorder.status: want 500, got %d", got.status)
+	}
 }
