@@ -32,13 +32,21 @@ func (LatencySelection) CaddyModule() caddy.ModuleInfo {
 // Select returns the lowest-scoring available upstream, or nil if none is
 // available (in which case Caddy's own no-upstream handling applies).
 func (LatencySelection) Select(pool reverseproxy.UpstreamPool, _ *http.Request, _ http.ResponseWriter) *reverseproxy.Upstream {
-	return lbSelectLowest(pool, func(u *reverseproxy.Upstream) bool { return u.Available() })
+	return lbSelectLowest(pool,
+		func(u *reverseproxy.Upstream) bool { return u.Available() },
+		func(u *reverseproxy.Upstream) int { return u.NumRequests() },
+	)
 }
 
-// lbSelectLowest carries the scoring logic with availability injected, so
-// the unavailable-upstream case is testable from outside the reverseproxy
-// package.
-func lbSelectLowest(pool reverseproxy.UpstreamPool, available func(*reverseproxy.Upstream) bool) *reverseproxy.Upstream {
+// lbSelectLowest carries the scoring logic with availability and in-flight
+// request count both injected, so both are testable from outside the
+// reverseproxy package. Caddy tracks both through unexported state: health
+// via setHealthy/countFail/the unhealthy atomic, in-flight count via the
+// unexported countRequest (hosts.go) — only the read side, NumRequests, is
+// exported. A test in this package has no other way to construct an
+// upstream that is unhealthy or mid-request, so do not "simplify" this back
+// to calling u.Available()/u.NumRequests() directly.
+func lbSelectLowest(pool reverseproxy.UpstreamPool, available func(*reverseproxy.Upstream) bool, inflight func(*reverseproxy.Upstream) int) *reverseproxy.Upstream {
 	var best *reverseproxy.Upstream
 	var bestScore float64
 
@@ -50,7 +58,7 @@ func lbSelectLowest(pool reverseproxy.UpstreamPool, available func(*reverseproxy
 		// first available entry — exactly the "first" policy's behaviour,
 		// which is what these vhosts do today.
 		ewma, _ := lbScore(up.Dial)
-		score := ewma * float64(up.NumRequests()+1)
+		score := ewma * float64(inflight(up)+1)
 
 		if best == nil || score < bestScore {
 			best, bestScore = up, score
