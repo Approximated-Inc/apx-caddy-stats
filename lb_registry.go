@@ -68,6 +68,11 @@ func lbRecord(dial string, d time.Duration) {
 
 	e, ok := lbEntries[dial]
 	if !ok {
+		// A never-seen dial is the only event that grows the map, so it is
+		// the natural moment to drop stale entries. New dials are rare in
+		// steady state (config changes), so the O(n) sweep stays off the
+		// per-request path.
+		lbEvictLocked()
 		lbEntries[dial] = &lbEntry{ewma: float64(d), lastSeen: lbNow()}
 		return
 	}
@@ -96,7 +101,11 @@ func lbScore(dial string) (float64, bool) {
 func lbEvict() {
 	lbMu.Lock()
 	defer lbMu.Unlock()
+	lbEvictLocked()
+}
 
+// lbEvictLocked is lbEvict for callers already holding lbMu.
+func lbEvictLocked() {
 	cutoff := lbNow().Add(-lbEvictAfter)
 	for dial, e := range lbEntries {
 		if e.lastSeen.Before(cutoff) {

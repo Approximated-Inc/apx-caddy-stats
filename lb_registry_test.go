@@ -122,3 +122,33 @@ func TestLBRecordFoldsAgainstDecayedStoredValue(t *testing.T) {
 		t.Fatalf("stale exile should have decayed away before folding in the new sample: got %v (>= 100ms)", score)
 	}
 }
+
+func TestLBRecordNewDialEvictsStaleEntries(t *testing.T) {
+	clock := time.Unix(0, 0)
+	withLBClock(t, &clock)
+
+	lbRecord("stale:1", 100*time.Millisecond)
+	clock = clock.Add(lbEvictAfter + time.Second)
+	lbRecord("fresh:1", 100*time.Millisecond) // new dial triggers the sweep
+
+	if _, known := lbScore("stale:1"); known {
+		t.Fatal("inserting a new dial must evict entries past lbEvictAfter")
+	}
+	if _, known := lbScore("fresh:1"); !known {
+		t.Fatal("the newly inserted dial must survive its own sweep")
+	}
+}
+
+func TestLBRecordExistingDialDoesNotEvict(t *testing.T) {
+	clock := time.Unix(0, 0)
+	withLBClock(t, &clock)
+
+	lbRecord("stale:1", 100*time.Millisecond)
+	lbRecord("hot:1", 100*time.Millisecond)
+	clock = clock.Add(lbEvictAfter + time.Second)
+	lbRecord("hot:1", 100*time.Millisecond) // existing dial: no sweep on the hot path
+
+	if _, known := lbScore("stale:1"); !known {
+		t.Fatal("updating an existing dial must not sweep — that would put O(n) on every request")
+	}
+}
