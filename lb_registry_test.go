@@ -69,11 +69,18 @@ func TestLBEvictDropsStaleEntries(t *testing.T) {
 	withLBClock(t, &clock)
 
 	lbRecord("a:1", 100*time.Millisecond)
+	lbRecord("b:1", 100*time.Millisecond)
 	clock = clock.Add(lbEvictAfter + time.Second)
+	// Touch only b:1 so it is fresh at eviction time. An lbEvict that wiped
+	// the whole map would still drop a:1 but must not pass this test.
+	lbRecord("b:1", 100*time.Millisecond)
 	lbEvict()
 
 	if _, known := lbScore("a:1"); known {
 		t.Fatal("stale entry should have been evicted")
+	}
+	if _, known := lbScore("b:1"); !known {
+		t.Fatal("recently touched entry must survive eviction")
 	}
 }
 
@@ -83,9 +90,16 @@ func TestLBRecordIgnoresNonPositiveAndEmpty(t *testing.T) {
 
 	lbRecord("", 100*time.Millisecond)
 	lbRecord("a:1", 0)
+	lbRecord("b:1", -time.Millisecond)
 
+	if _, known := lbScore(""); known {
+		t.Fatal("empty dial must not create an entry")
+	}
 	if _, known := lbScore("a:1"); known {
 		t.Fatal("zero duration must not create an entry")
+	}
+	if _, known := lbScore("b:1"); known {
+		t.Fatal("negative duration must not create an entry")
 	}
 }
 

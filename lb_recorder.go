@@ -12,6 +12,12 @@ func init() {
 	caddy.RegisterModule(LatencyRecorder{})
 }
 
+// lbErrorPenalty is the floor folded in for a served 502/503/504. Caddy sets
+// upstream.latency after any completed round-trip, error statuses included,
+// so without it an origin fast-failing at 2ms would score as the best
+// upstream. A floor, not a replacement: a 504 that took 8s records 8s.
+const lbErrorPenalty = 5 * time.Second
+
 // LatencyRecorder wraps the reverse_proxy handler and folds the upstream
 // round-trip Caddy has already measured into the latency registry. It adds
 // no measurement of its own: Caddy sets both replacer variables during
@@ -62,8 +68,29 @@ func (LatencyRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		return err
 	}
 
+	if lbGatewayError(repl) && d < lbErrorPenalty {
+		d = lbErrorPenalty
+	}
+
 	lbRecord(hostport, d)
 	return err
+}
+
+// lbGatewayError reports whether the response just relayed was a 502, 503
+// or 504. Caddy sets status_code on the same round-trip that sets
+// upstream.latency, so the two always describe the same attempt.
+func lbGatewayError(repl *caddy.Replacer) bool {
+	raw, ok := repl.Get("http.reverse_proxy.status_code")
+	if !ok {
+		return false
+	}
+	code, ok := raw.(int)
+	if !ok {
+		return false
+	}
+	return code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout
 }
 
 var _ caddyhttp.MiddlewareHandler = (*LatencyRecorder)(nil)

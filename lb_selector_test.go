@@ -53,7 +53,9 @@ func TestLBSelectReturnsLeastBadWhenAllSlow(t *testing.T) {
 	lbRecord("a:443", 9*time.Second)
 	lbRecord("b:443", 10*time.Second)
 
-	got := LatencySelection{}.Select(lbPool("a:443", "b:443"), nil, nil)
+	// b:443 is listed first so a stub returning the first available
+	// upstream would fail: the least-bad one has to win on score.
+	got := LatencySelection{}.Select(lbPool("b:443", "a:443"), nil, nil)
 	if got == nil {
 		t.Fatal("must never return nil while an upstream is available")
 	}
