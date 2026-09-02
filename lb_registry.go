@@ -44,6 +44,20 @@ func lbReset() {
 	lbEntries = map[string]*lbEntry{}
 }
 
+// lbDecayed returns e's EWMA decayed toward 0 (optimistic) for however long
+// it has sat unsampled as of at. This is the single definition of "what
+// this upstream's score is right now" — both lbScore's read path and
+// lbRecord's write path go through it, so a fold always blends the new
+// sample against the same value a concurrent read would see, not a stale
+// undecayed one.
+func lbDecayed(e *lbEntry, at time.Time) float64 {
+	idle := at.Sub(e.lastSeen)
+	if idle <= 0 {
+		return e.ewma
+	}
+	return e.ewma * math.Pow(0.5, float64(idle)/float64(lbDecayHalfLife))
+}
+
 // lbRecord folds one observed upstream round-trip into its EWMA.
 func lbRecord(dial string, d time.Duration) {
 	if dial == "" || d <= 0 {
@@ -57,8 +71,9 @@ func lbRecord(dial string, d time.Duration) {
 		lbEntries[dial] = &lbEntry{ewma: float64(d), lastSeen: lbNow()}
 		return
 	}
-	e.ewma = lbAlpha*float64(d) + (1-lbAlpha)*e.ewma
-	e.lastSeen = lbNow()
+	now := lbNow()
+	e.ewma = lbAlpha*float64(d) + (1-lbAlpha)*lbDecayed(e, now)
+	e.lastSeen = now
 }
 
 // lbScore returns the decayed EWMA in nanoseconds and whether this
@@ -73,11 +88,7 @@ func lbScore(dial string) (float64, bool) {
 	if !ok {
 		return 0, false
 	}
-	idle := lbNow().Sub(e.lastSeen)
-	if idle <= 0 {
-		return e.ewma, true
-	}
-	return e.ewma * math.Pow(0.5, float64(idle)/float64(lbDecayHalfLife)), true
+	return lbDecayed(e, lbNow()), true
 }
 
 // lbEvict drops entries untouched for longer than lbEvictAfter so the map

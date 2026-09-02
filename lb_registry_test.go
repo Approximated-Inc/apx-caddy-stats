@@ -88,3 +88,23 @@ func TestLBRecordIgnoresNonPositiveAndEmpty(t *testing.T) {
 		t.Fatal("zero duration must not create an entry")
 	}
 }
+
+// A regression test for a bug where lbRecord folded new samples into the
+// *undecayed* stored EWMA, so decay only ever showed up in lbScore's read
+// path, not in what got written back. That let one bad sample (e.g. a
+// timeout) exile an upstream for ~20 recovery cycles instead of the single
+// good sample decay is supposed to allow once the exile itself has decayed
+// away.
+func TestLBRecordFoldsAgainstDecayedStoredValue(t *testing.T) {
+	clock := time.Unix(0, 0)
+	withLBClock(t, &clock)
+
+	lbRecord("a:1", 6*time.Second)
+	clock = clock.Add(10 * lbDecayHalfLife)
+	lbRecord("a:1", 50*time.Millisecond)
+
+	score, _ := lbScore("a:1")
+	if score >= float64(100*time.Millisecond) {
+		t.Fatalf("stale exile should have decayed away before folding in the new sample: got %v (>= 100ms)", score)
+	}
+}
