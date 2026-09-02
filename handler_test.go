@@ -844,6 +844,29 @@ func TestServeHTTP_V2RecordsBlockedRequestEventWithDisposition(t *testing.T) {
 	require.NotZero(t, evs[0].MachineSeq)
 }
 
+func TestServeHTTP_V2RowCarriesResolvedMachineID(t *testing.T) {
+	// End-to-end over the REAL app: config placeholder → Provision →
+	// the row the recorder buffers. Regression guard for the fleet-wide bug
+	// where every row shipped the literal "{env.FLY_MACHINE_ID}".
+	t.Setenv("FLY_MACHINE_ID", "148e394f7e9218")
+	a, err := provisionApp(t, &IngestConfig{
+		URL:           "http://unused",
+		AuthToken:     "cfg-token",
+		RequestEvents: &RequestEventsConfig{Enabled: true, ModeV2: true, MaxRows: 100},
+	}, withMachineID("{env.FLY_MACHINE_ID}"))
+	require.NoError(t, err)
+
+	h := &StatsHandler{app: a}
+	r := newRequestWithReplacer("GET", "/", "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(200)))
+
+	rows, _ := a.requestEvents.drain()
+	require.Len(t, rows, 1)
+	require.True(t, rows[0].V2)
+	require.Equal(t, "148e394f7e9218", rows[0].MachineID)
+}
+
 func TestServeHTTP_V2RecordsRateLimitedDisposition(t *testing.T) {
 	app := &fakeApp{modeV2: true}
 	h := &StatsHandler{app: app}

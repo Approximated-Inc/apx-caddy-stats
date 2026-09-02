@@ -49,8 +49,9 @@ type AppRef interface {
 	HashSalt() string
 	// ProxyServerID returns the cluster id this Caddy instance serves.
 	ProxyServerID() uint32
-	// MachineID returns the emitting machine's identifier (app MachineID
-	// config), stamped on mode_v2 request_event rows. May be "".
+	// MachineID returns the emitting machine's identifier (the app's
+	// machine_id config with placeholders expanded at Provision), stamped
+	// on mode_v2 request_event rows. May be "".
 	MachineID() string
 	// RequestEventsModeV2 reports whether the request_events track runs in
 	// mode_v2 (unsampled served rows, blocked/challenge rows logged with a
@@ -176,9 +177,15 @@ type StatsApp struct {
 	// instance serves. Required.
 	ProxyServerIDValue uint32 `json:"proxy_server_id"`
 
-	// MachineID identifies which Caddy machine in the cluster this is.
-	// Currently unused by the wire format (the app server tags by sender);
-	// kept here for log/metric labels.
+	// MachineIDValue identifies which Caddy machine in the cluster this is.
+	// Stamped on every mode_v2 request_event row (and used for log/metric
+	// labels).
+	//
+	// MAY CONTAIN A CADDY PLACEHOLDER: the control plane emits
+	// `{env.FLY_MACHINE_ID}` here. Caddy does NOT expand placeholders in
+	// arbitrary module config fields — a module has to run them through a
+	// replacer itself — so read the RESOLVED value via MachineID() (see
+	// resolveMachineID, called from Provision), never this field directly.
 	MachineIDValue string `json:"machine_id,omitempty"`
 
 	// HashSaltValue is the per-deployment salt for hashing client
@@ -197,10 +204,11 @@ type StatsApp struct {
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
 
-	logger   *zap.Logger
-	secret   string
-	hashSalt string
-	client   *http.Client
+	logger    *zap.Logger
+	secret    string
+	hashSalt  string
+	machineID string // MachineIDValue with placeholders expanded (Provision)
+	client    *http.Client
 
 	cfg ingestRuntime // resolved from Ingest with defaults applied
 
@@ -399,7 +407,21 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	// Hash salt comes from the config blob directly (not an env var) so
 	// the operator can rotate it by regenerating Caddy config. Optional —
 	// empty disables unique-clients tracking without crashing Caddy.
+	// NOT run through the replacer: the salt is opaque secret material the
+	// control plane inlines verbatim, and expanding it would silently
+	// rewrite (and so rotate) any salt that happened to contain braces.
 	a.hashSalt = a.HashSaltValue
+
+	// machine_id is the one config field the control plane stamps a Caddy
+	// placeholder into (`{env.FLY_MACHINE_ID}`). Resolve it ONCE here — it
+	// is read per request on the request_event hot path. Never fatal: a
+	// machine without the env var logs rows with an empty machine id
+	// rather than refusing to serve.
+	a.machineID = resolveMachineID(a.MachineIDValue)
+	if a.MachineIDValue != "" && a.machineID == "" {
+		a.logger.Warn("apx_stats: machine_id resolved to empty",
+			zap.String("configured", a.MachineIDValue))
+	}
 
 	a.cfg = ingestRuntime{
 		url:                a.Ingest.URL,
@@ -597,8 +619,41 @@ func (a *StatsApp) Stop() error {
 // ProxyServerID exposes the cluster id to handlers.
 func (a *StatsApp) ProxyServerID() uint32 { return a.ProxyServerIDValue }
 
-// MachineID exposes the configured machine identifier to handlers. May be "".
-func (a *StatsApp) MachineID() string { return a.MachineIDValue }
+// MachineID exposes the machine identifier to handlers, with any Caddy
+// placeholder in the configured value already expanded by Provision. May
+// be "" (unset, or an env var that isn't present on this machine).
+func (a *StatsApp) MachineID() string { return a.machineID }
+
+// resolveMachineID expands Caddy placeholders in a configured machine_id.
+//
+// Caddy does not expand placeholders in arbitrary module config fields —
+// a module must run them through a replacer itself. Without this, the
+// control plane's `{env.FLY_MACHINE_ID}` was stored and shipped as that
+// literal string on every mode_v2 request_event row, killing per-machine
+// attribution fleet-wide.
+//
+// ReplaceAll (not ReplaceKnown) so an UNRECOGNIZED placeholder collapses
+// to "" instead of surviving as literal text. `{env.X}` is always
+// "recognized" by Caddy's global replacer — an absent env var yields "",
+// which is the intended fallback: self-hosted nodes have no
+// FLY_MACHINE_ID, the wire field is omitempty, and millions of existing
+// rows already carry "". A missing machine id must never fail Provision
+// and take a proxy down.
+//
+// The brace check is belt-and-braces against this whole class of bug
+// returning silently: anything that still looks like an unexpanded
+// placeholder (escaped braces, say, which the replacer deliberately
+// leaves as literal text) is normalised to "" rather than shipped.
+func resolveMachineID(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	v := caddy.NewReplacer().ReplaceAll(raw, "")
+	if strings.Contains(v, "{") && strings.Contains(v, "}") {
+		return ""
+	}
+	return v
+}
 
 // RequestEventsModeV2 reports whether the request_events track is in
 // mode_v2. Resolved at Provision (G5 wiring); false by default.
