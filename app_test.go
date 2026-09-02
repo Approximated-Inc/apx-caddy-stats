@@ -594,13 +594,69 @@ func TestProvisionLike_NoRequestEventsRecorderWhenAbsentOrDisabled(t *testing.T)
 // provisionApp runs the real Provision against a bare caddy.Context
 // (nil cfg → dev logger). Unlike newTestApp, this exercises the actual
 // secret-resolution path. Cleans up the corazaApp global that Provision
-// publishes.
-func provisionApp(t *testing.T, ingest *IngestConfig) (*StatsApp, error) {
+// publishes. opts mutate the app BEFORE Provision (config fields).
+func provisionApp(t *testing.T, ingest *IngestConfig, opts ...func(*StatsApp)) (*StatsApp, error) {
 	t.Helper()
 	a := &StatsApp{ProxyServerIDValue: 42, Ingest: ingest}
+	for _, opt := range opts {
+		opt(a)
+	}
 	err := a.Provision(caddy.Context{Context: context.Background()})
 	t.Cleanup(func() { corazaApp.CompareAndSwap(a, nil) })
 	return a, err
+}
+
+// withMachineID sets the raw machine_id config field pre-Provision.
+func withMachineID(v string) func(*StatsApp) {
+	return func(a *StatsApp) { a.MachineIDValue = v }
+}
+
+func TestProvision_MachineIDResolvesEnvPlaceholder(t *testing.T) {
+	// The control plane stamps `{env.FLY_MACHINE_ID}`; Caddy does not expand
+	// module config placeholders on its own, so Provision must.
+	t.Setenv("FLY_MACHINE_ID", "148e394f7e9218")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"},
+		withMachineID("{env.FLY_MACHINE_ID}"))
+	require.NoError(t, err)
+	require.Equal(t, "148e394f7e9218", a.MachineID())
+}
+
+func TestProvision_MachineIDEmptyWhenEnvUnset(t *testing.T) {
+	// Self-hosted nodes have no FLY_MACHINE_ID. Empty (not the literal
+	// placeholder, not an error) is the back-compatible fallback.
+	t.Setenv("FLY_MACHINE_ID", "")
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"},
+		withMachineID("{env.FLY_MACHINE_ID}"))
+	require.NoError(t, err, "a missing machine id must never fail Provision")
+	require.Equal(t, "", a.MachineID())
+}
+
+func TestProvision_MachineIDLiteralPassesThrough(t *testing.T) {
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"},
+		withMachineID("mach-1"))
+	require.NoError(t, err)
+	require.Equal(t, "mach-1", a.MachineID())
+
+	b, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"})
+	require.NoError(t, err)
+	require.Equal(t, "", b.MachineID(), "unset machine_id stays empty")
+}
+
+func TestProvision_MachineIDUnresolvedPlaceholderNormalizedToEmpty(t *testing.T) {
+	// Escaped braces are left as literal text by the replacer. Anything
+	// still shaped like a placeholder is dropped rather than shipped on
+	// every request_event row — this bug class must not return silently.
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"},
+		withMachineID(`\{env.FLY_MACHINE_ID\}`))
+	require.NoError(t, err)
+	require.Equal(t, "", a.MachineID())
+}
+
+func TestProvision_MachineIDUnknownPlaceholderCollapsesToEmpty(t *testing.T) {
+	a, err := provisionApp(t, &IngestConfig{URL: "http://unused", AuthToken: "cfg-token"},
+		withMachineID("{not.a.real.placeholder}"))
+	require.NoError(t, err)
+	require.Equal(t, "", a.MachineID())
 }
 
 func TestProvision_AuthTokenFromConfig(t *testing.T) {
