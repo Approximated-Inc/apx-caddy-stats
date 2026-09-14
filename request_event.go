@@ -38,13 +38,15 @@ type requestEventRow struct {
 	// monotonic counter. Disposition is exactly one of the seven disp*
 	// constants. Host is the lowercased, port-stripped Host header (capped
 	// 255B), empty when VhostID>0 to save bytes. V2 gates both the extra
-	// wire fields and the disposition-aware sampling.
-	TsUnixMs    int64
-	MachineID   string
-	MachineSeq  uint64
-	Disposition string
-	Host        string
-	V2          bool
+	// wire fields and the disposition-aware sampling. UpstreamFailureReason
+	// is a bounded category for a final pre-response proxy failure, or empty.
+	TsUnixMs              int64
+	MachineID             string
+	MachineSeq            uint64
+	Disposition           string
+	Host                  string
+	UpstreamFailureReason string
+	V2                    bool
 }
 
 // encodeRequestEventRow writes one NDJSON line for a raw request_event row.
@@ -55,6 +57,7 @@ type requestEventRow struct {
 // When row.V2 is set, five more fields are appended after sample_rate:
 // ts_ms, machine_id, machine_seq, disposition, host. This keeps the
 // legacy prefix byte-identical for non-v2 rows (old configs / old ingest).
+// Failed v2 rows additionally append upstream_failure_reason after host.
 //
 // ts is second-precision RFC3339 (formatTsSec). String fields go through
 // writeString so arbitrary-byte values (path, ua) are JSON-escaped.
@@ -113,6 +116,10 @@ func encodeRequestEventRow(w *gzip.Writer, ps uint32, row requestEventRow) error
 		writeString(&b, "disposition", row.Disposition)
 		b.WriteByte(',')
 		writeString(&b, "host", row.Host)
+		if row.UpstreamFailureReason != "" {
+			b.WriteByte(',')
+			writeString(&b, "upstream_failure_reason", row.UpstreamFailureReason)
+		}
 	}
 	b.WriteString("}\n")
 	_, err := w.Write([]byte(b.String()))

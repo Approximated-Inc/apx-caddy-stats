@@ -55,8 +55,9 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 // today — all knobs live on the app.
 func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
 
-// ServeHTTP records one row's worth of stats per request. Hot path is
-// designed to avoid allocations beyond the wrapper struct.
+// ServeHTTP records one row's worth of stats per request. The hot path
+// keeps legacy-mode allocation behavior; v2 logs also capture bounded
+// connection-stage evidence for upstream failure classification.
 //
 // Approximated's own URL monitor probes carry an `apx-monitor: true`
 // request header. We don't record those — they're our health-check
@@ -79,6 +80,11 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}
 
 	start := time.Now()
+	if h.app.RequestEventsModeV2() {
+		var failureTrace *upstreamFailureTrace
+		r, failureTrace = withUpstreamFailureTrace(r)
+		defer failureTrace.close()
+	}
 
 	wrapped := &recorder{ResponseWriter: w, status: 200}
 	servErr := next.ServeHTTP(wrapped, r)
@@ -221,27 +227,28 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
 	return requestEventRow{
-		TsUnixSec:   uint32(now.Unix()),
-		TsUnixMs:    now.UnixMilli(),
-		VhostID:     vhostID,
-		ClientIP:    securityClientIP(r),
-		ForwardedIP: forwardedIP(r),
-		FrontProxy:  frontProxy(r),
-		Method:      methodOrUnknown(r.Method),
-		Path:        capPath(r.URL.Path),
-		PathBucket:  pathBucket(r.URL.Path),
-		Status:      finalStatus(w, servErr),
-		HTTPVersion: httpVersionOrUnknown(r),
-		UA:          capUA(r.UserAgent()),
-		Origin:      origin,
-		BytesIn:     requestBytes(r),
-		BytesOut:    responseBytes(w),
-		DurationUs:  uint64(dur.Microseconds()),
-		MachineID:   truncateBytes(h.app.MachineID(), 64),
-		MachineSeq:  nextMachineSeq(),
-		Disposition: disposition,
-		Host:        host,
-		V2:          true,
+		TsUnixSec:             uint32(now.Unix()),
+		TsUnixMs:              now.UnixMilli(),
+		VhostID:               vhostID,
+		ClientIP:              securityClientIP(r),
+		ForwardedIP:           forwardedIP(r),
+		FrontProxy:            frontProxy(r),
+		Method:                methodOrUnknown(r.Method),
+		Path:                  capPath(r.URL.Path),
+		PathBucket:            pathBucket(r.URL.Path),
+		Status:                finalStatus(w, servErr),
+		HTTPVersion:           httpVersionOrUnknown(r),
+		UA:                    capUA(r.UserAgent()),
+		Origin:                origin,
+		UpstreamFailureReason: upstreamFailureReason(r, w, servErr, origin),
+		BytesIn:               requestBytes(r),
+		BytesOut:              responseBytes(w),
+		DurationUs:            uint64(dur.Microseconds()),
+		MachineID:             truncateBytes(h.app.MachineID(), 64),
+		MachineSeq:            nextMachineSeq(),
+		Disposition:           disposition,
+		Host:                  host,
+		V2:                    true,
 	}
 }
 
@@ -423,6 +430,9 @@ func classifyOrigin(repl *caddy.Replacer, servErr error, blockReason string) str
 	if blockReason != "" {
 		return OriginClusterBlocked
 	}
+	if noAvailableUpstreams(servErr) {
+		return OriginClusterProxyError
+	}
 
 	upstream := ""
 	if repl != nil {
@@ -432,6 +442,12 @@ func classifyOrigin(repl *caddy.Replacer, servErr error, blockReason string) str
 		return OriginCluster
 	}
 	if servErr != nil && isHandlerError(servErr) {
+		if retriedUpstreamResponse(servErr) {
+			return OriginUpstream
+		}
+		if localResponseHandlerError(repl, servErr) {
+			return OriginCluster
+		}
 		return OriginClusterProxyError
 	}
 	return OriginUpstream
