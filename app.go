@@ -264,6 +264,11 @@ type StatsApp struct {
 	l4IpOverflowLogMu    sync.Mutex          // throttles per-IP overflow log
 	l4IpOverflowLoggedAt time.Time
 
+	// Configured L4 close matches have a separate bounded track.
+	l4BlockMu       sync.Mutex
+	l4Blocks        map[l4BlockKey]uint64
+	l4BlockOverflow uint64
+
 	// Challenge attempts. Counter map keyed by (vhost, ip, outcome) — the
 	// PoW-challenge handler sets an `apx_challenge_outcome` request var and
 	// the StatsHandler records one increment per request that carries it.
@@ -1453,6 +1458,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	challengeSnap := a.challengeSnapshot()
 	edgeVerifySnap := a.edgeVerifySnapshot()
 	flushTs := uint32(time.Now().Unix() / 60)
+	l4BlockSnap := a.l4BlockSnapshot(flushTs)
 
 	// request_events: flat drain. reqEventOverflow is observability-only here
 	// (no breaker — the recorder samples under load on its own).
@@ -1471,6 +1477,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("l4_ip_uniques_raw_rows", len(l4IpSnap.sampled)),
 			zap.Int("l4_ip_prefix_rows", len(l4IpSnap.prefix)),
 			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)),
+			zap.Int("l4_block_rows", len(l4BlockSnap)),
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
 			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
@@ -1484,7 +1491,7 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
 		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 {
+		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 {
 		return
 	}
 
@@ -1492,10 +1499,10 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
 		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows)
+		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1616,7 +1623,7 @@ func isPermanent(err error) bool {
 // (ts/proxy_server_id/vhost_id) key fields. Histogram buckets are
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
-func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow) ([]byte, error) {
+func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1698,6 +1705,13 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 	for _, row := range reqEventRows {
 		if err := encodeRequestEventRow(gz, proxyServerID, row); err != nil {
 			return nil, err
+		}
+	}
+	for _, blocks := range blockSnapshots {
+		for key, count := range blocks {
+			if err := encodeL4BlockRow(gz, proxyServerID, key, count); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := gz.Close(); err != nil {
