@@ -18,5 +18,6 @@ import (
 func init() {
 	caddy.RegisterModule(&StatsHandler{})
 	caddy.RegisterModule(&L4Handler{})
+	caddy.RegisterModule(&L4BlockHandler{})
 	caddy.RegisterModule(&FingerprintHandler{})
 }
