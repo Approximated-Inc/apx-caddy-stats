@@ -6,6 +6,16 @@ No permission is granted to use, copy, modify, merge, publish, distribute,
 sublicense, or sell copies of this software or any associated files without
 prior written permission from the copyright holder.
 
+## Request correlation
+
+With request events enabled in `mode_v2`, `request_id` contains Caddy's
+per-request UUID from `{http.request.uuid}`. The control plane sets
+`X-Apx-Request-Id` to the same placeholder in the reverse proxy's upstream
+request headers, replacing client-supplied values. The ID stays the same
+across proxy retries; separate incoming requests receive separate IDs.
+The stats handler reads Caddy's replacer, never the inbound header.
+Legacy event payloads are unchanged.
+
 ## L4 block telemetry
 
 `layer4.handlers.apx_l4_block_stats` records a configured close-rule match.

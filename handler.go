@@ -248,8 +248,21 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		MachineSeq:            nextMachineSeq(),
 		Disposition:           disposition,
 		Host:                  host,
+		RequestID:             readRequestID(repl),
 		V2:                    true,
 	}
+}
+
+// readRequestID uses the same lazy, per-request Caddy UUID as the upstream
+// X-Apx-Request-Id header. Never fall back to the inbound, client-controlled
+// header: reverse_proxy applies its header override to a request clone.
+func readRequestID(repl *caddy.Replacer) string {
+	if repl == nil {
+		return ""
+	}
+	value, _ := repl.Get("http.request.uuid")
+	id, _ := value.(string)
+	return id
 }
 
 // clientIP returns the best-guess client IP for hashing purposes. Prefers

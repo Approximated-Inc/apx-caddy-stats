@@ -155,6 +155,7 @@ func TestEncodeBatch_RequestEventsStrictUTF8(t *testing.T) {
 			want["machine_seq"] = float64(2)
 			want["disposition"] = "served"
 			want["host"] = "sentinel.invalid"
+			want["request_id"] = ""
 			want["ua"] = "sentinel café\ufffd \"\\\t\n東京 \ufffd\ufffd 🚀"
 		}
 		require.Equal(t, want, got, "row %d", i)
