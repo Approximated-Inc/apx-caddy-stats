@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -1987,32 +1988,9 @@ func needsJSONEscape(s string) bool {
 // fast-path string writer handles >99% of inputs without taking this
 // path, so the per-call cost is fine for the rare exotic header value.
 func jsonEscape(s string) string {
-	// Inlined minimal escaping. Avoids importing encoding/json just for
-	// the slow path — keeps dependencies tight. Handles control chars,
-	// quotes, backslashes; non-ASCII passes through (ECMA-404 allows it).
-	var out strings.Builder
-	out.Grow(len(s) + 2)
-	out.WriteByte('"')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"' || c == '\\':
-			out.WriteByte('\\')
-			out.WriteByte(c)
-		case c == '\n':
-			out.WriteString(`\n`)
-		case c == '\r':
-			out.WriteString(`\r`)
-		case c == '\t':
-			out.WriteString(`\t`)
-		case c < 0x20:
-			fmt.Fprintf(&out, `\u%04x`, c)
-		default:
-			out.WriteByte(c)
-		}
-	}
-	out.WriteByte('"')
-	return out.String()
+	// Marshaling a string cannot fail; invalid UTF-8 bytes become U+FFFD.
+	encoded, _ := json.Marshal(s)
+	return string(encoded)
 }
 
 // firstNonEmpty returns the first non-empty string in args, or "".
