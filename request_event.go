@@ -40,11 +40,13 @@ type requestEventRow struct {
 	// 255B), empty when VhostID>0 to save bytes. V2 gates both the extra
 	// wire fields and the disposition-aware sampling. UpstreamFailureReason
 	// is a bounded category for a final pre-response proxy failure, or empty.
+	// RequestID is Caddy's per-request UUID, shared with the upstream header.
 	TsUnixMs              int64
 	MachineID             string
 	MachineSeq            uint64
 	Disposition           string
 	Host                  string
+	RequestID             string
 	UpstreamFailureReason string
 	V2                    bool
 }
@@ -54,10 +56,10 @@ type requestEventRow struct {
 //
 //	{"_type":"request_event","ts":"...","proxy_server_id":N,"vhost_id":N,"client_ip":"...","forwarded_ip":"...","front_proxy":"...","method":"...","path":"...","path_bucket":"...","status":N,"http_version":"...","ua":"...","origin":"...","bytes_in":N,"bytes_out":N,"duration_us":N,"sample_rate":N}
 //
-// When row.V2 is set, five more fields are appended after sample_rate:
-// ts_ms, machine_id, machine_seq, disposition, host. This keeps the
+// When row.V2 is set, six more fields are appended after sample_rate:
+// ts_ms, machine_id, machine_seq, disposition, host, request_id. This keeps the
 // legacy prefix byte-identical for non-v2 rows (old configs / old ingest).
-// Failed v2 rows additionally append upstream_failure_reason after host.
+// Failed v2 rows additionally append upstream_failure_reason after request_id.
 //
 // ts is second-precision RFC3339 (formatTsSec). String fields go through
 // writeString so arbitrary-byte values (path, ua) are JSON-escaped.
@@ -116,6 +118,8 @@ func encodeRequestEventRow(w *gzip.Writer, ps uint32, row requestEventRow) error
 		writeString(&b, "disposition", row.Disposition)
 		b.WriteByte(',')
 		writeString(&b, "host", row.Host)
+		b.WriteByte(',')
+		writeString(&b, "request_id", row.RequestID)
 		if row.UpstreamFailureReason != "" {
 			b.WriteByte(',')
 			writeString(&b, "upstream_failure_reason", row.UpstreamFailureReason)

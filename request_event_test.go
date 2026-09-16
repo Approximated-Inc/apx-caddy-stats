@@ -113,6 +113,7 @@ func TestEncodeRequestEventRow_V2_ExactNDJSON(t *testing.T) {
 		MachineSeq:  99,
 		Disposition: dispChallengeIssued,
 		Host:        "example.com",
+		RequestID:   "86aac198-bbb7-4bc3-b057-a57ee272a981",
 		V2:          true,
 	}
 	require.NoError(t, encodeRequestEventRow(gz, 42, row))
@@ -126,7 +127,7 @@ func TestEncodeRequestEventRow_V2_ExactNDJSON(t *testing.T) {
 
 	// V2 appends the new fields after sample_rate; the legacy prefix is
 	// byte-identical to the non-v2 line.
-	want := `{"_type":"request_event","ts":"2023-11-14T22:13:20Z","proxy_server_id":42,"vhost_id":0,"client_ip":"203.0.113.7","forwarded_ip":"198.51.100.9","front_proxy":"cloudflare","method":"GET","path":"/login","path_bucket":"/login","status":403,"http_version":"HTTP/2.0","ua":"curl/8.0","origin":"cluster","bytes_in":512,"bytes_out":4096,"duration_us":12345,"sample_rate":1,"ts_ms":1700000000123,"machine_id":"mach-abc","machine_seq":99,"disposition":"challenge_issued","host":"example.com"}` + "\n"
+	want := `{"_type":"request_event","ts":"2023-11-14T22:13:20Z","proxy_server_id":42,"vhost_id":0,"client_ip":"203.0.113.7","forwarded_ip":"198.51.100.9","front_proxy":"cloudflare","method":"GET","path":"/login","path_bucket":"/login","status":403,"http_version":"HTTP/2.0","ua":"curl/8.0","origin":"cluster","bytes_in":512,"bytes_out":4096,"duration_us":12345,"sample_rate":1,"ts_ms":1700000000123,"machine_id":"mach-abc","machine_seq":99,"disposition":"challenge_issued","host":"example.com","request_id":"86aac198-bbb7-4bc3-b057-a57ee272a981"}` + "\n"
 	require.Equal(t, want, string(line))
 
 	var got map[string]any
@@ -144,7 +145,7 @@ func TestEncodeRequestEventRow_NonV2_OmitsNewFields(t *testing.T) {
 	require.NoError(t, encodeRequestEventRow(gz, 1, requestEventRow{
 		TsUnixSec: 1_700_000_000, VhostID: 7, Status: 200, SampleRate: 1,
 		// New fields populated but V2 is false → must NOT be emitted.
-		TsUnixMs: 123, MachineID: "x", MachineSeq: 5, Disposition: dispServed, Host: "h",
+		TsUnixMs: 123, MachineID: "x", MachineSeq: 5, Disposition: dispServed, Host: "h", RequestID: "86aac198-bbb7-4bc3-b057-a57ee272a981",
 	}))
 	require.NoError(t, gz.Close())
 	gzr, err := gzip.NewReader(&buf)
@@ -155,7 +156,7 @@ func TestEncodeRequestEventRow_NonV2_OmitsNewFields(t *testing.T) {
 
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(line[:len(line)-1], &got))
-	for _, k := range []string{"ts_ms", "machine_id", "machine_seq", "disposition", "host"} {
+	for _, k := range []string{"ts_ms", "machine_id", "machine_seq", "disposition", "host", "request_id"} {
 		_, present := got[k]
 		require.False(t, present, "non-v2 row must not carry %q", k)
 	}
