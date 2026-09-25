@@ -724,6 +724,26 @@ func TestServeHTTP_RecordsRequestEventForServedRequest(t *testing.T) {
 	require.NotZero(t, ev.TsUnixSec)
 }
 
+func TestServeHTTP_V2CapturesOriginalBoundedQueryString(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+	query := "page=42&token=" + strings.Repeat("x", 5_000)
+	r := newRequestWithReplacer("GET", "/content.cfm?"+query, "100", upstreamSelected("10.0.0.1:8080"))
+	w := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		r.URL.RawQuery = "rewritten=true"
+		w.WriteHeader(200)
+		return nil
+	})
+	require.NoError(t, h.ServeHTTP(w, r, next))
+
+	events := app.reqEventSnapshot()
+	require.Len(t, events, 1)
+	require.Equal(t, query[:4_096], events[0].QueryString)
+	require.True(t, events[0].QueryStringTruncated)
+	require.Equal(t, "/content.cfm", events[0].Path)
+}
+
 func TestServeHTTP_SkipsRequestEventWhenBlockReasonSet(t *testing.T) {
 	// WAF-blocked / rate-limited requests carry apx_block_reason — they must
 	// NOT record a request_event (they live in request_counters +

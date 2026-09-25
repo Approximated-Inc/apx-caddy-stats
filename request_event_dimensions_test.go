@@ -5,8 +5,27 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 	"unsafe"
 )
+
+func TestCapQueryStringBoundsAndOwnsBacking(t *testing.T) {
+	backing := strings.Repeat("x", 8_000) + "page=42"
+	query := backing[len(backing)-7:]
+	got, truncated := capQueryString(query)
+	if got != query || truncated {
+		t.Fatalf("capQueryString(%q) = %q, %v", query, got, truncated)
+	}
+	if unsafe.StringData(got) == unsafe.StringData(query) {
+		t.Fatal("buffered query string shares request-line backing")
+	}
+
+	long := strings.Repeat("a", 4_095) + "é"
+	got, truncated = capQueryString(long)
+	if len(got) != 4_095 || !truncated || !utf8.ValidString(got) {
+		t.Fatalf("capQueryString split UTF-8 boundary: length=%d truncated=%v", len(got), truncated)
+	}
+}
 
 // newReq builds a GET request with the given RemoteAddr and headers.
 // headers is a flat list of key, value pairs.

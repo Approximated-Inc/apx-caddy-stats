@@ -65,15 +65,15 @@ func newRequestEventRecorderV2(maxRows, blockedThreshold int, gov *memGovernor) 
 // Pinned by TestRowFixedBytesCoverStructSizes against the real Sizeof.
 // Bumped from 192 when the mode_v2 fields (TsUnixMs/MachineID/MachineSeq/
 // Disposition/Host/V2) were added, then to 336 for UpstreamFailureReason
-// and 352 for RequestID.
-const requestEventRowFixedBytes = 352
+// and 352 for RequestID, then 384 for query-string fields.
+const requestEventRowFixedBytes = 384
 
 // requestEventRowBytes approximates the resident bytes one buffered row
 // holds: the fixed struct size plus every string field's backing bytes.
 func requestEventRowBytes(row *requestEventRow) int {
 	return requestEventRowFixedBytes +
 		len(row.ClientIP) + len(row.ForwardedIP) + len(row.FrontProxy) +
-		len(row.Method) + len(row.Path) + len(row.PathBucket) +
+		len(row.Method) + len(row.Path) + len(row.QueryString) + len(row.PathBucket) +
 		len(row.HTTPVersion) + len(row.UA) + len(row.Origin) +
 		len(row.MachineID) + len(row.Disposition) + len(row.Host) + len(row.RequestID) + len(row.UpstreamFailureReason)
 }

@@ -80,6 +80,9 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}
 
 	start := time.Now()
+	// Preserve the inbound query before downstream rewrites can mutate URL.
+	// Keep the original string unowned until a v2 row is actually built.
+	rawQuery := r.URL.RawQuery
 	if h.app.RequestEventsModeV2() {
 		var failureTrace *upstreamFailureTrace
 		r, failureTrace = withUpstreamFailureTrace(r)
@@ -90,7 +93,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr)
+	h.record(r, wrapped, dur, servErr, rawQuery)
 	return servErr
 }
 
@@ -103,7 +106,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, rawQuery string) {
 	modeV2 := h.app.RequestEventsModeV2()
 
 	// Challenge attempts record independently of vhost_id (see the original
@@ -146,7 +149,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp, rawQuery))
 		}
 		return
 	}
@@ -183,7 +186,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
+		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp, rawQuery))
 	} else if reason == "" {
 		h.app.RecordRequestEvent(requestEventRow{
 			TsUnixSec:   uint32(time.Now().UTC().Unix()),
@@ -222,10 +225,11 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition, rawQuery string) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
+	queryString, queryStringTruncated := capQueryString(rawQuery)
 	return requestEventRow{
 		TsUnixSec:             uint32(now.Unix()),
 		TsUnixMs:              now.UnixMilli(),
@@ -235,6 +239,8 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		FrontProxy:            frontProxy(r),
 		Method:                methodOrUnknown(r.Method),
 		Path:                  capPath(r.URL.Path),
+		QueryString:           queryString,
+		QueryStringTruncated:  queryStringTruncated,
 		PathBucket:            pathBucket(r.URL.Path),
 		Status:                finalStatus(w, servErr),
 		HTTPVersion:           httpVersionOrUnknown(r),

@@ -47,6 +47,8 @@ type requestEventRow struct {
 	Disposition           string
 	Host                  string
 	RequestID             string
+	QueryString           string
+	QueryStringTruncated  bool
 	UpstreamFailureReason string
 	V2                    bool
 }
@@ -56,10 +58,9 @@ type requestEventRow struct {
 //
 //	{"_type":"request_event","ts":"...","proxy_server_id":N,"vhost_id":N,"client_ip":"...","forwarded_ip":"...","front_proxy":"...","method":"...","path":"...","path_bucket":"...","status":N,"http_version":"...","ua":"...","origin":"...","bytes_in":N,"bytes_out":N,"duration_us":N,"sample_rate":N}
 //
-// When row.V2 is set, six more fields are appended after sample_rate:
-// ts_ms, machine_id, machine_seq, disposition, host, request_id. This keeps the
-// legacy prefix byte-identical for non-v2 rows (old configs / old ingest).
-// Failed v2 rows additionally append upstream_failure_reason after request_id.
+// When row.V2 is set, v2 fields follow sample_rate. Query string is included
+// when present, with a truncation marker when capped. This keeps the legacy
+// prefix byte-identical for non-v2 rows (old configs / old ingest).
 //
 // ts is second-precision RFC3339 (formatTsSec). String fields go through
 // writeString so arbitrary-byte values (path, ua) are JSON-escaped.
@@ -120,6 +121,13 @@ func encodeRequestEventRow(w *gzip.Writer, ps uint32, row requestEventRow) error
 		writeString(&b, "host", row.Host)
 		b.WriteByte(',')
 		writeString(&b, "request_id", row.RequestID)
+		if row.QueryString != "" {
+			b.WriteByte(',')
+			writeString(&b, "query_string", row.QueryString)
+		}
+		if row.QueryStringTruncated {
+			b.WriteString(`,"query_string_truncated":true`)
+		}
 		if row.UpstreamFailureReason != "" {
 			b.WriteByte(',')
 			writeString(&b, "upstream_failure_reason", row.UpstreamFailureReason)
