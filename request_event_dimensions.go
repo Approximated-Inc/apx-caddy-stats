@@ -84,6 +84,12 @@ func capPath(p string) string {
 	return ownedTruncate(p, 1024)
 }
 
+// capQueryString bounds the raw URL-encoded query to 4 KiB. Always own the
+// buffered copy because RawQuery can share a much larger request-line backing.
+func capQueryString(query string) (string, bool) {
+	return ownedTruncate(query, 4096), len(query) > 4096
+}
+
 // capUA truncates a user-agent to <=512 bytes UTF-8-safe. Copy-free under
 // the cap (truncateBytes, not ownedTruncate) is safe here: header VALUES
 // are right-sized allocations out of net/textproto / hpack (each value is

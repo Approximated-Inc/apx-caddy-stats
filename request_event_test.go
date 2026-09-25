@@ -92,29 +92,31 @@ func TestEncodeRequestEventRow_V2_ExactNDJSON(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	row := requestEventRow{
-		TsUnixSec:   1_700_000_000,
-		TsUnixMs:    1_700_000_000_123,
-		VhostID:     0, // terminal challenge: no vhost_id
-		ClientIP:    "203.0.113.7",
-		ForwardedIP: "198.51.100.9",
-		FrontProxy:  "cloudflare",
-		Method:      "GET",
-		Path:        "/login",
-		PathBucket:  "/login",
-		Status:      403,
-		HTTPVersion: "HTTP/2.0",
-		UA:          "curl/8.0",
-		Origin:      "cluster",
-		BytesIn:     512,
-		BytesOut:    4096,
-		DurationUs:  12345,
-		SampleRate:  1,
-		MachineID:   "mach-abc",
-		MachineSeq:  99,
-		Disposition: dispChallengeIssued,
-		Host:        "example.com",
-		RequestID:   "86aac198-bbb7-4bc3-b057-a57ee272a981",
-		V2:          true,
+		TsUnixSec:            1_700_000_000,
+		TsUnixMs:             1_700_000_000_123,
+		VhostID:              0, // terminal challenge: no vhost_id
+		ClientIP:             "203.0.113.7",
+		ForwardedIP:          "198.51.100.9",
+		FrontProxy:           "cloudflare",
+		Method:               "GET",
+		Path:                 "/login",
+		PathBucket:           "/login",
+		Status:               403,
+		HTTPVersion:          "HTTP/2.0",
+		UA:                   "curl/8.0",
+		Origin:               "cluster",
+		BytesIn:              512,
+		BytesOut:             4096,
+		DurationUs:           12345,
+		SampleRate:           1,
+		MachineID:            "mach-abc",
+		MachineSeq:           99,
+		Disposition:          dispChallengeIssued,
+		Host:                 "example.com",
+		RequestID:            "86aac198-bbb7-4bc3-b057-a57ee272a981",
+		QueryString:          "page=42&view=full",
+		QueryStringTruncated: true,
+		V2:                   true,
 	}
 	require.NoError(t, encodeRequestEventRow(gz, 42, row))
 	require.NoError(t, gz.Close())
@@ -127,7 +129,7 @@ func TestEncodeRequestEventRow_V2_ExactNDJSON(t *testing.T) {
 
 	// V2 appends the new fields after sample_rate; the legacy prefix is
 	// byte-identical to the non-v2 line.
-	want := `{"_type":"request_event","ts":"2023-11-14T22:13:20Z","proxy_server_id":42,"vhost_id":0,"client_ip":"203.0.113.7","forwarded_ip":"198.51.100.9","front_proxy":"cloudflare","method":"GET","path":"/login","path_bucket":"/login","status":403,"http_version":"HTTP/2.0","ua":"curl/8.0","origin":"cluster","bytes_in":512,"bytes_out":4096,"duration_us":12345,"sample_rate":1,"ts_ms":1700000000123,"machine_id":"mach-abc","machine_seq":99,"disposition":"challenge_issued","host":"example.com","request_id":"86aac198-bbb7-4bc3-b057-a57ee272a981"}` + "\n"
+	want := `{"_type":"request_event","ts":"2023-11-14T22:13:20Z","proxy_server_id":42,"vhost_id":0,"client_ip":"203.0.113.7","forwarded_ip":"198.51.100.9","front_proxy":"cloudflare","method":"GET","path":"/login","path_bucket":"/login","status":403,"http_version":"HTTP/2.0","ua":"curl/8.0","origin":"cluster","bytes_in":512,"bytes_out":4096,"duration_us":12345,"sample_rate":1,"ts_ms":1700000000123,"machine_id":"mach-abc","machine_seq":99,"disposition":"challenge_issued","host":"example.com","request_id":"86aac198-bbb7-4bc3-b057-a57ee272a981","query_string":"page=42&view=full","query_string_truncated":true}` + "\n"
 	require.Equal(t, want, string(line))
 
 	var got map[string]any
