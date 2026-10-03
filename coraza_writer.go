@@ -16,6 +16,9 @@ import (
 // internally, but we don't want to depend on that.
 const corazaVhostHeader = "X-Apx-Vhost-Id"
 
+// Only sanitized chains carry this server-controlled WAF component signature.
+const corazaHeaderExemptionSignature = "APX_HEADER_EXEMPT_TELEMETRY/1"
+
 // corazaApp is the single live StatsApp the audit-log writer hands
 // detections to. RegisterAuditLogWriter is a GLOBAL factory with no app
 // handle, and there is exactly one apx_stats app per process, so the app
@@ -59,6 +62,10 @@ type (
 		IsInterrupted() bool
 		ClientIP() string
 		Request() corazaReqView
+		Producer() corazaProducerView
+	}
+	corazaProducerView interface {
+		Rulesets() []string
 	}
 	corazaReqView interface {
 		Method() string
@@ -120,6 +127,14 @@ func (t txAdapter) Request() corazaReqView {
 		return nil
 	}
 	return reqAdapter{req}
+}
+
+func (t txAdapter) Producer() corazaProducerView {
+	producer := t.tx.Producer()
+	if producer == nil {
+		return nil
+	}
+	return producer
 }
 
 type reqAdapter struct {
@@ -184,10 +199,12 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 
 	var method, uri string
 	var vhostID uint32
+	var defenseExempt bool
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
+		defenseExempt = corazaTransactionSupportsExemption(tx) && corazaDefenseExemptFromHeaders(req.Headers())
 	}
 
 	msgs := al.Messages()
@@ -222,8 +239,9 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			ClientIP:      clientIP,
 			// MatchData can be a substring slice of a large parsed buffer
 			// (arg value out of a flooded query string) — must be owned.
-			MatchData:  ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
-			WasBlocked: wasBlocked,
+			MatchData:     ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
+			WasBlocked:    wasBlocked,
+			DefenseExempt: defenseExempt,
 		})
 	}
 	return out
@@ -286,3 +304,36 @@ func init() {
 
 // Interface guard.
 var _ plugintypes.AuditLogWriter = (*corazaAuditWriter)(nil)
+
+// The control plane overwrites this header before WAF processing. Reject
+// ambiguous duplicate markers, including differently cased map entries.
+func corazaDefenseExemptFromHeaders(headers map[string][]string) bool {
+	var marker string
+	count := 0
+	for name, values := range headers {
+		if !strings.EqualFold(name, "X-Apx-L7-Header-Exempt") {
+			continue
+		}
+		if len(values) != 1 || count != 0 {
+			return false
+		}
+		marker = values[0]
+		count++
+	}
+	return count == 1 && marker == "true"
+}
+
+// Trust the WAF instance that processed this transaction, since a hot reload
+// may have replaced the process-global StatsApp before audit logging runs.
+func corazaTransactionSupportsExemption(tx corazaTxView) bool {
+	producer := tx.Producer()
+	if producer == nil {
+		return false
+	}
+	for _, component := range producer.Rulesets() {
+		if component == corazaHeaderExemptionSignature {
+			return true
+		}
+	}
+	return false
+}

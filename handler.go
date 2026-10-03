@@ -105,12 +105,14 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
 	modeV2 := h.app.RequestEventsModeV2()
+	defenseExempt := h.defenseExempt(r)
 
 	// Challenge attempts record independently of vhost_id (see the original
 	// comment): a served challenge is terminal so vhost_id is unset. Read
 	// the outcome once — it also drives the request_event disposition below.
+	// Exempt outcomes stay in raw logs but cannot feed Defense evidence.
 	outcome := readChallengeOutcome(r)
-	if outcome != "" {
+	if outcome != "" && !defenseExempt {
 		h.app.RecordChallengeAttempt(challengeAttemptKey{
 			vhost:   challengeVhost(r),
 			ip:      securityClientIP(r),
@@ -158,13 +160,14 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	durationUs := uint64(dur.Microseconds())
 
 	k := Key{
-		TsUnixMin: uint32(time.Now().UTC().Unix() / 60),
-		VhostID:   vhostID,
-		Method:    methodOrUnknown(r.Method),
-		Status:    finalStatus(w, servErr),
-		Origin:    origin,
-		Country:   country,
-		ASN:       asn,
+		TsUnixMin:     uint32(time.Now().UTC().Unix() / 60),
+		VhostID:       vhostID,
+		Method:        methodOrUnknown(r.Method),
+		Status:        finalStatus(w, servErr),
+		Origin:        origin,
+		Country:       country,
+		ASN:           asn,
+		DefenseExempt: defenseExempt,
 	}
 	d := CounterDelta{
 		BytesIn:    requestBytes(r),
@@ -186,21 +189,22 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
 	} else if reason == "" {
 		h.app.RecordRequestEvent(requestEventRow{
-			TsUnixSec:   uint32(time.Now().UTC().Unix()),
-			VhostID:     k.VhostID,
-			ClientIP:    securityClientIP(r),
-			ForwardedIP: forwardedIP(r),
-			FrontProxy:  frontProxy(r),
-			Method:      k.Method,
-			Path:        capPath(r.URL.Path),
-			PathBucket:  pathBucket(r.URL.Path),
-			Status:      k.Status,
-			HTTPVersion: httpVersionOrUnknown(r),
-			UA:          capUA(r.UserAgent()),
-			Origin:      origin,
-			BytesIn:     requestBytes(r),
-			BytesOut:    responseBytes(w),
-			DurationUs:  durationUs,
+			TsUnixSec:     uint32(time.Now().UTC().Unix()),
+			VhostID:       k.VhostID,
+			ClientIP:      securityClientIP(r),
+			ForwardedIP:   forwardedIP(r),
+			FrontProxy:    frontProxy(r),
+			Method:        k.Method,
+			Path:          capPath(r.URL.Path),
+			PathBucket:    pathBucket(r.URL.Path),
+			Status:        k.Status,
+			HTTPVersion:   httpVersionOrUnknown(r),
+			UA:            capUA(r.UserAgent()),
+			Origin:        origin,
+			BytesIn:       requestBytes(r),
+			BytesOut:      responseBytes(w),
+			DurationUs:    durationUs,
+			DefenseExempt: k.DefenseExempt,
 		})
 	}
 
@@ -250,7 +254,18 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		Host:                  host,
 		RequestID:             readRequestID(repl),
 		V2:                    true,
+		DefenseExempt:         h.defenseExempt(r),
 	}
+}
+
+// defenseExempt reads only the shared Caddy var after downstream handlers return.
+// The transport header can be client-supplied or removed before proxying.
+func (h *StatsHandler) defenseExempt(r *http.Request) bool {
+	if !h.app.DefenseExemptionTelemetryEnabled() {
+		return false
+	}
+	marker, _ := caddyhttp.GetVar(r.Context(), "apx_l7_header_exempt").(string)
+	return marker == "true"
 }
 
 // readRequestID uses the same lazy, per-request Caddy UUID as the upstream

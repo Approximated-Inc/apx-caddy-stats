@@ -77,8 +77,9 @@ func (f *fakeApp) HashSalt() string { return f.hashSalt }
 
 func (f *fakeApp) ProxyServerID() uint32 { return f.psID }
 
-func (f *fakeApp) MachineID() string         { return f.machineID }
-func (f *fakeApp) RequestEventsModeV2() bool { return f.modeV2 }
+func (f *fakeApp) MachineID() string                      { return f.machineID }
+func (f *fakeApp) RequestEventsModeV2() bool              { return f.modeV2 }
+func (f *fakeApp) DefenseExemptionTelemetryEnabled() bool { return false }
 
 func (f *fakeApp) challengeSnapshot() []challengeAttemptKey {
 	f.mu.Lock()

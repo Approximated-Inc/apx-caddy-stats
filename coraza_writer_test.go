@@ -27,6 +27,7 @@ type fakeTx struct {
 	interrupted bool
 	clientIP    string
 	req         corazaReqView
+	producer    corazaProducerView
 }
 
 func (t *fakeTx) UnixTimestamp() int64   { return t.unixTs }
@@ -35,6 +36,12 @@ func (t *fakeTx) ServerID() string       { return t.serverID }
 func (t *fakeTx) IsInterrupted() bool    { return t.interrupted }
 func (t *fakeTx) ClientIP() string       { return t.clientIP }
 func (t *fakeTx) Request() corazaReqView { return t.req }
+
+func (t *fakeTx) Producer() corazaProducerView { return t.producer }
+
+type fakeProducer struct{ components []string }
+
+func (p fakeProducer) Rulesets() []string { return p.components }
 
 type fakeReq struct {
 	method  string
