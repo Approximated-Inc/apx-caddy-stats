@@ -58,6 +58,8 @@ type AppRef interface {
 	// mode_v2 (unsampled served rows, blocked/challenge rows logged with a
 	// disposition, extra wire fields). False → legacy behavior.
 	RequestEventsModeV2() bool
+	// DefenseExemptionTelemetryEnabled gates trusted header-exemption markers.
+	DefenseExemptionTelemetryEnabled() bool
 }
 
 // CounterDelta is what a single request contributes. The handler builds
@@ -201,6 +203,10 @@ type StatsApp struct {
 	// skip the hash, flush emits no uniques rows). Lets the module be
 	// deployed before the operator has provisioned a salt.
 	HashSaltValue string `json:"hash_salt,omitempty"`
+
+	// DefenseExemptionTelemetry marks trusted header exemptions in analytics.
+	// False preserves the existing wire format.
+	DefenseExemptionTelemetry bool `json:"defense_exemption_telemetry,omitempty"`
 
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
@@ -547,6 +553,7 @@ func (a *StatsApp) shardForKey(k Key) *counterShard {
 	h = mixString(h, k.Origin)
 	h = mixString(h, k.Country)
 	h = mixUint32(h, k.ASN)
+	h = mixUint16(h, uint16(boolToUint32(k.DefenseExempt)))
 	return a.shards[h&shardMask]
 }
 
@@ -665,6 +672,8 @@ func resolveMachineID(raw string) string {
 // RequestEventsModeV2 reports whether the request_events track is in
 // mode_v2. Resolved at Provision (G5 wiring); false by default.
 func (a *StatsApp) RequestEventsModeV2() bool { return a.reqEventsModeV2 }
+
+func (a *StatsApp) DefenseExemptionTelemetryEnabled() bool { return a.DefenseExemptionTelemetry }
 
 // Test-only accessors. The counters / uniques maps are sharded for
 // contention reduction; tests want to peek at aggregate state without
@@ -1946,6 +1955,9 @@ func encodeRow(w *gzip.Writer, ps uint32, k Key, c *Counter) error {
 		writeUint64(&b, histKey(i), n)
 	}
 
+	if k.DefenseExempt {
+		b.WriteString(`,"defense_exempt":true`)
+	}
 	b.WriteString("}\n")
 	_, err := w.Write([]byte(b.String()))
 	return err
