@@ -19,8 +19,9 @@ import (
 // StatsHandler is the HTTP middleware. Installed once at the top of the
 // global handler chain so it sees every request the cluster serves.
 type StatsHandler struct {
-	logger *zap.Logger
-	app    AppRef
+	HolderOnly bool `json:"holder_only,omitempty"`
+	logger     *zap.Logger
+	app        AppRef
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -35,6 +36,9 @@ func (*StatsHandler) CaddyModule() caddy.ModuleInfo {
 // the app isn't configured — running the handler without the app would
 // silently drop counters, which is worse than a clear startup error.
 func (h *StatsHandler) Provision(ctx caddy.Context) error {
+	if h.HolderOnly {
+		return nil
+	}
 	h.logger = ctx.Logger()
 	if h.app != nil {
 		return nil
@@ -74,6 +78,10 @@ func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return
 // dashboard with a one-line header injection. The exact match closes
 // it.
 func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	r, _ = withDefenseSnapshotHolder(r)
+	if h.HolderOnly {
+		return next.ServeHTTP(w, r)
+	}
 	if r.Header.Get("apx-monitor") == "true" {
 		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
 		return next.ServeHTTP(w, r)
@@ -258,9 +266,14 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 	}
 }
 
-// defenseExempt reads only the shared Caddy var after downstream handlers return.
-// The transport header can be client-supplied or removed before proxying.
+// V2 reads the frozen request holder. Retained v1 images use their original var.
 func (h *StatsHandler) defenseExempt(r *http.Request) bool {
+	if snapshot, ok := requestDefenseHolder(r).load(); ok {
+		return snapshot.Evidence.HTTP
+	}
+	if app, ok := h.app.(interface{ DefensePolicyEvidenceV2Enabled() bool }); ok && app.DefensePolicyEvidenceV2Enabled() {
+		return false
+	}
 	if !h.app.DefenseExemptionTelemetryEnabled() {
 		return false
 	}

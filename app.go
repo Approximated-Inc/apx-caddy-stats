@@ -207,6 +207,7 @@ type StatsApp struct {
 	// DefenseExemptionTelemetry marks trusted header exemptions in analytics.
 	// False preserves the existing wire format.
 	DefenseExemptionTelemetry bool `json:"defense_exemption_telemetry,omitempty"`
+	DefensePolicyEvidenceV2   bool `json:"defense_policy_evidence_v2,omitempty"`
 
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
@@ -671,6 +672,8 @@ func resolveMachineID(raw string) string {
 // RequestEventsModeV2 reports whether the request_events track is in
 // mode_v2. Resolved at Provision (G5 wiring); false by default.
 func (a *StatsApp) RequestEventsModeV2() bool { return a.reqEventsModeV2 }
+
+func (a *StatsApp) DefensePolicyEvidenceV2Enabled() bool { return a.DefensePolicyEvidenceV2 }
 
 func (a *StatsApp) DefenseExemptionTelemetryEnabled() bool { return a.DefenseExemptionTelemetry }
 

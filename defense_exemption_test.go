@@ -416,6 +416,8 @@ func TestDefenseExemptionWriterHotReloadTransactionTrust(t *testing.T) {
 	}{
 		{"old_unsigned_transaction_new_enabled_app", true, nil, false},
 		{"old_signed_transaction_new_disabled_app", false, []string{"APX_HEADER_EXEMPT_TELEMETRY/1"}, true},
+		{"v2_missing_marker_no_v1_fallback", true, []string{"APX_DEFENSE_EVIDENCE/2", "APX_HEADER_EXEMPT_TELEMETRY/1"}, false},
+		{"unknown_v2_generation_no_v1_fallback", true, []string{"APX_DEFENSE_EVIDENCE/3", "APX_HEADER_EXEMPT_TELEMETRY/1"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, cleanup := newCorazaTestApp(t, 10)

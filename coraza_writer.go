@@ -200,11 +200,17 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	var method, uri string
 	var vhostID uint32
 	var defenseExempt bool
+	var evidence defenseEvidence
+	v2 := corazaTransactionEvidenceVersion(tx)
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
-		defenseExempt = corazaTransactionSupportsExemption(tx) && corazaDefenseExemptFromHeaders(req.Headers())
+		if v2 == 2 {
+			evidence, _ = defenseEvidenceFromHeaders(req.Headers())
+		} else if v2 == 0 {
+			defenseExempt = corazaTransactionSupportsExemption(tx) && corazaDefenseExemptFromHeaders(req.Headers())
+		}
 	}
 
 	msgs := al.Messages()
@@ -241,7 +247,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			// (arg value out of a flooded query string) — must be owned.
 			MatchData:     ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
 			WasBlocked:    wasBlocked,
-			DefenseExempt: defenseExempt,
+			DefenseExempt: defenseExempt || evidence.corazaExempt(uint32(nonNegInt(d.ID()))),
 		})
 	}
 	return out
@@ -336,4 +342,22 @@ func corazaTransactionSupportsExemption(tx corazaTxView) bool {
 		}
 	}
 	return false
+}
+
+// A transaction advertising any v2-family proof never falls back to v1.
+func corazaTransactionEvidenceVersion(tx corazaTxView) int {
+	producer := tx.Producer()
+	if producer == nil {
+		return 0
+	}
+	version := 0
+	for _, component := range producer.Rulesets() {
+		if strings.HasPrefix(component, "APX_DEFENSE_EVIDENCE/") {
+			if component != defenseEvidenceSignature {
+				return -1
+			}
+			version = 2
+		}
+	}
+	return version
 }
