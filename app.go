@@ -265,9 +265,10 @@ type StatsApp struct {
 	l4IpOverflowLoggedAt time.Time
 
 	// Configured L4 close matches have a separate bounded track.
-	l4BlockMu       sync.Mutex
-	l4Blocks        map[l4BlockKey]uint64
-	l4BlockOverflow uint64
+	l4BlockMu                 sync.Mutex
+	l4Blocks                  map[l4BlockKey]uint64
+	l4BlockOverflow           uint64
+	l4BlockReputationOverflow uint64
 
 	// Challenge attempts. Counter map keyed by (vhost, ip, outcome) — the
 	// PoW-challenge handler sets an `apx_challenge_outcome` request var and

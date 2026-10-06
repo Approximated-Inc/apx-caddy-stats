@@ -25,7 +25,7 @@ Place it after PROXY-protocol decoding and immediately before `close`:
 {"handle":[{"handler":"apx_l4_block_stats","reason":"ip"},{"handler":"close"}]}
 ```
 
-The reason is required and must be `ip`, `sni`, `ja3`, or `ja4`. The handler
+The reason is required and must be `ip`, `sni`, `ja3`, `ja4`, or `abuseipdb`. The handler
 uses the existing `apx_stats` app and records the decoded connection address;
 it does not read TLS data or change matching, forwarding, or blocking policy.
 Only routes containing the handler record blocks. Existing L4 connection and
@@ -40,8 +40,13 @@ The normal authenticated gzip/NDJSON flush, including shutdown, carries rows:
 Counts retain the observation minute and aggregate by canonical IP and reason.
 IPv4-mapped IPv6 addresses normalize to IPv4; IPv6 scope zones are removed.
 Each app instance holds at most 10,000 distinct keys between drains. Existing
-keys keep counting at capacity; additional keys contribute to one overflow
-counter emitted with IP `::`, reason `overflow`, and the **flush minute**.
+keys keep counting at capacity; additional keys contribute to fixed source
+scalars emitted with IP `::` and the **flush minute**. Reputation closes use
+`reason=abuseipdb`; their capped increments use `reason=abuseipdb_overflow`.
+Existing close reasons keep `reason=overflow`. The handler cannot configure
+either overflow reason. Both sources share the same 10,000-key cap; only two
+scalar overflow counters exist. Source-specific reputation rows require a
+cluster-scoped analytics credential.
 Overflow has no client attribution or exact observation minute, so report
 windows must account for this timing limitation. Admission and drain share a
 mutex, and key sizes are bounded independently of caller-controlled strings.
