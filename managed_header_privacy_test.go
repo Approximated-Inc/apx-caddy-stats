@@ -166,3 +166,18 @@ func TestManagedHeaderPrivacyRedactionBudgetSharedAcrossWAFTransactions(t *testi
 	require.Empty(t, bridge.Redact("budget-b", text))
 	require.Empty(t, bridge.Redact("budget-a", "small ordinary field"))
 }
+
+func TestManagedHeaderPrivacyUnknownProofMasksWithoutChangingEvidence(t *testing.T) {
+	r := privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: "known-key!"}}, http.Header{"X-Key": {"known-key!"}})
+	bridge := &CorazaPrivacyBridge{}
+	release := bridge.Bind("unknown-privacy-proof", r)
+	defer release()
+	al := buildAuditLog(1700000000000000000, "unknown-privacy-proof", "host", true, map[string][]string{"X-Apx-L7-Header-Exempt": {"true"}}, &fakeMsgData{id: 920274, msg: "ordinary text", data: "future unknown private material"})
+	al.tx.(*fakeTx).producer = fakeProducer{components: []string{corazaHeaderExemptionSignature, managedHeaderPrivacySignature, "APX_MANAGED_HEADER_PRIVACY/2"}}
+	events := buildCorazaEvents(al)
+	require.Len(t, events, 1)
+	require.Empty(t, events[0].RuleMsg)
+	require.Empty(t, events[0].MatchData)
+	require.True(t, events[0].WasBlocked)
+	require.True(t, events[0].DefenseExempt)
+}

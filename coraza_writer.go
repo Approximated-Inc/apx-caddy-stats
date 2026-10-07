@@ -202,7 +202,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	var defenseExempt bool
 	var evidence defenseEvidence
 	v2 := corazaTransactionEvidenceVersion(tx)
-	managedPrivacy := corazaTransactionManagedPrivacy(tx)
+	privacyVersion := corazaTransactionManagedPrivacyVersion(tx)
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
@@ -227,11 +227,15 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 		if d == nil {
 			continue
 		}
-        message, data := d.Msg(), d.Data()
-        if managedPrivacy {
-            bridge := &CorazaPrivacyBridge{}
-            message, data = bridge.Redact(txID, message), bridge.Redact(txID, data)
-        }
+		message, data := d.Msg(), d.Data()
+		if privacyVersion != 0 {
+			if privacyVersion == 1 {
+				bridge := &CorazaPrivacyBridge{}
+				message, data = bridge.Redact(txID, message), bridge.Redact(txID, data)
+			} else {
+				message, data = "", ""
+			}
+		}
 		out = append(out, corazaDetection{
 			TsUnixSec: tsSec,
 			VhostID:   vhostID,

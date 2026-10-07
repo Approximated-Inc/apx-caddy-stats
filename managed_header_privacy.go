@@ -180,13 +180,20 @@ func (b *CorazaPrivacyBridge) Redact(id, text string) string {
 	return ""
 }
 
-func corazaTransactionManagedPrivacy(tx corazaTxView) bool {
+// Only the exact supported privacy proof permits captured-value redaction.
+// Unknown versions conservatively mask complete text without affecting evidence.
+func corazaTransactionManagedPrivacyVersion(tx corazaTxView) int {
+	version := 0
 	if producer := tx.Producer(); producer != nil {
 		for _, component := range producer.Rulesets() {
-			if strings.HasPrefix(component, "APX_MANAGED_HEADER_PRIVACY/") {
-				return true
+			if !strings.HasPrefix(component, "APX_MANAGED_HEADER_PRIVACY/") {
+				continue
 			}
+			if component != managedHeaderPrivacySignature {
+				return -1
+			}
+			version = 1
 		}
 	}
-	return false
+	return version
 }
