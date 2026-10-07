@@ -202,6 +202,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	var defenseExempt bool
 	var evidence defenseEvidence
 	v2 := corazaTransactionEvidenceVersion(tx)
+	managedPrivacy := corazaTransactionManagedPrivacy(tx)
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
@@ -226,6 +227,11 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 		if d == nil {
 			continue
 		}
+        message, data := d.Msg(), d.Data()
+        if managedPrivacy {
+            bridge := &CorazaPrivacyBridge{}
+            message, data = bridge.Redact(txID, message), bridge.Redact(txID, data)
+        }
 		out = append(out, corazaDetection{
 			TsUnixSec: tsSec,
 			VhostID:   vhostID,
@@ -234,7 +240,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			// RuleMsg stays copy-free under the cap: Msg() is either a
 			// static rule-config string (process-lifetime — cloning would
 			// duplicate it per event) or a macro-expanded fresh build.
-			RuleMsg: truncateBytes(d.Msg(), corazaRuleMsgMaxBytes),
+			RuleMsg: truncateBytes(message, corazaRuleMsgMaxBytes),
 			// Tags reference the rule's static config slice — no
 			// per-request data, safe to share.
 			Tags:          d.Tags(),
@@ -245,7 +251,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			ClientIP:      clientIP,
 			// MatchData can be a substring slice of a large parsed buffer
 			// (arg value out of a flooded query string) — must be owned.
-			MatchData:     ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
+			MatchData:     ownedTruncate(data, corazaMatchDataMaxBytes),
 			WasBlocked:    wasBlocked,
 			DefenseExempt: defenseExempt || evidence.corazaExempt(uint32(nonNegInt(d.ID()))),
 		})
