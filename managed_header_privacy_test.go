@@ -31,10 +31,10 @@ func TestManagedHeaderPrivacyOriginalDuplicatePartialAndMutation(t *testing.T) {
 	bridge := &CorazaPrivacyBridge{}
 	release := bridge.Bind("privacy-original", r)
 	defer release()
-	require.Equal(t, "[REDACTED]", bridge.Redact("privacy-original", "matched="+secret))
+	require.True(t, bridge.Redact("privacy-original", "matched="+secret) == "[REDACTED]", "sensitive original text was not masked")
 	require.Equal(t, "ordinary", bridge.Redact("privacy-original", "ordinary"))
 	require.Nil(t, requestDefenseHolder(r).snapshot, "privacy must not publish evidence authority")
-	require.NotContains(t, fmt.Sprint(r.Header), secret)
+	require.False(t, strings.Contains(fmt.Sprint(r.Header), secret), "mutated Header retained original value")
 }
 
 func TestManagedHeaderPrivacyWriterBeforeTruncationPreservesRowsAndProof(t *testing.T) {
@@ -75,20 +75,20 @@ func TestManagedHeaderPrivacyCollisionAndBothCloseOrders(t *testing.T) {
 		bridge := &CorazaPrivacyBridge{}
 		a := bridge.Bind(id, privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: "a-key!"}}, http.Header{"X-Key": {"a-key!"}}))
 		b := bridge.Bind(id, privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: "b-key!"}}, http.Header{"X-Key": {"b-key!"}}))
-		require.Empty(t, bridge.Redact(id, "a-key! b-key!"))
+		require.True(t, bridge.Redact(id, "a-key! b-key!") == "", "privacy fallback retained text")
 		if firstCloses {
 			a()
 		} else {
 			b()
 		}
-		require.Empty(t, bridge.Redact(id, "a-key! b-key!"))
+		require.True(t, bridge.Redact(id, "a-key! b-key!") == "", "privacy fallback retained text")
 		third := bridge.Bind(id, privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: "c-key!"}}, http.Header{"X-Key": {"c-key!"}}))
-		require.Empty(t, bridge.Redact(id, "a-key! b-key! c-key!"))
+		require.True(t, bridge.Redact(id, "a-key! b-key! c-key!") == "", "privacy fallback retained text")
 		a()
 		b()
-		require.Empty(t, bridge.Redact(id, "a-key! b-key! c-key!"))
+		require.True(t, bridge.Redact(id, "a-key! b-key! c-key!") == "", "privacy fallback retained text")
 		third()
-		require.Empty(t, bridge.Redact(id, "a-key! b-key!"))
+		require.True(t, bridge.Redact(id, "a-key! b-key!") == "", "privacy fallback retained text")
 	}
 }
 
@@ -99,7 +99,7 @@ func TestManagedHeaderPrivacyMarkerCollisionAndCaptureBudgets(t *testing.T) {
 		id := "privacy-marker-" + value
 		release := bridge.Bind(id, r)
 		masked := bridge.Redact(id, "matched="+value)
-		require.NotContains(t, masked, value)
+		require.False(t, strings.Contains(masked, value), "mask token retained a managed value")
 		release()
 	}
 	pairs := make([]managedHeaderCredential, 32768)
@@ -110,7 +110,7 @@ func TestManagedHeaderPrivacyMarkerCollisionAndCaptureBudgets(t *testing.T) {
 	bridge := &CorazaPrivacyBridge{}
 	release := bridge.Bind("privacy-work-overflow", r)
 	defer release()
-	require.Empty(t, bridge.Redact("privacy-work-overflow", "unrelated text"))
+	require.True(t, bridge.Redact("privacy-work-overflow", "unrelated text") == "", "privacy fallback retained text")
 }
 
 func TestManagedHeaderPrivacyRegistryHardBoundsAndCleanup(t *testing.T) {
@@ -118,8 +118,8 @@ func TestManagedHeaderPrivacyRegistryHardBoundsAndCleanup(t *testing.T) {
 	bridge := &CorazaPrivacyBridge{registry: registry}
 	r := privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: "abcd"}}, http.Header{"X-Key": {"abcd"}})
 	releases := []func(){bridge.Bind("bound-a", r), bridge.Bind("bound-b", r), bridge.Bind("bound-c", r)}
-	require.Equal(t, "[REDACTED]", bridge.Redact("bound-a", "abcd"))
-	require.Empty(t, bridge.Redact("bound-c", "abcd"))
+	require.True(t, bridge.Redact("bound-a", "abcd") == "[REDACTED]", "managed text was not masked")
+	require.True(t, bridge.Redact("bound-c", "abcd") == "", "privacy fallback retained text")
 	require.Len(t, registry.entries, 2)
 	require.Equal(t, 2, registry.slots)
 	require.Equal(t, 8, registry.bytes)
@@ -127,11 +127,11 @@ func TestManagedHeaderPrivacyRegistryHardBoundsAndCleanup(t *testing.T) {
 		release()
 		release()
 	}
-	require.Empty(t, registry.entries)
+	require.Len(t, registry.entries, 0)
 	require.Zero(t, registry.slots)
 	require.Zero(t, registry.bytes)
 	release := bridge.Bind("bound-new", r)
-	require.Equal(t, "[REDACTED]", bridge.Redact("bound-new", "abcd"))
+	require.True(t, bridge.Redact("bound-new", "abcd") == "[REDACTED]", "managed text was not masked")
 	release()
 }
 
@@ -163,8 +163,8 @@ func TestManagedHeaderPrivacyRedactionBudgetSharedAcrossWAFTransactions(t *testi
 	defer b()
 	text := strings.Repeat("x", managedHeaderWorkMaxBytes/2)
 	require.NotEmpty(t, bridge.Redact("budget-a", text))
-	require.Empty(t, bridge.Redact("budget-b", text))
-	require.Empty(t, bridge.Redact("budget-a", "small ordinary field"))
+	require.True(t, bridge.Redact("budget-b", text) == "", "privacy fallback retained text")
+	require.True(t, bridge.Redact("budget-a", "small ordinary field") == "", "privacy fallback retained text")
 }
 
 func TestManagedHeaderPrivacyUnknownProofMasksWithoutChangingEvidence(t *testing.T) {
