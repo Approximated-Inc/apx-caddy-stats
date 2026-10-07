@@ -333,6 +333,14 @@ type StatsApp struct {
 	// Provision. Gates the handler's disposition/host/unsampled-served path.
 	reqEventsModeV2 bool
 
+	// Retired HTTP delivery is bounded by existing buffers and one transient worker.
+	// Classification, row format, salt, identity and destination remain this app's.
+	httpDeliveryMu sync.Mutex
+	httpRetired atomic.Bool
+	httpDeliveryPending bool
+	httpDeliveryRunning bool
+	httpDeliveryDone chan struct{}
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -627,7 +635,50 @@ func (a *StatsApp) Stop() error {
 		scheduleFreeOSMemory(10 * time.Second)
 	})
 	a.wg.Wait()
+	// Do not wait for old requests or network delivery here: Caddy reload must
+	// finish while old handlers are still active. Catch records after final drain.
+	a.httpDeliveryMu.Lock()
+	a.httpRetired.Store(true)
+	a.scheduleHTTPDeliveryLocked()
+	a.httpDeliveryMu.Unlock()
 	return nil
+}
+
+// finishHTTPRecord is called only after all HTTP contributions are recorded.
+// Signals coalesce; neither active nor retired request completion waits on I/O.
+func (a *StatsApp) finishHTTPRecord() {
+	if !a.httpRetired.Load() {
+		return
+	}
+	a.httpDeliveryMu.Lock()
+	a.scheduleHTTPDeliveryLocked()
+	a.httpDeliveryMu.Unlock()
+}
+
+func (a *StatsApp) scheduleHTTPDeliveryLocked() {
+	a.httpDeliveryPending = true
+	if !a.httpDeliveryRunning {
+		a.httpDeliveryRunning = true
+		a.httpDeliveryDone = make(chan struct{})
+		go a.deliverRetiredHTTP()
+	}
+}
+
+func (a *StatsApp) deliverRetiredHTTP() {
+	for {
+		a.httpDeliveryMu.Lock()
+		if !a.httpDeliveryPending {
+			a.httpDeliveryRunning = false
+			close(a.httpDeliveryDone)
+			a.httpDeliveryMu.Unlock()
+			return
+		}
+		a.httpDeliveryPending = false
+		a.httpDeliveryMu.Unlock()
+		// Use this retired generation's bounded retry policy and original
+		// destination. L4, fingerprints and Coraza remain on normal flush paths.
+		a.flushBatch(a.cfg.maxRetries, true)
+	}
 }
 
 // ProxyServerID exposes the cluster id to handlers.
@@ -1436,6 +1487,10 @@ func (a *StatsApp) flushLoop() {
 // timing, but either way its data ships within the next flush
 // interval. No data loss.
 func (a *StatsApp) flushOnce(maxRetries int) {
+	a.flushBatch(maxRetries, false)
+}
+
+func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
 	if perShardInitialCap < 8 {
 		perShardInitialCap = 8
@@ -1462,15 +1517,23 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 		s.mu.Unlock()
 	}
 
-	l4SniSnap := a.drainL4SniRows()
-	l4IpSnap := a.l4IpSnapshot()
-	fpSnap := a.fingerprintSnapshot()
-	fpIpSnap := a.fingerprintIpSnapshot()
-	corazaSnap := a.corazaSnapshot()
+	var l4SniSnap map[L4SniKey]*l4SniCounter
+	var ipSnap l4IpSnap
+	var fpSnap map[fingerprintKey]*fingerprintCounter
+	var fpIpSnap map[fingerprintIpKey]*fingerprintCounter
+	var corazaSnap []corazaDetection
+	var l4BlockSnap map[l4BlockKey]uint64
+	flushTs := uint32(time.Now().Unix() / 60)
+	if !httpOnly {
+		l4SniSnap = a.drainL4SniRows()
+		ipSnap = a.l4IpSnapshot()
+		fpSnap = a.fingerprintSnapshot()
+		fpIpSnap = a.fingerprintIpSnapshot()
+		corazaSnap = a.corazaSnapshot()
+		l4BlockSnap = a.l4BlockSnapshot(flushTs)
+	}
 	challengeSnap := a.challengeSnapshot()
 	edgeVerifySnap := a.edgeVerifySnapshot()
-	flushTs := uint32(time.Now().Unix() / 60)
-	l4BlockSnap := a.l4BlockSnapshot(flushTs)
 
 	// request_events: flat drain. reqEventOverflow is observability-only here
 	// (no breaker — the recorder samples under load on its own).
@@ -1485,10 +1548,10 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 			zap.Int("http_counter_rows", len(snap)),
 			zap.Int("uniques_rows", len(uniqSnap)),
 			zap.Int("l4_sni_rows_after_filter", len(l4SniSnap)),
-			zap.Int("l4_ip_topk_rows", len(l4IpSnap.topkRows)),
-			zap.Int("l4_ip_uniques_raw_rows", len(l4IpSnap.sampled)),
-			zap.Int("l4_ip_prefix_rows", len(l4IpSnap.prefix)),
-			zap.Int("l4_ip_sni_rows", len(l4IpSnap.ipSni)),
+			zap.Int("l4_ip_topk_rows", len(ipSnap.topkRows)),
+			zap.Int("l4_ip_uniques_raw_rows", len(ipSnap.sampled)),
+			zap.Int("l4_ip_prefix_rows", len(ipSnap.prefix)),
+			zap.Int("l4_ip_sni_rows", len(ipSnap.ipSni)),
 			zap.Int("l4_block_rows", len(l4BlockSnap)),
 			zap.Int("l4_fingerprint_rows", len(fpSnap)),
 			zap.Int("l4_fingerprint_ip_rows", len(fpIpSnap)),
@@ -1500,21 +1563,21 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	}
 
 	if len(snap) == 0 && len(uniqSnap) == 0 && len(l4SniSnap) == 0 &&
-		len(l4IpSnap.topkRows) == 0 && len(l4IpSnap.sampled) == 0 &&
-		len(l4IpSnap.prefix) == 0 && len(l4IpSnap.ipSni) == 0 &&
+		len(ipSnap.topkRows) == 0 && len(ipSnap.sampled) == 0 &&
+		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
 		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 {
 		return
 	}
 
 	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
-		len(l4IpSnap.topkRows) + len(l4IpSnap.sampled) +
-		len(l4IpSnap.prefix) + len(l4IpSnap.ipSni) +
+		len(ipSnap.topkRows) + len(ipSnap.sampled) +
+		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
 		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, l4IpSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))

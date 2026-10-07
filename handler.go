@@ -112,6 +112,11 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+	// Keep the original generation authoritative, including early terminal rows.
+	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
+	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
+		defer app.finishHTTPRecord()
+	}
 	modeV2 := h.app.RequestEventsModeV2()
 	defenseExempt := h.defenseExempt(r)
 
