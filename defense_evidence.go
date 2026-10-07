@@ -87,6 +87,8 @@ func requestDefenseHolder(r *http.Request) *defenseSnapshotHolder {
 // each WAF boundary. Headers and later vars are never an authority source.
 type DefenseEvidenceHandler struct {
 	ManagedHeaders []managedHeaderCredential `json:"managed_headers,omitempty"`
+ privacyNamesOnce sync.Once
+ privacyNames []string
 	Mode               string            `json:"mode"`
 	HTTPVar            string            `json:"http_var,omitempty"`
 	CorazaAllVar       string            `json:"coraza_all_var,omitempty"`
@@ -119,7 +121,14 @@ func (h *DefenseEvidenceHandler) Validate() error {
 			}
 		}
 	}
-	return nil
+ h.privacyNamesOnce.Do(func() {
+  seen:=make(map[string]bool)
+  for _,pair:=range h.ManagedHeaders {
+   name:=strings.ToLower(pair.Name)
+   if !seen[name] { seen[name]=true;h.privacyNames=append(h.privacyNames,strings.Clone(name)) }
+  }
+ })
+ return nil
 }
 func strictDefenseVar(r *http.Request, name string) bool {
 	if name == "" {
@@ -157,7 +166,7 @@ func (h *DefenseEvidenceHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
  case "capture_privacy":
   if holder!=nil {
    holder.mu.Lock()
-   if holder.privacy==nil { snapshot:=captureManagedHeaders(r.Header,h.ManagedHeaders); holder.privacy=&snapshot }
+   if holder.privacy==nil { holder.privacy=captureManagedHeaders(r.Header,h.privacyNames) }
    holder.mu.Unlock()
   }
  case "capture":
