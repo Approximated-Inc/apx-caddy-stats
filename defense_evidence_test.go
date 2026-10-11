@@ -251,12 +251,16 @@ func TestDefenseEvidenceFrozenPrivateCopies(t *testing.T) {
 }
 
 func TestDefenseEvidenceClosedConfigAndStrictVars(t *testing.T) {
-	for _, config := range []string{`{"mode":"forged"}`, `{"mode":"stamp_waf","http_var":"late"}`, `{"mode":"capture","coraza_rule_vars":{"0942100":"x"}}`, `{"mode":"capture","skip_coraza_rule_vars":{"1234":"x"}}`, `{"mode":"capture","skip_coraza_rule_vars":{"942110":"x"}}`, `{"mode":"capture","coraza_rule_vars":{"942100":""}}`} {
+	for _, config := range []string{`{"mode":"forged"}`, `{"mode":"stamp_waf","http_var":"late"}`, `{"mode":"capture","coraza_rule_vars":{"0942100":"x"}}`, `{"mode":"capture","coraza_rule_vars":{"942100":""}}`} {
 		info, err := caddy.GetModule("http.handlers.apx_defense_evidence")
 		require.NoError(t, err)
 		module := info.New()
 		require.NoError(t, json.Unmarshal([]byte(config), module))
 		require.Error(t, module.(caddy.Validator).Validate())
+	}
+	// IDs outside the catalog (inline rules, a newer CRS) are skipped, not fatal.
+	for _, config := range []string{`{"mode":"capture","skip_coraza_rule_vars":{"1234":"x"}}`, `{"mode":"capture","skip_coraza_rule_vars":{"942110":"x"}}`} {
+		require.NoError(t, evidenceHandler(t, config).(caddy.Validator).Validate())
 	}
 	capture := evidenceHandler(t, `{"mode":"capture","http_var":"e_http"}`)
 	for _, value := range []any{true, "TRUE", " true", "true ", nil, "false", "true"} {
