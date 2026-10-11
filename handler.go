@@ -161,7 +161,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp))
 		}
 		return
 	}
@@ -192,6 +192,9 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
+	// Header-derived identity, with any managed Header value masked.
+	identity := telemetryIdentity(r)
+
 	// request_events. In mode_v2, EVERY disposition is logged (served rows
 	// unsampled, blocked/challenge rows sampled — decided in the recorder);
 	// host is empty here because vhost_id resolves the vhost. In legacy
@@ -199,20 +202,20 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
+		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp))
 	} else if reason == "" {
 		h.app.RecordRequestEvent(requestEventRow{
 			TsUnixSec:     uint32(time.Now().UTC().Unix()),
 			VhostID:       k.VhostID,
 			ClientIP:      securityClientIP(r),
-			ForwardedIP:   forwardedIP(r),
+			ForwardedIP:   identity.forwardedIP,
 			FrontProxy:    frontProxy(r),
 			Method:        k.Method,
 			Path:          capPath(r.URL.Path),
 			PathBucket:    pathBucket(r.URL.Path),
 			Status:        k.Status,
 			HTTPVersion:   httpVersionOrUnknown(r),
-			UA:            capUA(telemetryUserAgent(r)),
+			UA:            capUA(identity.userAgent),
 			Origin:        origin,
 			BytesIn:       requestBytes(r),
 			BytesOut:      responseBytes(w),
@@ -228,7 +231,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// rotating IPs will split. Good enough for "rough number of
 	// distinct clients in this window."
 	if salt := h.app.HashSalt(); salt != "" {
-		hash := ClientHash(clientIP(r), telemetryUserAgent(r), salt)
+		hash := ClientHash(identity.hashIP, identity.userAgent, salt)
 		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
 	}
 }
@@ -239,7 +242,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
@@ -248,14 +251,14 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		TsUnixMs:              now.UnixMilli(),
 		VhostID:               vhostID,
 		ClientIP:              securityClientIP(r),
-		ForwardedIP:           forwardedIP(r),
+		ForwardedIP:           identity.forwardedIP,
 		FrontProxy:            frontProxy(r),
 		Method:                methodOrUnknown(r.Method),
 		Path:                  capPath(r.URL.Path),
 		PathBucket:            pathBucket(r.URL.Path),
 		Status:                finalStatus(w, servErr),
 		HTTPVersion:           httpVersionOrUnknown(r),
-		UA:                    capUA(telemetryUserAgent(r)),
+		UA:                    capUA(identity.userAgent),
 		Origin:                origin,
 		UpstreamFailureReason: upstreamFailureReason(r, w, servErr, origin),
 		BytesIn:               requestBytes(r),

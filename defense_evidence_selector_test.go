@@ -100,3 +100,24 @@ func TestDefenseEvidenceCaptureStampAllocationsIndependentOfSelectors(t *testing
 		})
 	}
 }
+
+// Thousands of managed names must not exhaust a per-request work budget or
+// mask ordinary requests; the name lookup is precomputed.
+func TestManagedHeaderPrivacyLargePolicyKeepsOrdinaryDetail(t *testing.T) {
+	pairs := make([]managedHeaderCredential, managedHeaderPairMaxCount)
+	for i := range pairs {
+		pairs[i] = managedHeaderCredential{Name: fmt.Sprintf("X-N-%05d", i), Value: fmt.Sprintf("unused-value-%05d", i)}
+	}
+	r := privacyRequest(t, pairs, benchBrowserRequest(map[string]any{}).Header)
+	bridge := &CorazaPrivacyBridge{}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("large-policy-%d", i)
+		release := bridge.Bind(id, r)
+		require.True(t, bridge.Redact(id, "ordinary finding") == "ordinary finding", "a large policy masked an ordinary request")
+		release()
+	}
+	r.Header.Set("X-N-32767", "unused-value-32767")
+	release := bridge.Bind("large-policy-carrying", r)
+	require.True(t, bridge.Redact("large-policy-carrying", "ordinary finding") == "", "the last managed pair was not matched")
+	release()
+}

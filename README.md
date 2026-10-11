@@ -110,3 +110,26 @@ JSON encoding fix independently mergeable. PR #10 (unified plugin/gate) was
 closed without merging; if that work resumes, its separate gate will need
 equivalent failure capture. PR status checked on 2026-09-14; this work starts
 from the image's `3ae643eb9957d2d7d9bf4cfae81201e35f3381bb` pin.
+
+## Managed Header privacy
+
+`apx_defense_evidence` in `capture_privacy` mode receives the Header name/value
+pairs of the cluster's Defense rules. Telemetry masks only requests that carry
+one: a field of a managed Header name that equals a managed value after
+trimming, ASCII case folding and CRS-style URL/HTML decoding (each element of a
+comma-separated list; an IP in any textual form). For such a request every WAF
+finding's `rule_msg`/`match_data` is masked, since CRS transforms can rewrite the
+value. Any finding text containing a managed value of 8 bytes or more is masked
+too. `request_events.ua` is masked when it is a managed value or embeds one
+managed under another Header name; `forwarded_ip` and the unique-client hash IP
+when they are a managed IP.
+
+Masked text is `[masked: managed header value]` and a masked forwarded IP is
+`100::` (RFC 6666 discard-only), so masked is distinguishable from absent (`""`,
+`::`). If a managed value would itself appear in a marker, the text marker falls
+back to `[masked]`, then `[*]`, then `""`, and the IP to `100::1`, `100::2`, ...
+
+The stamped `X-Apx-Defense-Evidence` value is
+`http=<0|1>;coraza_all=<0|1>;coraza_rule_ids=<ascending ids>`, using only bytes
+CRS 920274 accepts at paranoia level 4. Selectors for CRS rules outside this
+image's catalog are skipped and logged once when the config loads.

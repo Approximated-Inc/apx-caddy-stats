@@ -203,6 +203,8 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	var evidence defenseEvidence
 	v2 := corazaTransactionEvidenceVersion(tx)
 	privacyVersion := corazaTransactionManagedPrivacyVersion(tx)
+	privacyState, _ := corazaPrivacyRegistry.lookup(txID)
+	private := privacyVersion != 0
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
@@ -228,13 +230,8 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			continue
 		}
 		message, data := d.Msg(), d.Data()
-		if privacyVersion != 0 {
-			if privacyVersion == 1 {
-				bridge := &CorazaPrivacyBridge{}
-				message, data = bridge.Redact(txID, message), bridge.Redact(txID, data)
-			} else {
-				message, data = "", ""
-			}
+		if private {
+			message, data = privateCorazaText(privacyState, privacyVersion, message), privateCorazaText(privacyState, privacyVersion, data)
 		}
 		out = append(out, corazaDetection{
 			TsUnixSec: tsSec,
@@ -261,6 +258,22 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 		})
 	}
 	return out
+}
+
+// privateCorazaText replaces finding text that must not reach telemetry with
+// the masked marker, so it stays distinguishable from a finding without text.
+// An unknown privacy version, or a missing (unbound or reused) state, masks.
+func privateCorazaText(state *managedHeaderState, version int, text string) string {
+	if text == "" {
+		return ""
+	}
+	if version >= 0 && state != nil && state.redact(text) != "" {
+		return text
+	}
+	if state != nil && state.policy != nil {
+		return state.policy.maskedText
+	}
+	return managedHeaderMaskedText
 }
 
 // corazaUnixNanoToSec converts the audit record's UnixTimestamp (which is

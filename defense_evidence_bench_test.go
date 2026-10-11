@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -161,5 +162,50 @@ func BenchmarkDefenseEvidenceRequestFloor(b *testing.B) {
 		r := *base
 		r.Header = base.Header.Clone()
 		_, _ = withDefenseSnapshotHolder(&r)
+	}
+}
+
+func benchPrivacyPairs(n int) []managedHeaderCredential {
+	pairs := make([]managedHeaderCredential, n)
+	for i := range pairs {
+		pairs[i] = managedHeaderCredential{Name: fmt.Sprintf("X-Partner-Key-%03d", i), Value: fmt.Sprintf("partner-secret-%03d-0123456789abcdef", i)}
+	}
+	return pairs
+}
+
+// Redact on a request that carries no managed value scans the finding text
+// for any managed value; this is the per-finding cost of that scan.
+func BenchmarkManagedHeaderPrivacyRedactText(b *testing.B) {
+	text := "Matched Data: union select found within ARGS:q: " + strings.Repeat("1 union select password from users where name='admin' -- ", 16)
+	for _, n := range []int{8, 128} {
+		b.Run(fmt.Sprintf("names=%d/bytes=%d", n, len(text)), func(b *testing.B) {
+			state := newManagedHeaderState(compileManagedHeaderPolicy(benchPrivacyPairs(n)), nil)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if state.redact(text) == "" {
+					b.Fatal("ordinary text was masked")
+				}
+			}
+		})
+	}
+}
+
+// The Header-derived identity request telemetry records (User-Agent,
+// forwarded IP, hash IP), checked against the managed values.
+func BenchmarkTelemetryIdentity(b *testing.B) {
+	for _, n := range []int{0, 8, 128} {
+		b.Run(fmt.Sprintf("names=%d", n), func(b *testing.B) {
+			r := benchBrowserRequest(map[string]any{})
+			r, _ = withDefenseSnapshotHolder(r)
+			if n > 0 {
+				requestDefenseHolder(r).capturePrivacy(compileManagedHeaderPolicy(benchPrivacyPairs(n)), r.Header)
+			}
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if telemetryIdentity(r).userAgent == "" {
+					b.Fatal("no User-Agent")
+				}
+			}
+		})
 	}
 }

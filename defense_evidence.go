@@ -134,7 +134,7 @@ type defenseSnapshotKey struct{}
 type defenseSnapshotHolder struct {
 	mu       sync.RWMutex
 	snapshot *defenseSnapshot
-	privacy  *managedHeaderSnapshot
+	privacy  *managedHeaderState
 }
 
 // publish stores a private copy; only the first snapshot is authoritative.
@@ -216,7 +216,7 @@ type defenseEvidencePlan struct {
 	rules, skips                []defenseSelector // ascending IDs
 	byName                      map[string][]defenseSelectorTarget
 	unknown                     []uint32 // skipped: not in this image's catalog
-	privacyNames                []string // lowercase managed Header names
+	privacy                     *managedHeaderPolicy
 }
 
 func init() { caddy.RegisterModule(&DefenseEvidenceHandler{}) }
@@ -265,7 +265,7 @@ func (h *DefenseEvidenceHandler) compile() (*defenseEvidencePlan, error) {
 		return nil, errors.New("invalid managed Header privacy input")
 	}
 	for _, pair := range h.ManagedHeaders {
-		if pair.Name == "" || len(pair.Name) > 128 || pair.Value == "" || len(pair.Value) > 1024 {
+		if pair.Name == "" || len(pair.Name) > managedHeaderNameMaxBytes || pair.Value == "" || len(pair.Value) > managedHeaderValueMaxBytes {
 			return nil, errors.New("invalid managed Header privacy input")
 		}
 	}
@@ -306,12 +306,8 @@ func (h *DefenseEvidenceHandler) compile() (*defenseEvidencePlan, error) {
 		plan.unknown = append(plan.unknown, id)
 	}
 	sort.Slice(plan.unknown, func(i, j int) bool { return plan.unknown[i] < plan.unknown[j] })
-	seen := make(map[string]bool)
-	for _, pair := range h.ManagedHeaders {
-		if name := strings.ToLower(pair.Name); !seen[name] {
-			seen[name] = true
-			plan.privacyNames = append(plan.privacyNames, name)
-		}
+	if h.Mode == "capture_privacy" {
+		plan.privacy = compileManagedHeaderPolicy(h.ManagedHeaders)
 	}
 	return plan, nil
 }
@@ -436,11 +432,7 @@ func (h *DefenseEvidenceHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	switch plan.mode {
 	case "capture_privacy":
 		if holder != nil {
-			holder.mu.Lock()
-			if holder.privacy == nil {
-				holder.privacy = captureManagedHeaders(r.Header, plan.privacyNames)
-			}
-			holder.mu.Unlock()
+			holder.capturePrivacy(plan.privacy, r.Header)
 		}
 	case "capture":
 		if holder != nil {
