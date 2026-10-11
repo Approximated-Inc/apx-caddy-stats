@@ -48,7 +48,7 @@ type defenseSnapshotKey struct{}
 type defenseSnapshotHolder struct {
 	mu       sync.RWMutex
 	snapshot *defenseSnapshot
-	privacy *managedHeaderSnapshot
+	privacy  *managedHeaderSnapshot
 }
 
 func (h *defenseSnapshotHolder) publish(s defenseSnapshot) error {
@@ -86,9 +86,9 @@ func requestDefenseHolder(r *http.Request) *defenseSnapshotHolder {
 // DefenseEvidenceHandler captures once, then restores only that snapshot at
 // each WAF boundary. Headers and later vars are never an authority source.
 type DefenseEvidenceHandler struct {
-	ManagedHeaders []managedHeaderCredential `json:"managed_headers,omitempty"`
- privacyNamesOnce sync.Once
- privacyNames []string
+	ManagedHeaders     []managedHeaderCredential `json:"managed_headers,omitempty"`
+	privacyNamesOnce   sync.Once
+	privacyNames       []string
 	Mode               string            `json:"mode"`
 	HTTPVar            string            `json:"http_var,omitempty"`
 	CorazaAllVar       string            `json:"coraza_all_var,omitempty"`
@@ -97,17 +97,23 @@ type DefenseEvidenceHandler struct {
 	SkipCorazaRuleVars map[string]string `json:"skip_coraza_rule_vars,omitempty"`
 }
 
-func init() { caddy.RegisterModule(DefenseEvidenceHandler{}) }
-func (DefenseEvidenceHandler) CaddyModule() caddy.ModuleInfo {
+func init() { caddy.RegisterModule(&DefenseEvidenceHandler{}) }
+func (*DefenseEvidenceHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{ID: "http.handlers.apx_defense_evidence", New: func() caddy.Module { return new(DefenseEvidenceHandler) }}
 }
 func (h *DefenseEvidenceHandler) Validate() error {
 	if h.Mode != "capture" && h.Mode != "capture_privacy" && h.Mode != "stamp_waf" {
 		return errors.New("invalid Defense evidence mode")
 	}
-	if len(h.ManagedHeaders) > managedHeaderPairMaxCount || (h.Mode != "capture_privacy" && len(h.ManagedHeaders)>0) { return errors.New("invalid managed Header privacy input") }
- for _, pair := range h.ManagedHeaders { if pair.Name=="" || len(pair.Name)>128 || pair.Value=="" || len(pair.Value)>1024 { return errors.New("invalid managed Header privacy input") } }
- if (h.Mode == "stamp_waf" || h.Mode == "capture_privacy") && (h.HTTPVar != "" || h.CorazaAllVar != "" || h.ObserveCorazaVar != "" || len(h.CorazaRuleVars) > 0 || len(h.SkipCorazaRuleVars) > 0) {
+	if len(h.ManagedHeaders) > managedHeaderPairMaxCount || (h.Mode != "capture_privacy" && len(h.ManagedHeaders) > 0) {
+		return errors.New("invalid managed Header privacy input")
+	}
+	for _, pair := range h.ManagedHeaders {
+		if pair.Name == "" || len(pair.Name) > 128 || pair.Value == "" || len(pair.Value) > 1024 {
+			return errors.New("invalid managed Header privacy input")
+		}
+	}
+	if (h.Mode == "stamp_waf" || h.Mode == "capture_privacy") && (h.HTTPVar != "" || h.CorazaAllVar != "" || h.ObserveCorazaVar != "" || len(h.CorazaRuleVars) > 0 || len(h.SkipCorazaRuleVars) > 0) {
 		return errors.New("stamp_waf cannot capture variables")
 	}
 	for _, vars := range []map[string]string{h.CorazaRuleVars, h.SkipCorazaRuleVars} {
@@ -121,14 +127,17 @@ func (h *DefenseEvidenceHandler) Validate() error {
 			}
 		}
 	}
- h.privacyNamesOnce.Do(func() {
-  seen:=make(map[string]bool)
-  for _,pair:=range h.ManagedHeaders {
-   name:=strings.ToLower(pair.Name)
-   if !seen[name] { seen[name]=true;h.privacyNames=append(h.privacyNames,strings.Clone(name)) }
-  }
- })
- return nil
+	h.privacyNamesOnce.Do(func() {
+		seen := make(map[string]bool)
+		for _, pair := range h.ManagedHeaders {
+			name := strings.ToLower(pair.Name)
+			if !seen[name] {
+				seen[name] = true
+				h.privacyNames = append(h.privacyNames, strings.Clone(name))
+			}
+		}
+	})
+	return nil
 }
 func strictDefenseVar(r *http.Request, name string) bool {
 	if name == "" {
@@ -157,19 +166,23 @@ func clearDefenseMarkers(headers http.Header) {
 	}
 }
 func (h *DefenseEvidenceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if h.Mode != "capture_privacy" { clearDefenseMarkers(r.Header) }
+	if h.Mode != "capture_privacy" {
+		clearDefenseMarkers(r.Header)
+	}
 	if h.Validate() != nil {
 		return next.ServeHTTP(w, r)
 	}
 	holder := requestDefenseHolder(r)
 	switch h.Mode {
- case "capture_privacy":
-  if holder!=nil {
-   holder.mu.Lock()
-   if holder.privacy==nil { holder.privacy=captureManagedHeaders(r.Header,h.privacyNames) }
-   holder.mu.Unlock()
-  }
- case "capture":
+	case "capture_privacy":
+		if holder != nil {
+			holder.mu.Lock()
+			if holder.privacy == nil {
+				holder.privacy = captureManagedHeaders(r.Header, h.privacyNames)
+			}
+			holder.mu.Unlock()
+		}
+	case "capture":
 		if holder != nil {
 			// Ignore later captures; only the first complete snapshot is authoritative.
 			_ = holder.publish(defenseSnapshot{Evidence: defenseEvidence{HTTP: strictDefenseVar(r, h.HTTPVar), CorazaAll: strictDefenseVar(r, h.CorazaAllVar), CorazaRuleIDs: selectedDefenseVars(r, h.CorazaRuleVars)}, ObserveCoraza: strictDefenseVar(r, h.ObserveCorazaVar), SkipCorazaRuleIDs: selectedDefenseVars(r, h.SkipCorazaRuleVars)})
