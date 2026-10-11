@@ -276,7 +276,7 @@ func privateCorazaURI(state *managedHeaderState, version int, uri string) string
 	if state == nil || state.policy == nil {
 		return "/" + managedHeaderMaskedURLPart
 	}
-	return state.policy.redactURI(managedURLScanBytes(uri, corazaRequestURIMaxBytes), version < 0 || state.masked.Load())
+	return state.policy.redactURI(state.policy.urlScanWindow(uri, corazaRequestURIMaxBytes, true), version < 0 || state.masked.Load())
 }
 
 // privateCorazaText replaces finding text that must not reach telemetry with

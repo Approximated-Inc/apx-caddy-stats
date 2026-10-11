@@ -57,9 +57,10 @@ type managedHeaderPolicy struct {
 	nameLens  [managedHeaderNameMaxBytes + 1]bool
 	values    map[string]struct{} // ASCII-lowercase managed values
 	valueLens [managedHeaderValueMaxBytes + 1]bool
-	lengths   []int                   // the set lengths of valueLens, ascending
+	lengths   []int                   // the set lengths of valueLens below managedHeaderContainMinBytes, ascending
 	ips       map[netip.Addr]struct{} // IPs among the values and their list elements
 	contain   foldMatcher             // values of at least managedHeaderContainMinBytes
+	question  bool                    // a value holds a literal '?', which can split it across a URL's path and query
 	// Values of at least managedHeaderContainMinBytes managed under names other
 	// than User-Agent. A User-Agent value only masks a whole User-Agent: a rule
 	// on a common prefix ("Mozilla/5.0") must not blank every browser's.
@@ -91,8 +92,13 @@ func compileManagedHeaderPolicy(pairs []managedHeaderCredential) *managedHeaderP
 		}
 		p.values[value] = struct{}{}
 		p.valueLens[len(value)] = true
+		p.question = p.question || strings.IndexByte(value, '?') >= 0
 		if len(value) >= managedHeaderContainMinBytes {
 			p.contain.add(value)
+			// CRS urlDecodeUni (and form decoding) turn a literal '+' into a space.
+			if strings.IndexByte(value, '+') >= 0 {
+				p.contain.add(strings.ReplaceAll(value, "+", " "))
+			}
 		}
 		for _, element := range strings.Split(pair.Value, ",") {
 			if ip, err := netip.ParseAddr(trimSpace(element)); err == nil {
@@ -100,7 +106,9 @@ func compileManagedHeaderPolicy(pairs []managedHeaderCredential) *managedHeaderP
 			}
 		}
 	}
-	for n, set := range p.valueLens {
+	// Values of managedHeaderContainMinBytes or more are found by contain
+	// anywhere, so only shorter ones need the whole-token scan.
+	for n, set := range p.valueLens[:managedHeaderContainMinBytes] {
 		if set {
 			p.lengths = append(p.lengths, n)
 		}
@@ -232,6 +240,25 @@ func managedURLScanBytes(text string, limit int) string {
 	return text
 }
 
+// urlScanWindow is managedURLScanBytes for a path, or a request target when
+// target is set. A value encoded over several rounds can start in the kept
+// bytes yet end past the window, so the segment or parameter the window cuts
+// becomes the URL marker when it starts within limit and holds an escape.
+func (p *managedHeaderPolicy) urlScanWindow(text string, limit int, target bool) string {
+	window := managedURLScanBytes(text, limit)
+	if len(window) == len(text) {
+		return window
+	}
+	start := strings.LastIndexByte(window, '/') + 1
+	if q := strings.IndexByte(window, '?'); target && q >= 0 {
+		start = max(q, strings.LastIndexByte(window, '&')) + 1
+	}
+	if start < limit && strings.ContainsAny(window[start:], "%&") {
+		return window[:start] + p.maskedURLPart
+	}
+	return window
+}
+
 // urlTextCarries reports whether URL text holds a managed value of at least
 // managedHeaderContainMinBytes anywhere or, for a request that carried a
 // managed value (all), any managed value as a whole token, directly or after
@@ -253,8 +280,9 @@ func (p *managedHeaderPolicy) urlTextCarries(text string, all bool) bool {
 	}
 }
 
-// tokenCarries finds a managed value, of any length, that is the whole text,
-// one of its list elements or IP forms, or a token in it: not continued by an
+// tokenCarries finds a managed value that is the whole text, one of its list
+// elements or IP forms, or, when shorter than managedHeaderContainMinBytes
+// (contain finds longer ones anywhere), a token in it: not continued by an
 // alphanumeric byte on either side where the value's own edge is alphanumeric.
 func (p *managedHeaderPolicy) tokenCarries(t string) bool {
 	if p.formCarries(trimSpace(t)) || p.ipTokenCarries(t) {
@@ -343,29 +371,72 @@ func (p *managedHeaderPolicy) redactURLQuery(query string, all bool) string {
 	if all {
 		return p.maskedURLPart
 	}
-	if !p.urlTextCarries(query, false) {
+	return p.redactURLParams(query, false)
+}
+
+// redactURLParams replaces each parameter carrying a managed value with the
+// URL marker, or the whole query when a value spans parameters.
+func (p *managedHeaderPolicy) redactURLParams(query string, all bool) string {
+	if query == "" || !p.urlTextCarries(query, all) {
 		return query
 	}
 	params := strings.Split(query, "&")
 	for i, param := range params {
-		if param != "" && p.urlTextCarries(param, false) {
+		if param != "" && p.urlTextCarries(param, all) {
 			params[i] = p.maskedURLPart
 		}
 	}
-	if out := strings.Join(params, "&"); !p.urlTextCarries(out, false) {
+	if out := strings.Join(params, "&"); !p.urlTextCarries(out, all) {
 		return out
 	}
 	return p.maskedURLPart
 }
 
-// redactURI applies redactURLPath and redactURLQuery to a request target.
+// redactURLTarget applies redactURLPath and redactURLQuery to a path and its
+// query. A value holding a literal '?' sent raw is split between the path's
+// last segment and the first parameter: both become the marker, or the whole
+// path and query when the value reaches further.
+func (p *managedHeaderPolicy) redactURLTarget(path, query string, hasQuery, all bool) (string, string) {
+	redacted := p.redactURLPath(path, all)
+	if !hasQuery {
+		return redacted, ""
+	}
+	out := p.redactURLQuery(query, all)
+	if !p.question {
+		return redacted, out
+	}
+	params := out
+	if all {
+		params = p.redactURLParams(query, true)
+	}
+	if !p.urlTextCarries(redacted+"?"+params, all) {
+		return redacted, out
+	}
+	segment := path[strings.LastIndexByte(path, '/')+1:]
+	first, rest, hasRest := strings.Cut(query, "&")
+	if p.urlTextCarries(segment, all) || p.urlTextCarries(first, all) || !p.urlTextCarries(segment+"?"+first, all) {
+		return "/" + p.maskedURLPart, p.maskedURLPart
+	}
+	redacted = redacted[:strings.LastIndexByte(redacted, '/')+1] + p.maskedURLPart
+	if !all && hasRest {
+		out = p.maskedURLPart + "&" + p.redactURLParams(rest, false)
+	} else {
+		out = p.maskedURLPart
+	}
+	if p.urlTextCarries(redacted+"?"+out, all) {
+		return "/" + p.maskedURLPart, p.maskedURLPart
+	}
+	return redacted, out
+}
+
+// redactURI applies redactURLTarget to a request target.
 func (p *managedHeaderPolicy) redactURI(uri string, all bool) string {
 	path, query, hasQuery := strings.Cut(uri, "?")
-	path = p.redactURLPath(path, all)
+	path, query = p.redactURLTarget(path, query, hasQuery, all)
 	if !hasQuery {
 		return path
 	}
-	return path + "?" + p.redactURLQuery(query, all)
+	return path + "?" + query
 }
 
 // foldMatcher finds any of its ASCII-lowercase patterns (each at least
@@ -533,7 +604,7 @@ func (s *managedHeaderState) observe(headers http.Header) {
 // managed value (CRS transforms can rewrite it, so all of its text is
 // withheld), or the text itself contains one.
 func (s *managedHeaderState) redact(text string) string {
-	if text == "" || s.masked.Load() || s.policy == nil || s.policy.contain.find(text) {
+	if text == "" || s.masked.Load() || s.policy == nil || s.policy.urlTextCarries(text, false) {
 		return ""
 	}
 	return text
@@ -596,14 +667,23 @@ func telemetryIdentity(r *http.Request) requestTelemetryIdentity {
 }
 
 // telemetryPath is the request path telemetry records: a managed value in it
-// is replaced by the URL marker (see redactURLPath).
+// is replaced by the URL marker (see redactURLTarget). A path with nothing
+// masked is returned whole, so its path_bucket never depends on the scan window.
 func telemetryPath(r *http.Request) string {
 	path := r.URL.Path
 	state := requestManagedHeaderState(r)
 	if path == "" || state == nil || state.policy == nil {
 		return path
 	}
-	return state.policy.redactURLPath(managedURLScanBytes(path, requestEventPathMaxBytes), state.masked.Load())
+	scan := managedURLScanBytes(path, requestEventPathMaxBytes)
+	// A value split at '?' starts within its encoded length of the end of the
+	// path, so a path longer than the window keeps no part of it.
+	hasQuery := len(scan) == len(path) && (r.URL.RawQuery != "" || r.URL.ForceQuery)
+	out, _ := state.policy.redactURLTarget(state.policy.urlScanWindow(path, requestEventPathMaxBytes, false), managedURLScanBytes(r.URL.RawQuery, 0), hasQuery, state.masked.Load())
+	if out == scan {
+		return path
+	}
+	return out
 }
 
 // managedHeaderRegistry indexes live WAF transactions to their request's

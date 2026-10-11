@@ -126,10 +126,11 @@ one: a field of a managed Header name that equals a managed value after
 trimming, ASCII case folding and CRS-style URL/HTML decoding (each element of a
 comma-separated list; an IP in any textual form). For such a request every WAF
 finding's `rule_msg`/`match_data` is masked, since CRS transforms can rewrite the
-value. Any finding text containing a managed value of 8 bytes or more is masked
-too. `request_events.ua` is masked when it is a managed value or embeds one
-managed under another Header name; `forwarded_ip` and the unique-client hash IP
-when they are a managed IP.
+value. Any finding text containing a managed value of 8 bytes or more, directly
+or after up to three rounds of CRS-style URL/HTML decoding, is masked too. A
+value's `+` also matches a space, as CRS decodes it. `request_events.ua` is
+masked when it is a managed value or embeds one managed under another Header
+name; `forwarded_ip` and the unique-client hash IP when they are a managed IP.
 
 The URL is masked by part, keeping its shape. In the WAF finding's
 `request_uri` and in `request_events.path`/`path_bucket` (and the Edge Verify
@@ -139,9 +140,16 @@ decoding, becomes `[masked]`, on any request. For a request that carries a
 managed value, a segment that holds any managed value as a whole token (or a
 managed IP in any textual form) is masked too, and its whole query becomes
 `[masked]`. A value spanning segments or parameters masks the whole path or
-query. Redaction runs before the URL is truncated, so a value straddling the
-limit is not partly shipped. A WAF transaction bound without a privacy state
-ships `request_uri` as `/[masked]`.
+query. A value holding a literal `?` sent raw is split between the path and
+the query: the last path segment and the first parameter both become
+`[masked]` (the whole path and query when the value reaches further).
+Redaction runs before the URL is truncated, over the kept bytes plus 6 KiB, so
+a value straddling the limit is not partly shipped; a segment or parameter that
+starts within the limit, holds an escape and is cut by that scan window (a
+value encoded over several rounds) becomes `[masked]`. A path with nothing
+masked is recorded unchanged, so its `path_bucket` never depends on the scan.
+A WAF transaction bound without a privacy state ships `request_uri` as
+`/[masked]`.
 
 Masked text is `[masked: managed header value]` and a masked forwarded IP is
 `100::` (RFC 6666 discard-only), so masked is distinguishable from absent (`""`,
