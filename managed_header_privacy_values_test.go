@@ -315,6 +315,32 @@ func TestManagedHeaderPrivacyLongLivedBindingsDoNotDegradeOthers(t *testing.T) {
 	require.Zero(t, privacyRegistrySize(), "released bindings leaked registry entries")
 }
 
+// A transaction the connector bound must never ship raw text, even when the
+// WAF's audit log omitted part H (no privacy proof in the producer).
+func TestCorazaWriterMasksBoundTransactionsWithoutPrivacyProof(t *testing.T) {
+	pairs := []managedHeaderCredential{{Name: "X-Partner-Key", Value: valuesSecret}}
+	rules := `SecRule REQUEST_HEADERS:X-Partner-Key "@rx ." "id:900151,phase:1,pass,log,msg:'key %{MATCHED_VAR}',logdata:'%{MATCHED_VAR}'"
+SecRule REQUEST_HEADERS:Accept "@rx ." "id:900152,phase:1,pass,log,msg:'accept',logdata:'%{MATCHED_VAR}'"`
+	for _, parts := range []string{"ABIJKZ", "ABHIJKZ"} {
+		for _, signature := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/signature=%v", parts, signature), func(t *testing.T) {
+				run := runPrivacyPipeline(t, privacyRunOptions{pairs: pairs, rules: rules, auditParts: parts, noSignature: !signature, prepare: setHeader("X-Partner-Key", valuesSecret)})
+				require.Len(t, run.detections, 2)
+				for _, d := range run.detections {
+					require.True(t, d.RuleMsg == managedHeaderMaskedText && d.MatchData == managedHeaderMaskedText, "a bound transaction shipped raw text")
+				}
+				require.False(t, containsFold(run.encoded, "7f3a9c"), "the managed value reached encoded telemetry")
+				ordinary := runPrivacyPipeline(t, privacyRunOptions{pairs: pairs, rules: rules, auditParts: parts, noSignature: !signature})
+				require.Len(t, ordinary.detections, 1)
+				require.True(t, ordinary.detections[0].MatchData == "text/html,*/*;q=0.8", "a bound ordinary transaction lost its detail")
+			})
+		}
+	}
+	// Teeth for the fixtures: without the bridge the same rules do echo it.
+	raw := runPrivacyPipeline(t, privacyRunOptions{pairs: pairs, rules: rules, auditParts: "ABIJKZ", noSignature: true, unbound: true, prepare: setHeader("X-Partner-Key", valuesSecret)})
+	require.True(t, containsFold(raw.encoded, "7f3a9c"), "fixture rules no longer echo the Header; the masking checks are vacuous")
+}
+
 // Configuration and state never print managed values.
 func TestManagedHeaderPrivacyFormattingRedactsValues(t *testing.T) {
 	pairs := []managedHeaderCredential{{Name: "X-Partner-Key", Value: valuesSecret}}

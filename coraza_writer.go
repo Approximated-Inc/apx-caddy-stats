@@ -203,8 +203,10 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	var evidence defenseEvidence
 	v2 := corazaTransactionEvidenceVersion(tx)
 	privacyVersion := corazaTransactionManagedPrivacyVersion(tx)
-	privacyState, _ := corazaPrivacyRegistry.lookup(txID)
-	private := privacyVersion != 0
+	// A transaction the connector bound ran under managed Header privacy even
+	// when its audit log omitted part H (no producer proof): fail closed.
+	privacyState, bound := corazaPrivacyRegistry.lookup(txID)
+	private := privacyVersion != 0 || bound
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
 		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
