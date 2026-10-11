@@ -25,10 +25,18 @@ type managedHeaderSnapshot struct {
 	maskAll bool
 	names   []string
 	work    int
+	// userAgent is fixed at capture: a managed User-Agent is never telemetry.
+	userAgent bool
 }
 
 func captureManagedHeaders(headers http.Header, names []string) *managedHeaderSnapshot {
 	snapshot := &managedHeaderSnapshot{names: names}
+	for _, name := range names {
+		if strings.EqualFold(name, "User-Agent") {
+			snapshot.userAgent = true
+			break
+		}
+	}
 	snapshot.captureNames(headers)
 	return snapshot
 }
@@ -57,6 +65,20 @@ func (s *managedHeaderSnapshot) redact(text string) string {
 		return ""
 	}
 	return text
+}
+
+// telemetryUserAgent is the User-Agent that request telemetry may record:
+// empty when this request's captured managed Header names include User-Agent.
+func telemetryUserAgent(r *http.Request) string {
+	if holder := requestDefenseHolder(r); holder != nil {
+		holder.mu.RLock()
+		managed := holder.privacy != nil && holder.privacy.userAgent
+		holder.mu.RUnlock()
+		if managed {
+			return ""
+		}
+	}
+	return r.UserAgent()
 }
 
 type managedHeaderRegistryEntry struct {

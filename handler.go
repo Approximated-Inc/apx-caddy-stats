@@ -212,7 +212,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 			PathBucket:    pathBucket(r.URL.Path),
 			Status:        k.Status,
 			HTTPVersion:   httpVersionOrUnknown(r),
-			UA:            capUA(r.UserAgent()),
+			UA:            capUA(telemetryUserAgent(r)),
 			Origin:        origin,
 			BytesIn:       requestBytes(r),
 			BytesOut:      responseBytes(w),
@@ -228,7 +228,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// rotating IPs will split. Good enough for "rough number of
 	// distinct clients in this window."
 	if salt := h.app.HashSalt(); salt != "" {
-		hash := ClientHash(clientIP(r), r.UserAgent(), salt)
+		hash := ClientHash(clientIP(r), telemetryUserAgent(r), salt)
 		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
 	}
 }
@@ -255,7 +255,7 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		PathBucket:            pathBucket(r.URL.Path),
 		Status:                finalStatus(w, servErr),
 		HTTPVersion:           httpVersionOrUnknown(r),
-		UA:                    capUA(r.UserAgent()),
+		UA:                    capUA(telemetryUserAgent(r)),
 		Origin:                origin,
 		UpstreamFailureReason: upstreamFailureReason(r, w, servErr, origin),
 		BytesIn:               requestBytes(r),
