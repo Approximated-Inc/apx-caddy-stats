@@ -1,0 +1,21 @@
+{
+  "now": "2026-10-06T12:00:00Z",
+  "cases": [
+    {"name":"A only", "facts":{"proxy_server_id":7,"headers":[["X-Fixture-A","alpha"]]},"operations":["bypass_l7_challenges"]},
+    {"name":"B only", "facts":{"proxy_server_id":7,"headers":[["x-fixture-b","beta"]]},"operations":["exclude_http_request_evidence"]},
+    {"name":"both", "facts":{"proxy_server_id":7,"headers":[["X-Fixture-A","alpha"],["X-Fixture-B","beta"]]},"operations":["bypass_l7_challenges","exclude_http_request_evidence"]},
+    {"name":"duplicate A", "facts":{"proxy_server_id":7,"headers":[["X-Fixture-A","alpha"],["x-fixture-a","alpha"]]},"operations":[]},
+    {"name":"wrong case value", "facts":{"proxy_server_id":7,"headers":[["X-Fixture-A","Alpha"]]},"operations":[]},
+    {"name":"foreign cluster", "facts":{"proxy_server_id":8,"headers":[["X-Fixture-A","alpha"]]},"operations":[]},
+    {"name":"missing headers", "facts":{"proxy_server_id":7},"operations":[]}
+  ],
+  "restriction_cases": [
+    {"ip":"192.0.2.1","path":"/private","matches":true},
+    {"ip":"192.0.2.1","path":"/private/deep","matches":true},
+    {"ip":"192.0.2.1","path":"/public","matches":false},
+    {"ip":"192.0.2.2","path":"/private","matches":false},
+    {"ip":"192.0.2.2","path":"/admin","matches":true},
+    {"ip":"192.0.2.1","path":"/admin","matches":false},
+    {"ip":"192.0.2.2","path":"/administrator","matches":false}
+  ]
+}

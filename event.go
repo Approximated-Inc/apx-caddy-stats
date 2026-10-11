@@ -21,13 +21,14 @@ const (
 // `proxy_server_id` is global per Caddy process (set on StatsApp at
 // provision) so it's not part of the key — there's exactly one value.
 type Key struct {
-	TsUnixMin uint32 // unix minute, fits 2106
-	VhostID   uint32
-	Method    string // "GET" / "POST" / etc — kept as string; cardinality is small
-	Status    uint16 // full HTTP status (200, 404, 502, …)
-	Origin    string // OriginUpstream | OriginCluster | OriginClusterProxyError
-	Country   string // ISO 3166 alpha-2, "" if unknown
-	ASN       uint32 // 0 if unknown
+	TsUnixMin     uint32 // unix minute, fits 2106
+	VhostID       uint32
+	Method        string // "GET" / "POST" / etc — kept as string; cardinality is small
+	Status        uint16 // full HTTP status (200, 404, 502, …)
+	Origin        string // OriginUpstream | OriginCluster | OriginClusterProxyError
+	Country       string // ISO 3166 alpha-2, "" if unknown
+	ASN           uint32 // 0 if unknown
+	DefenseExempt bool   // trusted header exemption; keeps mixed buckets separate
 }
 
 // uniqueKey identifies a per-(vhost, minute) set of hashed client

@@ -77,6 +77,7 @@ type corazaDetection struct {
 	ClientIP      string // audit-log Transaction().ClientIP() — real PROXY-derived client IP (NOT XFF)
 	MatchData     string // truncated to corazaMatchDataMaxBytes
 	WasBlocked    bool
+	DefenseExempt bool
 }
 
 // formatTsSec renders a Unix-second as RFC3339 UTC. Detection events
@@ -187,6 +188,9 @@ func encodeCorazaDetectionRow(w *gzip.Writer, ev corazaDetection, proxyServerID 
 	writeString(&b, "match_data", ev.MatchData)
 	b.WriteByte(',')
 	writeUint32(&b, "was_blocked", boolToUint32(ev.WasBlocked))
+	if ev.DefenseExempt {
+		b.WriteString(`,"defense_exempt":true`)
+	}
 	b.WriteString("}\n")
 	_, err := w.Write([]byte(b.String()))
 	return err

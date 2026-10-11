@@ -81,8 +81,10 @@ func capPath(p string) string {
 	if i := strings.IndexByte(p, '#'); i >= 0 {
 		p = p[:i]
 	}
-	return ownedTruncate(p, 1024)
+	return ownedTruncate(p, requestEventPathMaxBytes)
 }
+
+const requestEventPathMaxBytes = 1024
 
 // capUA truncates a user-agent to <=512 bytes UTF-8-safe. Copy-free under
 // the cap (truncateBytes, not ownedTruncate) is safe here: header VALUES

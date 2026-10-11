@@ -14,22 +14,23 @@ import (
 // here. SampleRate is the sample-under-load factor stamped by the
 // recorder (1 = kept every row; n>1 = this row represents n requests).
 type requestEventRow struct {
-	TsUnixSec   uint32 // second precision (per-request)
-	VhostID     uint32
-	ClientIP    string
-	ForwardedIP string
-	FrontProxy  string
-	Method      string
-	Path        string
-	PathBucket  string
-	Status      uint16
-	HTTPVersion string
-	UA          string
-	Origin      string
-	BytesIn     uint64
-	BytesOut    uint64
-	DurationUs  uint64
-	SampleRate  uint16
+	TsUnixSec     uint32 // second precision (per-request)
+	VhostID       uint32
+	ClientIP      string
+	ForwardedIP   string
+	FrontProxy    string
+	Method        string
+	Path          string
+	PathBucket    string
+	Status        uint16
+	HTTPVersion   string
+	UA            string
+	Origin        string
+	BytesIn       uint64
+	BytesOut      uint64
+	DurationUs    uint64
+	SampleRate    uint16
+	DefenseExempt bool
 
 	// --- mode_v2 fields (emitted only when V2 is true) ---
 	// TsUnixMs is epoch milliseconds (kept alongside TsUnixSec/`ts` for
@@ -124,6 +125,9 @@ func encodeRequestEventRow(w *gzip.Writer, ps uint32, row requestEventRow) error
 			b.WriteByte(',')
 			writeString(&b, "upstream_failure_reason", row.UpstreamFailureReason)
 		}
+	}
+	if row.DefenseExempt {
+		b.WriteString(`,"defense_exempt":true`)
 	}
 	b.WriteString("}\n")
 	_, err := w.Write([]byte(b.String()))

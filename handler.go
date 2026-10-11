@@ -19,8 +19,9 @@ import (
 // StatsHandler is the HTTP middleware. Installed once at the top of the
 // global handler chain so it sees every request the cluster serves.
 type StatsHandler struct {
-	logger *zap.Logger
-	app    AppRef
+	HolderOnly bool `json:"holder_only,omitempty"`
+	logger     *zap.Logger
+	app        AppRef
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -35,6 +36,9 @@ func (*StatsHandler) CaddyModule() caddy.ModuleInfo {
 // the app isn't configured — running the handler without the app would
 // silently drop counters, which is worse than a clear startup error.
 func (h *StatsHandler) Provision(ctx caddy.Context) error {
+	if h.HolderOnly {
+		return nil
+	}
 	h.logger = ctx.Logger()
 	if h.app != nil {
 		return nil
@@ -74,6 +78,10 @@ func (h *StatsHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return
 // dashboard with a one-line header injection. The exact match closes
 // it.
 func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	r, _ = withDefenseSnapshotHolder(r)
+	if h.HolderOnly {
+		return next.ServeHTTP(w, r)
+	}
 	if r.Header.Get("apx-monitor") == "true" {
 		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
 		return next.ServeHTTP(w, r)
@@ -104,13 +112,20 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
 func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+	// Keep the original generation authoritative, including early terminal rows.
+	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
+	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
+		defer app.finishHTTPRecord()
+	}
 	modeV2 := h.app.RequestEventsModeV2()
+	defenseExempt := h.defenseExempt(r)
 
 	// Challenge attempts record independently of vhost_id (see the original
 	// comment): a served challenge is terminal so vhost_id is unset. Read
 	// the outcome once — it also drives the request_event disposition below.
+	// Exempt outcomes stay in raw logs but cannot feed Defense evidence.
 	outcome := readChallengeOutcome(r)
-	if outcome != "" {
+	if outcome != "" && !defenseExempt {
 		h.app.RecordChallengeAttempt(challengeAttemptKey{
 			vhost:   challengeVhost(r),
 			ip:      securityClientIP(r),
@@ -127,7 +142,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	if edgeVerifyOutcome != "" {
 		h.app.RecordEdgeVerifyAttempt(edgeVerifyAttemptKey{
 			vhost:      challengeVhost(r),
-			pathBucket: pathBucket(r.URL.Path),
+			pathBucket: pathBucket(telemetryPath(r)),
 			outcome:    edgeVerifyOutcome,
 		})
 	}
@@ -146,7 +161,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, 0, challengeVhost(r), disp))
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp))
 		}
 		return
 	}
@@ -158,13 +173,14 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	durationUs := uint64(dur.Microseconds())
 
 	k := Key{
-		TsUnixMin: uint32(time.Now().UTC().Unix() / 60),
-		VhostID:   vhostID,
-		Method:    methodOrUnknown(r.Method),
-		Status:    finalStatus(w, servErr),
-		Origin:    origin,
-		Country:   country,
-		ASN:       asn,
+		TsUnixMin:     uint32(time.Now().UTC().Unix() / 60),
+		VhostID:       vhostID,
+		Method:        methodOrUnknown(r.Method),
+		Status:        finalStatus(w, servErr),
+		Origin:        origin,
+		Country:       country,
+		ASN:           asn,
+		DefenseExempt: defenseExempt,
 	}
 	d := CounterDelta{
 		BytesIn:    requestBytes(r),
@@ -176,6 +192,9 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	h.app.Record(k, d)
 	metricRequestsTotal.WithLabelValues(origin).Inc()
 
+	// Header-derived identity, with any managed Header value masked.
+	identity := telemetryIdentity(r)
+
 	// request_events. In mode_v2, EVERY disposition is logged (served rows
 	// unsampled, blocked/challenge rows sampled — decided in the recorder);
 	// host is empty here because vhost_id resolves the vhost. In legacy
@@ -183,24 +202,26 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, k.VhostID, "", disp))
+		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp))
 	} else if reason == "" {
+		path := telemetryPath(r)
 		h.app.RecordRequestEvent(requestEventRow{
-			TsUnixSec:   uint32(time.Now().UTC().Unix()),
-			VhostID:     k.VhostID,
-			ClientIP:    securityClientIP(r),
-			ForwardedIP: forwardedIP(r),
-			FrontProxy:  frontProxy(r),
-			Method:      k.Method,
-			Path:        capPath(r.URL.Path),
-			PathBucket:  pathBucket(r.URL.Path),
-			Status:      k.Status,
-			HTTPVersion: httpVersionOrUnknown(r),
-			UA:          capUA(r.UserAgent()),
-			Origin:      origin,
-			BytesIn:     requestBytes(r),
-			BytesOut:    responseBytes(w),
-			DurationUs:  durationUs,
+			TsUnixSec:     uint32(time.Now().UTC().Unix()),
+			VhostID:       k.VhostID,
+			ClientIP:      securityClientIP(r),
+			ForwardedIP:   identity.forwardedIP,
+			FrontProxy:    frontProxy(r),
+			Method:        k.Method,
+			Path:          capPath(path),
+			PathBucket:    pathBucket(path),
+			Status:        k.Status,
+			HTTPVersion:   httpVersionOrUnknown(r),
+			UA:            capUA(identity.userAgent),
+			Origin:        origin,
+			BytesIn:       requestBytes(r),
+			BytesOut:      responseBytes(w),
+			DurationUs:    durationUs,
+			DefenseExempt: k.DefenseExempt,
 		})
 	}
 
@@ -211,7 +232,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// rotating IPs will split. Good enough for "rough number of
 	// distinct clients in this window."
 	if salt := h.app.HashSalt(); salt != "" {
-		hash := ClientHash(clientIP(r), r.UserAgent(), salt)
+		hash := ClientHash(identity.hashIP, identity.userAgent, salt)
 		h.app.RecordUnique(k.TsUnixMin, k.VhostID, hash)
 	}
 }
@@ -222,23 +243,24 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, vhostID uint32, host, disposition string) requestEventRow {
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
+	path := telemetryPath(r)
 	return requestEventRow{
 		TsUnixSec:             uint32(now.Unix()),
 		TsUnixMs:              now.UnixMilli(),
 		VhostID:               vhostID,
 		ClientIP:              securityClientIP(r),
-		ForwardedIP:           forwardedIP(r),
+		ForwardedIP:           identity.forwardedIP,
 		FrontProxy:            frontProxy(r),
 		Method:                methodOrUnknown(r.Method),
-		Path:                  capPath(r.URL.Path),
-		PathBucket:            pathBucket(r.URL.Path),
+		Path:                  capPath(path),
+		PathBucket:            pathBucket(path),
 		Status:                finalStatus(w, servErr),
 		HTTPVersion:           httpVersionOrUnknown(r),
-		UA:                    capUA(r.UserAgent()),
+		UA:                    capUA(identity.userAgent),
 		Origin:                origin,
 		UpstreamFailureReason: upstreamFailureReason(r, w, servErr, origin),
 		BytesIn:               requestBytes(r),
@@ -250,7 +272,23 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		Host:                  host,
 		RequestID:             readRequestID(repl),
 		V2:                    true,
+		DefenseExempt:         h.defenseExempt(r),
 	}
+}
+
+// V2 reads the frozen request holder. Retained v1 images use their original var.
+func (h *StatsHandler) defenseExempt(r *http.Request) bool {
+	if snapshot, ok := requestDefenseHolder(r).load(); ok {
+		return snapshot.Evidence.HTTP
+	}
+	if app, ok := h.app.(interface{ DefensePolicyEvidenceV2Enabled() bool }); ok && app.DefensePolicyEvidenceV2Enabled() {
+		return false
+	}
+	if !h.app.DefenseExemptionTelemetryEnabled() {
+		return false
+	}
+	marker, _ := caddyhttp.GetVar(r.Context(), "apx_l7_header_exempt").(string)
+	return marker == "true"
 }
 
 // readRequestID uses the same lazy, per-request Caddy UUID as the upstream

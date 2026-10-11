@@ -16,6 +16,9 @@ import (
 // internally, but we don't want to depend on that.
 const corazaVhostHeader = "X-Apx-Vhost-Id"
 
+// Only sanitized chains carry this server-controlled WAF component signature.
+const corazaHeaderExemptionSignature = "APX_HEADER_EXEMPT_TELEMETRY/1"
+
 // corazaApp is the single live StatsApp the audit-log writer hands
 // detections to. RegisterAuditLogWriter is a GLOBAL factory with no app
 // handle, and there is exactly one apx_stats app per process, so the app
@@ -59,6 +62,10 @@ type (
 		IsInterrupted() bool
 		ClientIP() string
 		Request() corazaReqView
+		Producer() corazaProducerView
+	}
+	corazaProducerView interface {
+		Rulesets() []string
 	}
 	corazaReqView interface {
 		Method() string
@@ -120,6 +127,14 @@ func (t txAdapter) Request() corazaReqView {
 		return nil
 	}
 	return reqAdapter{req}
+}
+
+func (t txAdapter) Producer() corazaProducerView {
+	producer := t.tx.Producer()
+	if producer == nil {
+		return nil
+	}
+	return producer
 }
 
 type reqAdapter struct {
@@ -184,10 +199,27 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 
 	var method, uri string
 	var vhostID uint32
+	var defenseExempt bool
+	var evidence defenseEvidence
+	v2 := corazaTransactionEvidenceVersion(tx)
+	privacyVersion := corazaTransactionManagedPrivacyVersion(tx)
+	// A transaction the connector bound ran under managed Header privacy even
+	// when its audit log omitted part H (no producer proof): fail closed.
+	privacyState, bound := corazaPrivacyRegistry.lookup(txID)
+	private := privacyVersion != 0 || bound
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
-		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
+		uri = req.URI()
+		if private {
+			uri = privateCorazaURI(privacyState, privacyVersion, uri)
+		}
+		uri = ownedTruncate(uri, corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
+		if v2 == 2 {
+			evidence, _ = defenseEvidenceFromHeaders(req.Headers())
+		} else if v2 == 0 {
+			defenseExempt = corazaTransactionSupportsExemption(tx) && corazaDefenseExemptFromHeaders(req.Headers())
+		}
 	}
 
 	msgs := al.Messages()
@@ -203,6 +235,10 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 		if d == nil {
 			continue
 		}
+		message, data := d.Msg(), d.Data()
+		if private {
+			message, data = privateCorazaText(privacyState, privacyVersion, message), privateCorazaText(privacyState, privacyVersion, data)
+		}
 		out = append(out, corazaDetection{
 			TsUnixSec: tsSec,
 			VhostID:   vhostID,
@@ -211,7 +247,7 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			// RuleMsg stays copy-free under the cap: Msg() is either a
 			// static rule-config string (process-lifetime — cloning would
 			// duplicate it per event) or a macro-expanded fresh build.
-			RuleMsg: truncateBytes(d.Msg(), corazaRuleMsgMaxBytes),
+			RuleMsg: truncateBytes(message, corazaRuleMsgMaxBytes),
 			// Tags reference the rule's static config slice — no
 			// per-request data, safe to share.
 			Tags:          d.Tags(),
@@ -222,11 +258,41 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 			ClientIP:      clientIP,
 			// MatchData can be a substring slice of a large parsed buffer
 			// (arg value out of a flooded query string) — must be owned.
-			MatchData:  ownedTruncate(d.Data(), corazaMatchDataMaxBytes),
-			WasBlocked: wasBlocked,
+			MatchData:     ownedTruncate(data, corazaMatchDataMaxBytes),
+			WasBlocked:    wasBlocked,
+			DefenseExempt: defenseExempt || evidence.corazaExempt(uint32(nonNegInt(d.ID()))),
 		})
 	}
 	return out
+}
+
+// privateCorazaURI replaces each managed value in a request target with the
+// URL marker, and masks the whole query of a request that carried one (or
+// whose privacy version is unknown). Without a state it masks the whole target.
+func privateCorazaURI(state *managedHeaderState, version int, uri string) string {
+	if uri == "" {
+		return ""
+	}
+	if state == nil || state.policy == nil {
+		return "/" + managedHeaderMaskedURLPart
+	}
+	return state.policy.redactURI(state.policy.urlScanWindow(uri, corazaRequestURIMaxBytes, true), version < 0 || state.masked.Load())
+}
+
+// privateCorazaText replaces finding text that must not reach telemetry with
+// the masked marker, so it stays distinguishable from a finding without text.
+// An unknown privacy version, or a missing (unbound or reused) state, masks.
+func privateCorazaText(state *managedHeaderState, version int, text string) string {
+	if text == "" {
+		return ""
+	}
+	if version >= 0 && state != nil && state.redact(text) != "" {
+		return text
+	}
+	if state != nil && state.policy != nil {
+		return state.policy.maskedText
+	}
+	return managedHeaderMaskedText
 }
 
 // corazaUnixNanoToSec converts the audit record's UnixTimestamp (which is
@@ -286,3 +352,54 @@ func init() {
 
 // Interface guard.
 var _ plugintypes.AuditLogWriter = (*corazaAuditWriter)(nil)
+
+// The control plane overwrites this header before WAF processing. Reject
+// ambiguous duplicate markers, including differently cased map entries.
+func corazaDefenseExemptFromHeaders(headers map[string][]string) bool {
+	var marker string
+	count := 0
+	for name, values := range headers {
+		if !strings.EqualFold(name, "X-Apx-L7-Header-Exempt") {
+			continue
+		}
+		if len(values) != 1 || count != 0 {
+			return false
+		}
+		marker = values[0]
+		count++
+	}
+	return count == 1 && marker == "true"
+}
+
+// Trust the WAF instance that processed this transaction, since a hot reload
+// may have replaced the process-global StatsApp before audit logging runs.
+func corazaTransactionSupportsExemption(tx corazaTxView) bool {
+	producer := tx.Producer()
+	if producer == nil {
+		return false
+	}
+	for _, component := range producer.Rulesets() {
+		if component == corazaHeaderExemptionSignature {
+			return true
+		}
+	}
+	return false
+}
+
+// A transaction advertising any v2-family proof never falls back to v1.
+func corazaTransactionEvidenceVersion(tx corazaTxView) int {
+	producer := tx.Producer()
+	if producer == nil {
+		return 0
+	}
+	version := 0
+	for _, component := range producer.Rulesets() {
+		if strings.HasPrefix(component, "APX_DEFENSE_EVIDENCE/") {
+			if component != defenseEvidenceSignature {
+				return -1
+			}
+			version = 2
+		}
+	}
+	return version
+}

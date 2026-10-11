@@ -1,0 +1,565 @@
+package apxstats
+
+import (
+	"context"
+	"errors"
+	"math/bits"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
+)
+
+const defenseEvidenceHeader = "X-Apx-Defense-Evidence"
+const defenseEvidenceSignature = "APX_DEFENSE_EVIDENCE/2"
+const defenseObserveHeader = "X-Apx-Coraza-Observe"
+
+// The stamped evidence marker uses only bytes OWASP CRS 920274 (paranoia
+// level 4) accepts in a request Header (32,34,38,42-59,61,65-90,95,97-122),
+// so stamping it never trips the WAF it informs. Its one canonical form is
+//
+//	http=<0|1>;coraza_all=<0|1>;coraza_rule_ids=<ascending ids, comma separated>
+const (
+	evidenceHTTPField  = "http="
+	evidenceAllField   = ";coraza_all="
+	evidenceRulesField = ";coraza_rule_ids="
+)
+
+// defenseSelectorMaxCount bounds config size, not catalog membership: a newer
+// CRS can name more rules than this image knows.
+const defenseSelectorMaxCount = 4096
+
+type defenseEvidence struct {
+	HTTP          bool
+	CorazaAll     bool
+	CorazaRuleIDs []uint32
+}
+
+func (e defenseEvidence) corazaExempt(id uint32) bool {
+	if e.CorazaAll {
+		return true
+	}
+	i := sort.Search(len(e.CorazaRuleIDs), func(i int) bool { return e.CorazaRuleIDs[i] >= id })
+	return i < len(e.CorazaRuleIDs) && e.CorazaRuleIDs[i] == id
+}
+
+func (e defenseEvidence) marker() string {
+	var b strings.Builder
+	b.Grow(len(evidenceHTTPField) + len(evidenceAllField) + len(evidenceRulesField) + 2 + 7*len(e.CorazaRuleIDs))
+	b.WriteString(evidenceHTTPField)
+	b.WriteByte(evidenceDigit(e.HTTP))
+	b.WriteString(evidenceAllField)
+	b.WriteByte(evidenceDigit(e.CorazaAll))
+	b.WriteString(evidenceRulesField)
+	var digits [10]byte
+	for i, id := range e.CorazaRuleIDs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(strconv.AppendUint(digits[:0], uint64(id), 10))
+	}
+	return b.String()
+}
+
+func evidenceDigit(v bool) byte {
+	if v {
+		return '1'
+	}
+	return '0'
+}
+
+func parseEvidenceDigit(c byte) (bool, bool) {
+	return c == '1', c == '0' || c == '1'
+}
+
+// parseDefenseEvidenceMarker accepts only the canonical marker over known
+// catalog IDs: strictly ascending, no leading zeros, no empty elements.
+func parseDefenseEvidenceMarker(marker string) (defenseEvidence, bool) {
+	var e defenseEvidence
+	rest, ok := strings.CutPrefix(marker, evidenceHTTPField)
+	if !ok || rest == "" {
+		return defenseEvidence{}, false
+	}
+	if e.HTTP, ok = parseEvidenceDigit(rest[0]); !ok {
+		return defenseEvidence{}, false
+	}
+	if rest, ok = strings.CutPrefix(rest[1:], evidenceAllField); !ok || rest == "" {
+		return defenseEvidence{}, false
+	}
+	if e.CorazaAll, ok = parseEvidenceDigit(rest[0]); !ok {
+		return defenseEvidence{}, false
+	}
+	if rest, ok = strings.CutPrefix(rest[1:], evidenceRulesField); !ok {
+		return defenseEvidence{}, false
+	}
+	e.CorazaRuleIDs = []uint32{}
+	previous := uint32(0)
+	for rest != "" {
+		element := rest
+		if i := strings.IndexByte(rest, ','); i >= 0 {
+			if element, rest = rest[:i], rest[i+1:]; rest == "" {
+				return defenseEvidence{}, false
+			}
+		} else {
+			rest = ""
+		}
+		id, err := strconv.ParseUint(element, 10, 32)
+		if err != nil || element[0] == '0' || uint32(id) <= previous || !validDefenseCRSID(uint32(id)) {
+			return defenseEvidence{}, false
+		}
+		e.CorazaRuleIDs = append(e.CorazaRuleIDs, uint32(id))
+		previous = uint32(id)
+	}
+	return e, true
+}
+
+type defenseSnapshot struct {
+	Evidence          defenseEvidence
+	ObserveCoraza     bool
+	SkipCorazaRuleIDs []uint32
+}
+
+func (s defenseSnapshot) copy() defenseSnapshot {
+	s.Evidence.CorazaRuleIDs = append([]uint32{}, s.Evidence.CorazaRuleIDs...)
+	s.SkipCorazaRuleIDs = append([]uint32{}, s.SkipCorazaRuleIDs...)
+	return s
+}
+
+type defenseSnapshotKey struct{}
+type defenseSnapshotHolder struct {
+	mu       sync.RWMutex
+	snapshot *defenseSnapshot
+	privacy  *managedHeaderState
+}
+
+// publish stores a private copy; only the first snapshot is authoritative.
+func (h *defenseSnapshotHolder) publish(s defenseSnapshot) error {
+	s = s.copy()
+	return h.publishOwned(&s)
+}
+
+// publishOwned stores s itself; the caller must not retain or mutate it.
+func (h *defenseSnapshotHolder) publishOwned(s *defenseSnapshot) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.snapshot != nil {
+		return errors.New("Defense evidence already captured")
+	}
+	h.snapshot = s
+	return nil
+}
+func (h *defenseSnapshotHolder) load() (defenseSnapshot, bool) {
+	if s := h.shared(); s != nil {
+		return s.copy(), true
+	}
+	return defenseSnapshot{}, false
+}
+
+// shared returns the published snapshot, which is never mutated after
+// publication; callers must only read it.
+func (h *defenseSnapshotHolder) shared() *defenseSnapshot {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.snapshot
+}
+func withDefenseSnapshotHolder(r *http.Request) (*http.Request, *defenseSnapshotHolder) {
+	h := new(defenseSnapshotHolder)
+	// Caddy's replacer is bound to this request pointer by PrepareRequest.
+	*r = *r.WithContext(context.WithValue(r.Context(), defenseSnapshotKey{}, h))
+	return r, h
+}
+func requestDefenseHolder(r *http.Request) *defenseSnapshotHolder {
+	h, _ := r.Context().Value(defenseSnapshotKey{}).(*defenseSnapshotHolder)
+	return h
+}
+
+// DefenseEvidenceHandler captures once, then restores only that snapshot at
+// each WAF boundary. Headers and later vars are never an authority source.
+// Its config is validated and compiled once; requests only read the result.
+type DefenseEvidenceHandler struct {
+	ManagedHeaders     []managedHeaderCredential `json:"managed_headers,omitempty"`
+	Mode               string                    `json:"mode"`
+	HTTPVar            string                    `json:"http_var,omitempty"`
+	CorazaAllVar       string                    `json:"coraza_all_var,omitempty"`
+	CorazaRuleVars     map[string]string         `json:"coraza_rule_vars,omitempty"`
+	ObserveCorazaVar   string                    `json:"observe_coraza_var,omitempty"`
+	SkipCorazaRuleVars map[string]string         `json:"skip_coraza_rule_vars,omitempty"`
+
+	compileOnce sync.Once
+	plan        *defenseEvidencePlan
+	planErr     error
+}
+
+// defenseSelector is one CRS rule selector this image's catalog knows.
+type defenseSelector struct {
+	id    uint32
+	index int // position in defenseCRSIDs
+	name  string
+}
+
+type defenseSelectorTarget struct {
+	index int
+	skip  bool
+}
+
+type defenseEvidencePlan struct {
+	mode                        string
+	httpVar, allVar, observeVar string
+	rules, skips                []defenseSelector // ascending IDs
+	byName                      map[string][]defenseSelectorTarget
+	unknown                     []uint32 // skipped: not in this image's catalog
+	privacy                     *managedHeaderPolicy
+}
+
+func init() { caddy.RegisterModule(&DefenseEvidenceHandler{}) }
+func (*DefenseEvidenceHandler) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{ID: "http.handlers.apx_defense_evidence", New: func() caddy.Module { return new(DefenseEvidenceHandler) }}
+}
+
+func (h *DefenseEvidenceHandler) compiled() *defenseEvidencePlan {
+	h.compileOnce.Do(func() { h.plan, h.planErr = h.compile() })
+	return h.plan
+}
+
+func (h *DefenseEvidenceHandler) Provision(ctx caddy.Context) error {
+	return h.provision(ctx.Logger())
+}
+
+// provision logs selectors for CRS rules this image does not know, once per
+// config load. They are skipped: their rules keep running and their
+// findings stay ordinary evidence, so skipping never widens an exemption.
+func (h *DefenseEvidenceHandler) provision(logger *zap.Logger) error {
+	plan := h.compiled()
+	if h.planErr != nil {
+		return h.planErr
+	}
+	if len(plan.unknown) > 0 {
+		logged := plan.unknown
+		if len(logged) > 64 {
+			logged = logged[:64]
+		}
+		logger.Warn("skipping Defense selectors for CRS rules this image does not know",
+			zap.Int("count", len(plan.unknown)), zap.Uint32s("rule_ids", logged))
+	}
+	return nil
+}
+
+func (h *DefenseEvidenceHandler) Validate() error {
+	h.compiled()
+	return h.planErr
+}
+
+func (h *DefenseEvidenceHandler) compile() (*defenseEvidencePlan, error) {
+	if h.Mode != "capture" && h.Mode != "capture_privacy" && h.Mode != "stamp_waf" {
+		return nil, errors.New("invalid Defense evidence mode")
+	}
+	if len(h.ManagedHeaders) > managedHeaderPairMaxCount || (h.Mode != "capture_privacy" && len(h.ManagedHeaders) > 0) {
+		return nil, errors.New("invalid managed Header privacy input")
+	}
+	for _, pair := range h.ManagedHeaders {
+		if pair.Name == "" || len(pair.Name) > managedHeaderNameMaxBytes || pair.Value == "" || len(pair.Value) > managedHeaderValueMaxBytes {
+			return nil, errors.New("invalid managed Header privacy input")
+		}
+	}
+	if (h.Mode == "stamp_waf" || h.Mode == "capture_privacy") && (h.HTTPVar != "" || h.CorazaAllVar != "" || h.ObserveCorazaVar != "" || len(h.CorazaRuleVars) > 0 || len(h.SkipCorazaRuleVars) > 0) {
+		return nil, errors.New("stamp_waf cannot capture variables")
+	}
+	plan := &defenseEvidencePlan{mode: h.Mode, httpVar: h.HTTPVar, allVar: h.CorazaAllVar, observeVar: h.ObserveCorazaVar, byName: map[string][]defenseSelectorTarget{}}
+	unknown := map[uint32]bool{}
+	for _, group := range []struct {
+		vars map[string]string
+		skip bool
+	}{{h.CorazaRuleVars, false}, {h.SkipCorazaRuleVars, true}} {
+		if len(group.vars) > defenseSelectorMaxCount {
+			return nil, errors.New("too many Defense selectors")
+		}
+		selectors := make([]defenseSelector, 0, len(group.vars))
+		for key, name := range group.vars {
+			id, err := strconv.ParseUint(key, 10, 32)
+			if err != nil || strconv.FormatUint(id, 10) != key || name == "" {
+				return nil, errors.New("invalid Defense selector")
+			}
+			index, known := defenseCRSIndex(uint32(id))
+			if !known {
+				unknown[uint32(id)] = true
+				continue
+			}
+			selectors = append(selectors, defenseSelector{id: uint32(id), index: index, name: name})
+			plan.byName[name] = append(plan.byName[name], defenseSelectorTarget{index: index, skip: group.skip})
+		}
+		sort.Slice(selectors, func(i, j int) bool { return selectors[i].id < selectors[j].id })
+		if group.skip {
+			plan.skips = selectors
+		} else {
+			plan.rules = selectors
+		}
+	}
+	for id := range unknown {
+		plan.unknown = append(plan.unknown, id)
+	}
+	sort.Slice(plan.unknown, func(i, j int) bool { return plan.unknown[i] < plan.unknown[j] })
+	if h.Mode == "capture_privacy" {
+		plan.privacy = compileManagedHeaderPolicy(h.ManagedHeaders)
+	}
+	return plan, nil
+}
+
+// capture reads the classification variables once. Only the exact string
+// "true" selects; anything else (absent, bool, "TRUE", " true") does not.
+func (p *defenseEvidencePlan) capture(r *http.Request) *defenseSnapshot {
+	vars, _ := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+	s := &defenseSnapshot{
+		Evidence:      defenseEvidence{HTTP: selectedVar(vars, p.httpVar), CorazaAll: selectedVar(vars, p.allVar)},
+		ObserveCoraza: selectedVar(vars, p.observeVar),
+	}
+	s.Evidence.CorazaRuleIDs, s.SkipCorazaRuleIDs = p.selected(vars)
+	return s
+}
+
+func selectedVar(vars map[string]any, name string) bool {
+	if name == "" {
+		return false
+	}
+	v, _ := vars[name].(string)
+	return v == "true"
+}
+
+const defenseCatalogWords = 16 // bitset words over defenseCRSIDs indexes
+
+// selected returns the selected rule and skip IDs, ascending. It probes each
+// selector's variable, or, for many selectors that dominate the request's
+// variables (the generated routes set every one), scans the variables once:
+// about half the cost per variable of a probe at catalog scale.
+func (p *defenseEvidencePlan) selected(vars map[string]any) (rules, skips []uint32) {
+	n := len(p.rules) + len(p.skips)
+	if n == 0 || len(vars) == 0 {
+		return nil, nil
+	}
+	if n < 64 || len(vars) > 2*n {
+		return probeSelectors(vars, p.rules), probeSelectors(vars, p.skips)
+	}
+	var ruleBits, skipBits [defenseCatalogWords]uint64
+	for name, value := range vars {
+		if v, _ := value.(string); v != "true" {
+			continue
+		}
+		for _, target := range p.byName[name] {
+			if target.skip {
+				skipBits[target.index>>6] |= 1 << (target.index & 63)
+			} else {
+				ruleBits[target.index>>6] |= 1 << (target.index & 63)
+			}
+		}
+	}
+	return catalogIDs(&ruleBits), catalogIDs(&skipBits)
+}
+
+func probeSelectors(vars map[string]any, selectors []defenseSelector) []uint32 {
+	var ids []uint32
+	for _, s := range selectors {
+		if v, _ := vars[s.name].(string); v == "true" {
+			ids = append(ids, s.id)
+		}
+	}
+	return ids
+}
+
+func catalogIDs(set *[defenseCatalogWords]uint64) []uint32 {
+	var ids []uint32
+	for word, w := range set {
+		for w != 0 {
+			bit := bits.TrailingZeros64(w)
+			ids = append(ids, defenseCRSIDs[word<<6+bit])
+			w &= w - 1
+		}
+	}
+	return ids
+}
+
+// clearDefenseMarkers removes client-supplied control-plane markers before
+// capture and stamping, comparing names case-insensitively without allocating.
+func clearDefenseMarkers(headers http.Header) {
+	for name := range headers {
+		if isDefenseMarker(name) {
+			delete(headers, name)
+		}
+	}
+}
+
+func isDefenseMarker(name string) bool {
+	const prefix, skip = "x-apx-", "coraza-skip-"
+	if len(name) < len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return false
+	}
+	rest := name[len(prefix):]
+	return strings.EqualFold(rest, "l7-header-exempt") || strings.EqualFold(rest, "defense-evidence") ||
+		strings.EqualFold(rest, "coraza-observe") || (len(rest) >= len(skip) && strings.EqualFold(rest[:len(skip)], skip))
+}
+
+func stampDefenseEvidence(r *http.Request, s *defenseSnapshot) {
+	if r.Header == nil {
+		r.Header = make(http.Header)
+	}
+	// Canonical names, so direct assignment equals Header.Set.
+	r.Header[defenseEvidenceHeader] = []string{s.Evidence.marker()}
+	if s.ObserveCoraza {
+		r.Header[defenseObserveHeader] = []string{"true"}
+	}
+	for _, id := range s.SkipCorazaRuleIDs {
+		if index, ok := defenseCRSIndex(id); ok {
+			r.Header[defenseSkipHeaderNames[index]] = []string{"true"}
+		}
+	}
+}
+
+func (h *DefenseEvidenceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if h.Mode != "capture_privacy" {
+		clearDefenseMarkers(r.Header)
+	}
+	plan := h.compiled()
+	if plan == nil {
+		return next.ServeHTTP(w, r)
+	}
+	holder := requestDefenseHolder(r)
+	switch plan.mode {
+	case "capture_privacy":
+		if holder != nil {
+			holder.capturePrivacy(plan.privacy, r.Header)
+		}
+	case "capture":
+		if holder != nil {
+			// Later captures are ignored; the first complete snapshot is authoritative.
+			_ = holder.publishOwned(plan.capture(r))
+		}
+	case "stamp_waf":
+		if snapshot := holder.shared(); snapshot != nil {
+			stampDefenseEvidence(r, snapshot)
+		}
+	}
+	return next.ServeHTTP(w, r)
+}
+
+func defenseEvidenceFromHeaders(headers map[string][]string) (defenseEvidence, bool) {
+	var marker string
+	count := 0
+	for name, values := range headers {
+		if !strings.EqualFold(name, defenseEvidenceHeader) {
+			continue
+		}
+		if count != 0 || len(values) != 1 {
+			return defenseEvidence{}, false
+		}
+		count++
+		marker = values[0]
+	}
+	// Each canonical CRS ID occupies at most six digits plus its comma.
+	if count != 1 || len(marker) > 64+7*len(defenseCRSIDs) {
+		return defenseEvidence{}, false
+	}
+	evidence, ok := parseDefenseEvidenceMarker(marker)
+	if !ok || evidence.marker() != marker {
+		return defenseEvidence{}, false
+	}
+	return evidence, true
+}
+
+func defenseCRSIndex(id uint32) (int, bool) {
+	i := sort.Search(len(defenseCRSIDs), func(i int) bool { return defenseCRSIDs[i] >= id })
+	return i, i < len(defenseCRSIDs) && defenseCRSIDs[i] == id
+}
+
+func validDefenseCRSID(id uint32) bool {
+	_, ok := defenseCRSIndex(id)
+	return ok
+}
+
+var defenseSkipHeaderNames = func() []string {
+	if len(defenseCRSIDs) > defenseCatalogWords*64 {
+		panic("Defense selector catalog exceeds its bitset")
+	}
+	names := make([]string, len(defenseCRSIDs))
+	for i, id := range defenseCRSIDs {
+		names[i] = "X-Apx-Coraza-Skip-" + strconv.FormatUint(uint64(id), 10)
+	}
+	return names
+}()
+
+var _ caddyhttp.MiddlewareHandler = (*DefenseEvidenceHandler)(nil)
+var _ caddy.Provisioner = (*DefenseEvidenceHandler)(nil)
+var _ caddy.Validator = (*DefenseEvidenceHandler)(nil)
+
+// Selector catalog: the exact non-inline rule IDs of the control plane's
+// vendored CRS. A selector outside it is skipped and logged at provisioning,
+// never fatal, so a CRS bump cannot make an older image reject its config.
+var defenseCRSIDs = []uint32{
+	900000, 900001, 900010, 900100, 900110, 900115, 900120, 900130, 900200, 900220,
+	900230, 900240, 900250, 900255, 900280, 900300, 900310, 900320, 900330, 900340,
+	900350, 900400, 900500, 900950, 900990, 901001, 901100, 901110, 901111, 901115,
+	901120, 901125, 901130, 901140, 901141, 901142, 901143, 901160, 901162, 901163,
+	901164, 901165, 901167, 901168, 901169, 901170, 901171, 901200, 901320, 901340,
+	901350, 901400, 901410, 901450, 901500, 905100, 905110, 911011, 911012, 911013,
+	911014, 911015, 911016, 911017, 911018, 911100, 913011, 913012, 913013, 913014,
+	913015, 913016, 913017, 913018, 913100, 920011, 920012, 920013, 920014, 920015,
+	920016, 920017, 920018, 920100, 920120, 920121, 920160, 920170, 920171, 920180,
+	920181, 920190, 920200, 920201, 920202, 920210, 920220, 920221, 920230, 920240,
+	920250, 920260, 920270, 920271, 920272, 920273, 920274, 920275, 920280, 920290,
+	920300, 920310, 920311, 920320, 920330, 920340, 920341, 920350, 920360, 920370,
+	920380, 920390, 920400, 920410, 920420, 920430, 920440, 920450, 920451, 920460,
+	920470, 920480, 920490, 920500, 920510, 920520, 920521, 920530, 920540, 920600,
+	920610, 920620, 921011, 921012, 921013, 921014, 921015, 921016, 921017, 921018,
+	921110, 921120, 921130, 921140, 921150, 921151, 921160, 921170, 921180, 921190,
+	921200, 921210, 921220, 921230, 921240, 921421, 921422, 922100, 922110, 922120,
+	922130, 930011, 930012, 930013, 930014, 930015, 930016, 930017, 930018, 930100,
+	930110, 930120, 930121, 930130, 931011, 931012, 931013, 931014, 931015, 931016,
+	931017, 931018, 931100, 931110, 931120, 931130, 931131, 932011, 932012, 932013,
+	932014, 932015, 932016, 932017, 932018, 932120, 932125, 932130, 932131, 932140,
+	932160, 932161, 932170, 932171, 932175, 932180, 932190, 932200, 932205, 932206,
+	932210, 932220, 932230, 932231, 932232, 932235, 932236, 932237, 932238, 932239,
+	932240, 932250, 932260, 932270, 932300, 932301, 932310, 932311, 932320, 932321,
+	932330, 932331, 932370, 932380, 933011, 933012, 933013, 933014, 933015, 933016,
+	933017, 933018, 933100, 933110, 933111, 933120, 933130, 933131, 933135, 933140,
+	933150, 933151, 933160, 933161, 933170, 933180, 933190, 933200, 933210, 933211,
+	934011, 934012, 934013, 934014, 934015, 934016, 934017, 934018, 934100, 934101,
+	934110, 934120, 934130, 934140, 934150, 934160, 934170, 941010, 941011, 941012,
+	941013, 941014, 941015, 941016, 941017, 941018, 941100, 941101, 941110, 941120,
+	941130, 941140, 941150, 941160, 941170, 941180, 941181, 941190, 941200, 941210,
+	941220, 941230, 941240, 941250, 941260, 941270, 941280, 941290, 941300, 941310,
+	941320, 941330, 941340, 941350, 941360, 941370, 941380, 941390, 941400, 942011,
+	942012, 942013, 942014, 942015, 942016, 942017, 942018, 942100, 942101, 942120,
+	942130, 942131, 942140, 942150, 942151, 942152, 942160, 942170, 942180, 942190,
+	942200, 942210, 942220, 942230, 942240, 942250, 942251, 942260, 942270, 942280,
+	942290, 942300, 942310, 942320, 942321, 942330, 942340, 942350, 942360, 942361,
+	942362, 942370, 942380, 942390, 942400, 942410, 942420, 942421, 942430, 942431,
+	942432, 942440, 942441, 942442, 942450, 942460, 942470, 942480, 942490, 942500,
+	942510, 942511, 942520, 942521, 942522, 942530, 942540, 942550, 942560, 943011,
+	943012, 943013, 943014, 943015, 943016, 943017, 943018, 943100, 943110, 943120,
+	944011, 944012, 944013, 944014, 944015, 944016, 944017, 944018, 944100, 944110,
+	944120, 944130, 944140, 944150, 944151, 944152, 944200, 944210, 944240, 944250,
+	944260, 944300, 949011, 949012, 949013, 949014, 949015, 949016, 949017, 949018,
+	949052, 949053, 949054, 949055, 949059, 949060, 949061, 949062, 949063, 949110,
+	949111, 949152, 949153, 949154, 949155, 949159, 949160, 949161, 949162, 949163,
+	950010, 950011, 950012, 950013, 950014, 950015, 950016, 950017, 950018, 950021,
+	950100, 950130, 950140, 951010, 951011, 951012, 951013, 951014, 951015, 951016,
+	951017, 951018, 951100, 951110, 951120, 951130, 951140, 951150, 951160, 951170,
+	951180, 951190, 951200, 951210, 951220, 951230, 951240, 951250, 951260, 952010,
+	952011, 952012, 952013, 952014, 952015, 952016, 952017, 952018, 952100, 952110,
+	953010, 953011, 953012, 953013, 953014, 953015, 953016, 953017, 953018, 953100,
+	953101, 953110, 953120, 954010, 954011, 954012, 954013, 954014, 954015, 954016,
+	954017, 954018, 954100, 954110, 954120, 954130, 955010, 955011, 955012, 955013,
+	955014, 955015, 955016, 955017, 955018, 955100, 955110, 955120, 955130, 955140,
+	955150, 955160, 955170, 955180, 955190, 955200, 955210, 955220, 955230, 955240,
+	955250, 955260, 955270, 955280, 955290, 955300, 955310, 955320, 955330, 955340,
+	955350, 959011, 959012, 959013, 959014, 959015, 959016, 959017, 959018, 959052,
+	959053, 959054, 959055, 959059, 959060, 959061, 959062, 959063, 959100, 959101,
+	959152, 959153, 959154, 959155, 959159, 959160, 959161, 959162, 959163, 980011,
+	980012, 980013, 980014, 980015, 980016, 980017, 980018, 980041, 980042, 980043,
+	980044, 980045, 980046, 980047, 980048, 980049, 980050, 980051, 980099, 980170,
+}
