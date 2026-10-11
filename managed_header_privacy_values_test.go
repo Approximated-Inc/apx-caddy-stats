@@ -202,9 +202,61 @@ SecRule REQUEST_HEADERS:User-Agent "@rx Mozilla" "id:900113,phase:1,pass,log,msg
 			}
 			require.Len(t, run.events, 1)
 			require.True(t, run.events[0].UA == valuesBrowserUA, "a User-Agent that does not carry the value was masked")
-			require.False(t, containsFold(run.encoded, "7f3a9c"), "the managed value reached encoded telemetry")
+			require.True(t, run.events[0].Path == "/products", "a path without the value lost its detail")
+			require.False(t, leaksValueFragment(run.encoded), "the managed value reached encoded telemetry")
 		})
 	}
+	// The value in the URL: a carrying request masks every occurrence in the
+	// path and its whole query; any request masks a path segment or query
+	// parameter containing it, in any form CRS-style URL decoding reveals.
+	for _, tc := range []struct {
+		name, target, path, uri, maskedURI string
+	}{
+		{"path", "/keys/Partner-Key-7f3a9c!/rotate", "/keys/[masked]/rotate", "/keys/[masked]/rotate", ""},
+		{"path_case_variant", "/keys/PARTNER-KEY-7F3A9C!/rotate", "/keys/[masked]/rotate", "/keys/[masked]/rotate", ""},
+		{"path_embedded", "/keys/v1-Partner-Key-7f3a9c!.json", "/keys/[masked]", "/keys/[masked]", ""},
+		{"path_url_encoded", "/keys/Partner-Key-7f3a9c%21/rotate", "/keys/[masked]/rotate", "/keys/[masked]/rotate", ""},
+		{"path_fully_encoded", "/keys/%50artner-Key-%37f3a9c%21/rotate", "/keys/[masked]/rotate", "/keys/[masked]/rotate", ""},
+		{"path_double_encoded", "/keys/Partner-Key-7f3a9c%2521/rotate", "/keys/[masked]/rotate", "/keys/[masked]/rotate", ""},
+		{"query", "/search?q=shoes&api_key=Partner-Key-7f3a9c!", "/search", "/search?q=shoes&[masked]", "/search?[masked]"},
+		{"query_url_encoded", "/search?q=shoes&api_key=Partner-Key-7f3a9c%21", "/search", "/search?q=shoes&[masked]", "/search?[masked]"},
+		{"query_unicode_encoded", "/search?api_key=Partner-Key-7f3a9c%u0021&q=shoes", "/search", "/search?[masked]&q=shoes", "/search?[masked]"},
+		{"query_fully_encoded", "/search?q=shoes&api_key=%50artner-Key-%37f3a9c%21", "/search", "/search?q=shoes&[masked]", "/search?[masked]"},
+		{"query_double_encoded", "/search?q=shoes&api_key=Partner-Key-7f3a9c%2521", "/search", "/search?q=shoes&[masked]", "/search?[masked]"},
+	} {
+		for _, carried := range []bool{false, true} {
+			t.Run(fmt.Sprintf("url_%s/carried=%v", tc.name, carried), func(t *testing.T) {
+				o := privacyRunOptions{pairs: pairs, rules: rules, target: tc.target}
+				if carried {
+					o.prepare = setHeader("X-Partner-Key", valuesSecret)
+				}
+				run := runPrivacyPipeline(t, o)
+				require.NotEmpty(t, run.detections, "no findings: the request_uri check would be vacuous")
+				wantURI := tc.uri
+				if carried && tc.maskedURI != "" {
+					wantURI = tc.maskedURI
+				}
+				for _, d := range run.detections {
+					require.True(t, d.RequestURI == wantURI, "request_uri was not masked to the expected shape")
+				}
+				require.Len(t, run.events, 1)
+				require.True(t, run.events[0].Path == tc.path, "request_events.path was not masked to the expected shape")
+				require.False(t, leaksValueFragment(run.encoded), "the managed value reached encoded telemetry")
+			})
+		}
+	}
+}
+
+// leaksValueFragment reports whether text holds the managed value's fragment
+// directly or after up to three rounds of CRS-style URL/HTML decoding.
+func leaksValueFragment(text string) bool {
+	for round := 0; round <= 3; round++ {
+		if containsFold(text, "7f3a9c") {
+			return true
+		}
+		text = decodeManagedHeaderEscapes(text)
+	}
+	return false
 }
 
 // Masked text is marked; text that never existed stays empty (absent).
@@ -374,4 +426,50 @@ func TestManagedHeaderPrivacyUserAgentEmbeddingAndCommonPrefix(t *testing.T) {
 			require.False(t, containsFold(run.encoded, "7f3a9c"), "the managed value reached encoded telemetry")
 		})
 	}
+}
+
+// URL redaction keeps the URL's shape: segments and parameters carrying a
+// managed value become the marker, a value spanning them masks the whole part,
+// and short values mask only whole tokens of a carrying request.
+func TestManagedHeaderPrivacyURLRedaction(t *testing.T) {
+	policy := compileManagedHeaderPolicy([]managedHeaderCredential{
+		{Name: "X-Partner-Key", Value: valuesSecret},
+		{Name: "Authorization", Value: "Bearer tok/7f3a9c-slash"},
+		{Name: "X-Debug", Value: "on"},
+		{Name: "X-Real-Ip", Value: "2001:db8::17"},
+		{Name: "Cf-Connecting-Ip", Value: "1.2.3.4"},
+	})
+	for _, tc := range []struct {
+		name, uri string
+		carried   bool
+		want      string
+	}{
+		{"ordinary", "/a/b?c=d", false, "/a/b?c=d"},
+		{"ordinary_carried_masks_query", "/a/b?c=d", true, "/a/b?[masked]"},
+		{"no_query_carried", "/a/b", true, "/a/b"},
+		{"value_spans_segments", "/x/Bearer%20tok/7f3a9c-slash/y", false, "/[masked]"},
+		{"value_spans_parameters", "/x?a=Partner-Key-7f3a9c%21&b=1&c=Bearer+tok%2F7f3a9c-slash", false, "/x?[masked]&b=1&[masked]"},
+		{"value_spans_parameters_raw", "/x?k=Bearer tok/7f3a9c-slash&b=2", false, "/x?[masked]&b=2"},
+		{"short_value_unmasked_request", "/on/turn-on", false, "/on/turn-on"},
+		{"short_value_whole_token_carried", "/on/turn-on/onion", true, "/[masked]/[masked]/onion"},
+		{"short_value_encoded_token_carried", "/%6Fn/x", true, "/[masked]/x"},
+		{"managed_ip_other_form_carried", "/ip/2001:db8:0:0::17", true, "/ip/[masked]"},
+		{"managed_ipv4_after_hex_letters_carried", "/ip/abc1.2.3.4", true, "/ip/[masked]"},
+		{"managed_ip_unmasked_request", "/ip/2001:db8:0:0::17", false, "/ip/2001:db8:0:0::17"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := policy.redactURI(tc.uri, tc.carried)
+			require.True(t, got == tc.want, "redactURI(%q, %v) = %q, want %q", strings.ReplaceAll(tc.uri, "7f3a9c", "…"), tc.carried, strings.ReplaceAll(got, "7f3a9c", "…"), tc.want)
+		})
+	}
+	// The marker never carries a managed value itself.
+	clash := compileManagedHeaderPolicy([]managedHeaderCredential{{Name: "X-Key", Value: "masked"}, {Name: "X-Key", Value: "*"}})
+	require.True(t, clash.redactURI("/masked/x?q=1", true) == "/-/x?-", "a marker that carries a managed value was used")
+	// A value straddling the truncation limit is redacted before truncation.
+	long := "/" + strings.Repeat("a", corazaRequestURIMaxBytes-10) + "/" + valuesSecret + "/" + strings.Repeat("b", 9000)
+	shipped := ownedTruncate(privateCorazaURI(newManagedHeaderState(policy, nil), 1, long), corazaRequestURIMaxBytes)
+	require.False(t, containsFold(shipped, "partner-key"), "a value straddling the truncation limit was partly shipped")
+	require.True(t, strings.HasSuffix(shipped, "/[masked]/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"[:len(shipped)-corazaRequestURIMaxBytes+9]), "the straddling value was not replaced by the marker")
+	// Without a state (unbound or reused transaction) the whole target is masked.
+	require.True(t, privateCorazaURI(nil, 1, "/a?b") == "/[masked]")
 }

@@ -101,8 +101,11 @@ response-handler errors and exhausted response-based retries are excluded using
 the pinned Caddy error metadata, covered by integration tests.
 
 When the managed Header privacy WAF connector withholds an error's text, the
-reason comes from that request's connection-stage evidence if all of its
-recorded stages agree, and is `unknown` otherwise.
+reason comes from the connection-stage evidence recorded after that request's
+last successful connection (a dial or a reused pooled connection) if all of it
+agrees, and is `unknown` otherwise. A dial failure followed by a successful
+connection, such as a load-balancer retry to another upstream or the other
+address family of one hostname, therefore never classifies a later failure.
 
 Connection-stage hooks keep bounded request-local evidence and emit no raw error
 messages, addresses, certificates or headers. The control plane must deploy its
@@ -128,10 +131,23 @@ too. `request_events.ua` is masked when it is a managed value or embeds one
 managed under another Header name; `forwarded_ip` and the unique-client hash IP
 when they are a managed IP.
 
+The URL is masked by part, keeping its shape. In the WAF finding's
+`request_uri` and in `request_events.path`/`path_bucket` (and the Edge Verify
+path bucket), a path segment or query parameter that contains a managed value
+of 8 bytes or more, directly or after up to three rounds of CRS-style URL/HTML
+decoding, becomes `[masked]`, on any request. For a request that carries a
+managed value, a segment that holds any managed value as a whole token (or a
+managed IP in any textual form) is masked too, and its whole query becomes
+`[masked]`. A value spanning segments or parameters masks the whole path or
+query. Redaction runs before the URL is truncated, so a value straddling the
+limit is not partly shipped. A WAF transaction bound without a privacy state
+ships `request_uri` as `/[masked]`.
+
 Masked text is `[masked: managed header value]` and a masked forwarded IP is
 `100::` (RFC 6666 discard-only), so masked is distinguishable from absent (`""`,
 `::`). If a managed value would itself appear in a marker, the text marker falls
-back to `[masked]`, then `[*]`, then `""`, and the IP to `100::1`, `100::2`, ...
+back to `[masked]`, then `[*]`, then `""`, the URL marker to `[*]`, then `-`,
+then `""`, and the IP to `100::1`, `100::2`, ...
 
 The stamped `X-Apx-Defense-Evidence` value is
 `http=<0|1>;coraza_all=<0|1>;coraza_rule_ids=<ascending ids>`, using only bytes

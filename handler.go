@@ -142,7 +142,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	if edgeVerifyOutcome != "" {
 		h.app.RecordEdgeVerifyAttempt(edgeVerifyAttemptKey{
 			vhost:      challengeVhost(r),
-			pathBucket: pathBucket(r.URL.Path),
+			pathBucket: pathBucket(telemetryPath(r)),
 			outcome:    edgeVerifyOutcome,
 		})
 	}
@@ -204,6 +204,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		disp := deriveDisposition(reason, outcome)
 		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp))
 	} else if reason == "" {
+		path := telemetryPath(r)
 		h.app.RecordRequestEvent(requestEventRow{
 			TsUnixSec:     uint32(time.Now().UTC().Unix()),
 			VhostID:       k.VhostID,
@@ -211,8 +212,8 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 			ForwardedIP:   identity.forwardedIP,
 			FrontProxy:    frontProxy(r),
 			Method:        k.Method,
-			Path:          capPath(r.URL.Path),
-			PathBucket:    pathBucket(r.URL.Path),
+			Path:          capPath(path),
+			PathBucket:    pathBucket(path),
 			Status:        k.Status,
 			HTTPVersion:   httpVersionOrUnknown(r),
 			UA:            capUA(identity.userAgent),
@@ -246,6 +247,7 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
+	path := telemetryPath(r)
 	return requestEventRow{
 		TsUnixSec:             uint32(now.Unix()),
 		TsUnixMs:              now.UnixMilli(),
@@ -254,8 +256,8 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		ForwardedIP:           identity.forwardedIP,
 		FrontProxy:            frontProxy(r),
 		Method:                methodOrUnknown(r.Method),
-		Path:                  capPath(r.URL.Path),
-		PathBucket:            pathBucket(r.URL.Path),
+		Path:                  capPath(path),
+		PathBucket:            pathBucket(path),
 		Status:                finalStatus(w, servErr),
 		HTTPVersion:           httpVersionOrUnknown(r),
 		UA:                    capUA(identity.userAgent),

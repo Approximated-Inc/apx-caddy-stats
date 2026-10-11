@@ -24,6 +24,10 @@ const managedHeaderValueMaxBytes = 1024
 // value, so a masked field is distinguishable from an absent (empty) one.
 const managedHeaderMaskedText = "[masked: managed header value]"
 
+// managedHeaderMaskedURLPart replaces a URL path segment, query parameter or
+// query that held a managed value, keeping the URL's shape.
+const managedHeaderMaskedURLPart = "[masked]"
+
 // managedHeaderMaskedIP replaces a managed forwarded IP. 100:: is the RFC 6666
 // discard-only prefix: never a client, and distinct from "::" (absent).
 const managedHeaderMaskedIP = "100::"
@@ -53,15 +57,16 @@ type managedHeaderPolicy struct {
 	nameLens  [managedHeaderNameMaxBytes + 1]bool
 	values    map[string]struct{} // ASCII-lowercase managed values
 	valueLens [managedHeaderValueMaxBytes + 1]bool
+	lengths   []int                   // the set lengths of valueLens, ascending
 	ips       map[netip.Addr]struct{} // IPs among the values and their list elements
 	contain   foldMatcher             // values of at least managedHeaderContainMinBytes
 	// Values of at least managedHeaderContainMinBytes managed under names other
 	// than User-Agent. A User-Agent value only masks a whole User-Agent: a rule
 	// on a common prefix ("Mozilla/5.0") must not blank every browser's.
 	containInUserAgent foldMatcher
-	// The markers this policy writes in place of masked text and IPs; never
-	// themselves a managed value.
-	maskedText, maskedIP string
+	// The markers this policy writes in place of masked text, URL parts and
+	// IPs; never themselves a managed value.
+	maskedText, maskedURLPart, maskedIP string
 }
 
 func (*managedHeaderPolicy) Format(f fmt.State, _ rune) {
@@ -95,9 +100,19 @@ func compileManagedHeaderPolicy(pairs []managedHeaderCredential) *managedHeaderP
 			}
 		}
 	}
+	for n, set := range p.valueLens {
+		if set {
+			p.lengths = append(p.lengths, n)
+		}
+	}
 	// A marker that equals or contains a managed value would itself carry it.
 	for _, marker := range []string{managedHeaderMaskedText, "[masked]", "[*]", ""} {
 		if p.maskedText = marker; marker == "" || (!p.equalsValue(marker) && !p.contain.find(marker)) {
+			break
+		}
+	}
+	for _, marker := range []string{managedHeaderMaskedURLPart, "[*]", "-", ""} {
+		if p.maskedURLPart = marker; marker == "" || !p.urlTextCarries(marker, true) {
 			break
 		}
 	}
@@ -206,6 +221,151 @@ func (p *managedHeaderPolicy) managedIP(s string) bool {
 	}
 	_, ok := p.ips[ip.Unmap()]
 	return ok
+}
+
+// managedURLScanBytes bounds the URL text redacted before it is truncated to
+// limit: a value overlapping the kept bytes, even %uXXXX-encoded, ends within it.
+func managedURLScanBytes(text string, limit int) string {
+	if n := limit + 6*managedHeaderValueMaxBytes; len(text) > n {
+		return text[:n]
+	}
+	return text
+}
+
+// urlTextCarries reports whether URL text holds a managed value of at least
+// managedHeaderContainMinBytes anywhere or, for a request that carried a
+// managed value (all), any managed value as a whole token, directly or after
+// up to three rounds of CRS-style URL/HTML decoding.
+func (p *managedHeaderPolicy) urlTextCarries(text string, all bool) bool {
+	t := text
+	for round := 0; ; round++ {
+		if p.contain.find(t) || all && p.tokenCarries(t) {
+			return true
+		}
+		if round == 3 || !strings.ContainsAny(t, "%+&\x00") {
+			return false
+		}
+		next := decodeManagedHeaderEscapes(t)
+		if next == t {
+			return false
+		}
+		t = next
+	}
+}
+
+// tokenCarries finds a managed value, of any length, that is the whole text,
+// one of its list elements or IP forms, or a token in it: not continued by an
+// alphanumeric byte on either side where the value's own edge is alphanumeric.
+func (p *managedHeaderPolicy) tokenCarries(t string) bool {
+	if p.formCarries(trimSpace(t)) || p.ipTokenCarries(t) {
+		return true
+	}
+	var buf [managedHeaderValueMaxBytes]byte
+	for i := 0; i < len(t); i++ {
+		// An alphanumeric byte after another starts no token.
+		if i > 0 && isAlnum(t[i-1]) && isAlnum(t[i]) {
+			continue
+		}
+		for _, n := range p.lengths {
+			end := i + n
+			if end > len(t) {
+				break
+			}
+			for j := 0; j < n; j++ {
+				buf[j] = foldByte(t[i+j])
+			}
+			if _, ok := p.values[string(buf[:n])]; !ok {
+				continue
+			}
+			if end < len(t) && isAlnum(t[end-1]) && isAlnum(t[end]) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// ipTokenCarries finds a managed IP, in any textual form, among the maximal
+// runs of IP-literal bytes in t: hex digits, ':' and '.' (IPv6), and digits
+// and '.' (IPv4, which adjacent hex letters would otherwise hide).
+func (p *managedHeaderPolicy) ipTokenCarries(t string) bool {
+	if len(p.ips) == 0 {
+		return false
+	}
+	for _, inRun := range []func(byte) bool{
+		func(c byte) bool { return isHex(c) || c == ':' || c == '.' },
+		func(c byte) bool { return '0' <= c && c <= '9' || c == '.' },
+	} {
+		for i := 0; i < len(t); {
+			j := i
+			for j < len(t) && inRun(t[j]) {
+				j++
+			}
+			if j > i && p.managedIP(t[i:j]) {
+				return true
+			}
+			i = j + 1
+		}
+	}
+	return false
+}
+
+func isAlnum(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
+}
+
+// redactURLPath replaces each path segment carrying a managed value with the
+// URL marker; a value spanning segments masks the whole path.
+func (p *managedHeaderPolicy) redactURLPath(path string, all bool) string {
+	if !p.urlTextCarries(path, all) {
+		return path
+	}
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if segment != "" && p.urlTextCarries(segment, all) {
+			segments[i] = p.maskedURLPart
+		}
+	}
+	if out := strings.Join(segments, "/"); !p.urlTextCarries(out, all) {
+		return out
+	}
+	return "/" + p.maskedURLPart
+}
+
+// redactURLQuery masks the whole query of a request that carried a managed
+// value; otherwise each parameter carrying one, or the whole query when a
+// value spans parameters.
+func (p *managedHeaderPolicy) redactURLQuery(query string, all bool) string {
+	if query == "" {
+		return ""
+	}
+	if all {
+		return p.maskedURLPart
+	}
+	if !p.urlTextCarries(query, false) {
+		return query
+	}
+	params := strings.Split(query, "&")
+	for i, param := range params {
+		if param != "" && p.urlTextCarries(param, false) {
+			params[i] = p.maskedURLPart
+		}
+	}
+	if out := strings.Join(params, "&"); !p.urlTextCarries(out, false) {
+		return out
+	}
+	return p.maskedURLPart
+}
+
+// redactURI applies redactURLPath and redactURLQuery to a request target.
+func (p *managedHeaderPolicy) redactURI(uri string, all bool) string {
+	path, query, hasQuery := strings.Cut(uri, "?")
+	path = p.redactURLPath(path, all)
+	if !hasQuery {
+		return path
+	}
+	return path + "?" + p.redactURLQuery(query, all)
 }
 
 // foldMatcher finds any of its ASCII-lowercase patterns (each at least
@@ -433,6 +593,17 @@ func telemetryIdentity(r *http.Request) requestTelemetryIdentity {
 		id.hashIP = r.RemoteAddr
 	}
 	return id
+}
+
+// telemetryPath is the request path telemetry records: a managed value in it
+// is replaced by the URL marker (see redactURLPath).
+func telemetryPath(r *http.Request) string {
+	path := r.URL.Path
+	state := requestManagedHeaderState(r)
+	if path == "" || state == nil || state.policy == nil {
+		return path
+	}
+	return state.policy.redactURLPath(managedURLScanBytes(path, requestEventPathMaxBytes), state.masked.Load())
 }
 
 // managedHeaderRegistry indexes live WAF transactions to their request's

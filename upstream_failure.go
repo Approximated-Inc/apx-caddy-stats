@@ -26,9 +26,15 @@ type upstreamFailureTrace struct {
 	mu       sync.Mutex
 	closed   bool
 	evidence []upstreamFailureEvidence
+	// connections counts successful connections (dials and pooled reuse);
+	// each evidence entry keeps the count at its latest occurrence.
+	connections uint64
 }
 
-type upstreamFailureEvidence struct{ message, reason string }
+type upstreamFailureEvidence struct {
+	message, reason string
+	connections     uint64
+}
 
 func withUpstreamFailureTrace(r *http.Request) (*http.Request, *upstreamFailureTrace) {
 	f := new(upstreamFailureTrace)
@@ -45,6 +51,7 @@ func withUpstreamFailureTrace(r *http.Request) (*http.Request, *upstreamFailureT
 		},
 		ConnectDone: func(network, _ string, err error) {
 			if err == nil {
+				f.connected()
 				return
 			}
 			// Only TCP connections have the advertised connect-timeout meaning.
@@ -59,6 +66,7 @@ func withUpstreamFailureTrace(r *http.Request) (*http.Request, *upstreamFailureT
 			}
 			f.record(err, reason)
 		},
+		GotConn: func(httptrace.GotConnInfo) { f.connected() },
 		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
 			if err == nil {
 				return
@@ -104,8 +112,9 @@ func (f *upstreamFailureTrace) record(err error, reason string) {
 	if f.closed {
 		return
 	}
-	for _, prior := range f.evidence {
-		if prior.message == message && prior.reason == reason {
+	for i := range f.evidence {
+		if prior := &f.evidence[i]; prior.message == message && prior.reason == reason {
+			prior.connections = f.connections
 			return
 		}
 	}
@@ -113,7 +122,15 @@ func (f *upstreamFailureTrace) record(err error, reason string) {
 	// return an earlier address's error rather than the last callback's.
 	// Allocate only on failure and retain a bounded set across attempts.
 	if len(f.evidence) < 16 {
-		f.evidence = append(f.evidence, upstreamFailureEvidence{message, reason})
+		f.evidence = append(f.evidence, upstreamFailureEvidence{message, reason, f.connections})
+	}
+}
+
+func (f *upstreamFailureTrace) connected() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.closed {
+		f.connections++
 	}
 }
 
@@ -133,9 +150,16 @@ func (f *upstreamFailureTrace) reason(err error) string {
 		// error against stage evidence, including the net.OpError prefix,
 		// instead of letting a failed earlier attempt determine the result.
 		// The managed Header privacy connector withholds the text of a cause
-		// it cannot classify (an empty message): every recorded stage of this
-		// request is then a candidate, and only a unanimous one classifies.
-		if message != "" && !(message == evidence.message || strings.HasSuffix(message, ": "+evidence.message)) {
+		// it cannot classify (an empty message): every stage recorded after
+		// this request's last successful connection is then a candidate, and
+		// only a unanimous one classifies. A stage failure that a later
+		// connection superseded (a retry, the other address family) did not
+		// end the request.
+		if message == "" {
+			if evidence.connections != f.connections {
+				continue
+			}
+		} else if message != evidence.message && !strings.HasSuffix(message, ": "+evidence.message) {
 			continue
 		}
 		if reason != "" && reason != evidence.reason {

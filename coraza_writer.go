@@ -209,7 +209,11 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 	private := privacyVersion != 0 || bound
 	if req := tx.Request(); req != nil {
 		method = ownedTruncate(req.Method(), corazaRequestMethodMaxBytes)
-		uri = ownedTruncate(req.URI(), corazaRequestURIMaxBytes)
+		uri = req.URI()
+		if private {
+			uri = privateCorazaURI(privacyState, privacyVersion, uri)
+		}
+		uri = ownedTruncate(uri, corazaRequestURIMaxBytes)
 		vhostID = corazaVhostIDFromHeaders(req.Headers())
 		if v2 == 2 {
 			evidence, _ = defenseEvidenceFromHeaders(req.Headers())
@@ -260,6 +264,19 @@ func buildCorazaEvents(al corazaAuditView) []corazaDetection {
 		})
 	}
 	return out
+}
+
+// privateCorazaURI replaces each managed value in a request target with the
+// URL marker, and masks the whole query of a request that carried one (or
+// whose privacy version is unknown). Without a state it masks the whole target.
+func privateCorazaURI(state *managedHeaderState, version int, uri string) string {
+	if uri == "" {
+		return ""
+	}
+	if state == nil || state.policy == nil {
+		return "/" + managedHeaderMaskedURLPart
+	}
+	return state.policy.redactURI(managedURLScanBytes(uri, corazaRequestURIMaxBytes), version < 0 || state.masked.Load())
 }
 
 // privateCorazaText replaces finding text that must not reach telemetry with

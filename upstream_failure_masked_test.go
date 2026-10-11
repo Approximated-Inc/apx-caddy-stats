@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +68,37 @@ func TestUpstreamFailureReasonForPrivacyMaskedCause(t *testing.T) {
 			tr.ConnectDone("tcp", "192.0.2.1:81", timeout)
 		}},
 		{"no_evidence", "unknown", 502, func(*httptrace.ClientTrace) {}},
+		// A connection that succeeded after a dial failure (a retry to another
+		// upstream, or the other address family) means the dial failure did
+		// not end the request.
+		{"refused_then_connected", "unknown", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+			tr.ConnectDone("tcp", "127.0.0.1:2", nil)
+		}},
+		{"refused_then_reused_connection", "unknown", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+			tr.GotConn(httptrace.GotConnInfo{Reused: true})
+		}},
+		{"other_family_refused_then_connected", "unknown", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "[::1]:1", &net.OpError{Op: "dial", Net: "tcp6", Err: syscall.ECONNREFUSED})
+			tr.ConnectDone("tcp", "127.0.0.1:1", nil)
+			tr.GotConn(httptrace.GotConnInfo{})
+		}},
+		{"connected_then_refused", "connection_refused", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "127.0.0.1:2", nil)
+			tr.GotConn(httptrace.GotConnInfo{})
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+		}},
+		{"refused_connected_refused_again", "connection_refused", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+			tr.ConnectDone("tcp", "127.0.0.1:2", nil)
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+		}},
+		{"connected_then_tls_failed", "tls_handshake_error", 502, func(tr *httptrace.ClientTrace) {
+			tr.ConnectDone("tcp", "127.0.0.1:1", refused)
+			tr.ConnectDone("tcp", "127.0.0.1:2", nil)
+			tr.TLSHandshakeDone(tls.ConnectionState{}, errors.New("tls: first record does not look like a TLS handshake"))
+		}},
 	} {
 		for _, wrapped := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/wrapped=%v", tc.name, wrapped), func(t *testing.T) {
@@ -258,4 +290,95 @@ func TestUpstreamFailureRealCaddyProxyMaskedMatchesUnmasked(t *testing.T) {
 			require.Equal(t, unmasked, masked, "masking changed upstream_failure_reason")
 		})
 	}
+}
+
+// A masked request whose final error is not a stage failure must not take its
+// reason from a dial failure that a later successful connection superseded:
+// a load-balancer retry to another upstream, or the other address family of
+// one hostname. Real Caddy reverse_proxy, masked == unmasked == unknown.
+func TestUpstreamFailureRealCaddyProxyMaskedIgnoresSupersededDialFailures(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(&caddy.Config{Admin: &caddy.AdminConfig{Disabled: true}})
+	require.NoError(t, err)
+	ctx, cancel := caddy.NewContext(ctx)
+	t.Cleanup(cancel)
+	malformedListener := func(network, address string) *net.TCPAddr {
+		ln, err := net.Listen(network, address)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					buf := make([]byte, 4096)
+					_, _ = c.Read(buf)
+					_, _ = io.WriteString(c, "garbage-not-http\r\n\r\n")
+					_ = c.Close()
+				}(c)
+			}
+		}()
+		return ln.Addr().(*net.TCPAddr)
+	}
+	closedAddress := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		address := ln.Addr().String()
+		require.NoError(t, ln.Close())
+		return address
+	}
+	run := func(config string, masked bool) string {
+		proxy := new(reverseproxy.Handler)
+		require.NoError(t, json.Unmarshal([]byte(config), proxy))
+		require.NoError(t, proxy.Provision(ctx))
+		t.Cleanup(func() { require.NoError(t, proxy.Cleanup()) })
+		var inner caddyhttp.Handler = caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return proxy.ServeHTTP(w, r, nextHandler(404)) })
+		if masked {
+			inner = emulatedMaskingConnector(inner)
+		}
+		app := &fakeApp{modeV2: true}
+		completed := make(chan struct{})
+		downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(completed)
+			r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), w, &caddyhttp.Server{})
+			caddyhttp.SetVar(r.Context(), "vhost_id", "100")
+			if err := (&StatsHandler{app: app}).ServeHTTP(w, r, inner); err != nil {
+				var he caddyhttp.HandlerError
+				require.True(t, errors.As(err, &he))
+				w.WriteHeader(he.StatusCode)
+			}
+		}))
+		defer downstream.Close()
+		response, err := (&http.Client{Timeout: 10 * time.Second}).Get(downstream.URL + "/")
+		require.NoError(t, err)
+		_, _ = io.ReadAll(response.Body)
+		require.NoError(t, response.Body.Close())
+		<-completed
+		rows := app.reqEventSnapshot()
+		require.Len(t, rows, 1)
+		return rows[0].UpstreamFailureReason
+	}
+	t.Run("lb_retry_after_refused_upstream", func(t *testing.T) {
+		config := func() string {
+			// Fresh upstream addresses per run: passive health state is shared by address.
+			return fmt.Sprintf(`{"transport":{"protocol":"http","dial_timeout":"300ms"},"upstreams":[{"dial":%q},{"dial":%q}],"load_balancing":{"selection_policy":{"policy":"first"},"retries":3},"health_checks":{"passive":{"fail_duration":"30s","max_fails":1}}}`,
+				closedAddress(), malformedListener("tcp", "127.0.0.1:0").String())
+		}
+		unmasked, masked := run(config(), false), run(config(), true)
+		require.Equal(t, "unknown", unmasked, "fixture no longer produces the expected unmasked reason")
+		require.Equal(t, unmasked, masked, "masking changed upstream_failure_reason")
+	})
+	t.Run("dual_stack_ipv6_refused_ipv4_connected", func(t *testing.T) {
+		addrs, err := net.LookupHost("localhost")
+		require.NoError(t, err)
+		if len(addrs) < 2 || net.ParseIP(addrs[0]).To4() != nil {
+			t.Skip("localhost does not resolve to ::1 before 127.0.0.1 here")
+		}
+		port := malformedListener("tcp4", "127.0.0.1:0").Port
+		config := fmt.Sprintf(`{"transport":{"protocol":"http","dial_timeout":"300ms"},"upstreams":[{"dial":"localhost:%d"}]}`, port)
+		unmasked, masked := run(config, false), run(config, true)
+		require.Equal(t, "unknown", unmasked, "fixture no longer produces the expected unmasked reason")
+		require.Equal(t, unmasked, masked, "masking changed upstream_failure_reason")
+	})
 }
