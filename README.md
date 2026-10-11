@@ -100,6 +100,10 @@ either an unknown or typed reason. Built-in
 response-handler errors and exhausted response-based retries are excluded using
 the pinned Caddy error metadata, covered by integration tests.
 
+When the managed Header privacy WAF connector withholds an error's text, the
+reason comes from that request's connection-stage evidence if all of its
+recorded stages agree, and is `unknown` otherwise.
+
 Connection-stage hooks keep bounded request-local evidence and emit no raw error
 messages, addresses, certificates or headers. The control plane must deploy its
 optional-field ingestion, ClickHouse migration and log-reader changes before the

@@ -132,7 +132,10 @@ func (f *upstreamFailureTrace) reason(err error) string {
 		// Caddy's DialError has no Unwrap method. Match the actual final
 		// error against stage evidence, including the net.OpError prefix,
 		// instead of letting a failed earlier attempt determine the result.
-		if evidence.message == "" || !(message == evidence.message || strings.HasSuffix(message, ": "+evidence.message)) {
+		// The managed Header privacy connector withholds the text of a cause
+		// it cannot classify (an empty message): every recorded stage of this
+		// request is then a candidate, and only a unanimous one classifies.
+		if message != "" && !(message == evidence.message || strings.HasSuffix(message, ": "+evidence.message)) {
 			continue
 		}
 		if reason != "" && reason != evidence.reason {
