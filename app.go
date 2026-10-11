@@ -336,11 +336,11 @@ type StatsApp struct {
 
 	// Retired HTTP delivery is bounded by existing buffers and one transient worker.
 	// Classification, row format, salt, identity and destination remain this app's.
-	httpDeliveryMu sync.Mutex
-	httpRetired atomic.Bool
+	httpDeliveryMu      sync.Mutex
+	httpRetired         atomic.Bool
 	httpDeliveryPending bool
 	httpDeliveryRunning bool
-	httpDeliveryDone chan struct{}
+	httpDeliveryDone    chan struct{}
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
