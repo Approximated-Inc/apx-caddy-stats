@@ -53,7 +53,8 @@ func TestManagedHeaderPrivacyPlusValueInFindingText(t *testing.T) {
 }
 
 // legacyURLTextCarries is urlTextCarries as it was before the token scan was
-// limited to short values: every managed value length is scanned as a token.
+// limited to short values: every managed value length is scanned as a token
+// (a short value's '+' also matching a space).
 func legacyURLTextCarries(p *managedHeaderPolicy, text string, all bool) bool {
 	var lengths []int
 	for n, set := range p.valueLens {
@@ -74,7 +75,8 @@ func legacyURLTextCarries(p *managedHeaderPolicy, text string, all bool) bool {
 				if end > len(t) {
 					break
 				}
-				if _, ok := p.values[foldASCII(t[i:end])]; !ok {
+				_, ok := p.values[foldASCII(t[i:end])]
+				if _, plus := p.plusTokens[foldASCII(t[i:end])]; !ok && !plus {
 					continue
 				}
 				if end < len(t) && isAlnum(t[end-1]) && isAlnum(t[end]) {
@@ -269,31 +271,92 @@ func TestManagedHeaderPrivacyQuestionMarkValueInURL(t *testing.T) {
 	}
 }
 
-// A path with nothing to mask is recorded whole, whatever its length, so its
-// path_bucket never depends on the redaction scan window.
-func TestManagedHeaderPrivacyLongOrdinaryPathUnchanged(t *testing.T) {
-	policy := compileManagedHeaderPolicy(benchPrivacyPairs(8))
-	for _, path := range []string{
-		"/" + strings.Repeat("a", 7200) + "/b/c",
-		strings.Repeat("/", 7168) + "éé",
-		"/" + strings.Repeat("seg/", 3000) + "end",
+// A path longer than the redaction scan window is recorded as its scanned
+// window: a managed value past the window, which the scan never saw, must not
+// reach path_bucket (which reads segments past the kept bytes), and a segment
+// the window cuts past the kept bytes may be a value's prefix.
+func TestManagedHeaderPrivacyPathBeyondScanWindow(t *testing.T) {
+	const secret = "mysupersecretapikey"
+	policy := compileManagedHeaderPolicy([]managedHeaderCredential{{Name: "X-Api-Key", Value: secret}})
+	window := requestEventPathMaxBytes + 6*managedHeaderValueMaxBytes
+	pad := func(n int) string { return "/" + strings.Repeat("a", n-1) }
+	for _, target := range []string{
+		pad(7200) + "/" + secret + "/x",
+		strings.Repeat("/", 7200) + secret,
+		pad(7200) + "/mysupersecret%61pikey/x",
+		pad(window-10) + "/" + secret + "/x", // the window cuts the value
+		pad(window-1) + "/" + secret,         // the window ends just after a '/'
+		pad(window-70) + "/" + strings.Repeat("Q", 60) + secret + "/x",
 	} {
 		for _, carried := range []bool{false, true} {
-			r := httptest.NewRequest("GET", "/", nil)
-			r.URL.Path = path
+			r := httptest.NewRequest("GET", target, nil)
 			r, _ = withDefenseSnapshotHolder(r)
 			requestDefenseHolder(r).capturePrivacy(policy, r.Header)
 			requestManagedHeaderState(r).masked.Store(carried)
 			got := telemetryPath(r)
-			require.True(t, got == path, "carried=%v a %d-byte ordinary path changed", carried, len(path))
-			require.Equal(t, pathBucket(path), pathBucket(got))
+			bucket := pathBucket(got)
+			require.False(t, containsFold(bucket, "mysup") || containsFold(capPath(got), "mysup"),
+				"carried=%v a %d-byte path shipped part of a value past the scan window: bucket %q", carried, len(target), bucket)
+			require.LessOrEqual(t, len(got), window+len(managedHeaderMaskedURLPart))
 		}
 	}
+	// An ordinary long path's bucket reflects only the scanned window.
+	for _, tc := range []struct{ path, bucket string }{
+		{"/" + strings.Repeat("a", 7200) + "/b/c", "/*"},
+		{pad(window-5) + "/b/c", "/*/b/c"},
+		{pad(window-3) + "/abcdef/c", "/*/[masked]"},
+		{"/a/b/c/" + strings.Repeat("d", 7200), "/a/b/c"},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.URL.Path = tc.path
+		r, _ = withDefenseSnapshotHolder(r)
+		requestDefenseHolder(r).capturePrivacy(policy, r.Header)
+		require.Equal(t, tc.bucket, pathBucket(telemetryPath(r)))
+	}
+	// A path within the window is recorded whole.
+	inWindow := pad(window-7) + "/b/c/d"
 	r := httptest.NewRequest("GET", "/", nil)
-	r.URL.Path = "/" + strings.Repeat("a", 7200) + "/b/c"
+	r.URL.Path = inWindow
 	r, _ = withDefenseSnapshotHolder(r)
 	requestDefenseHolder(r).capturePrivacy(policy, r.Header)
-	require.Equal(t, "/*/b/c", pathBucket(telemetryPath(r)))
+	require.True(t, telemetryPath(r) == inWindow)
+	// The cost is bounded by the window, not the path.
+	r.URL.Path = strings.Repeat("/", 16<<20)
+	require.Equal(t, window, len(telemetryPath(r)))
+}
+
+// An ordinary request's query is not scanned for telemetryPath unless a value
+// holds a '?' (the only way a value reaches the path from the query).
+func TestManagedHeaderPrivacyTelemetryPathSkipsQueryScan(t *testing.T) {
+	policy := compileManagedHeaderPolicy(benchPrivacyPairs(8))
+	r := httptest.NewRequest("GET", "/products/12345?utm_source=google&q=red+shoes&r=https%3A%2F%2Fa.example%2F", nil)
+	r, _ = withDefenseSnapshotHolder(r)
+	requestDefenseHolder(r).capturePrivacy(policy, r.Header)
+	allocs := testing.AllocsPerRun(100, func() { _ = telemetryPath(r) })
+	require.Zero(t, allocs, "telemetryPath scanned the query of an ordinary request")
+	require.Equal(t, "/products/12345", telemetryPath(r))
+}
+
+// A short value's '+' also matches a space as a whole token, as CRS decodes it.
+func TestManagedHeaderPrivacyShortPlusValueToken(t *testing.T) {
+	policy := compileManagedHeaderPolicy([]managedHeaderCredential{{Name: "X-Key", Value: "a+b/c"}})
+	for _, tc := range []struct {
+		uri     string
+		carried bool
+		want    string
+	}{
+		{"/x/a+b%2Fc/y", true, "/x/[masked]/y"},
+		{"/x/a%2Bb%2Fc/y", true, "/x/[masked]/y"},
+		{"/x/a%20b%252Fc/y", true, "/x/[masked]/y"},
+		{"/x/a+b%2Fc/y", false, "/x/a+b%2Fc/y"},
+		{"/x/a+b%2Fcd/y", true, "/x/a+b%2Fcd/y"},
+	} {
+		got := policy.redactURI(tc.uri, tc.carried)
+		require.Equal(t, tc.want, got, "redactURI(%q, %v)", tc.uri, tc.carried)
+	}
+	// Header matching is unchanged: a field holding a space for the '+' is not the value.
+	require.False(t, policy.fieldCarries("a b/c"))
+	require.True(t, policy.fieldCarries("a+b/c"))
 }
 
 // A long value encoded over two rounds (eight bytes per byte) can start in the

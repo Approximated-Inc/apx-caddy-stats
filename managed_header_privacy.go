@@ -61,6 +61,9 @@ type managedHeaderPolicy struct {
 	ips       map[netip.Addr]struct{} // IPs among the values and their list elements
 	contain   foldMatcher             // values of at least managedHeaderContainMinBytes
 	question  bool                    // a value holds a literal '?', which can split it across a URL's path and query
+	// Values shorter than managedHeaderContainMinBytes holding a '+', with
+	// each '+' as a space (CRS urlDecodeUni), matched only as URL tokens.
+	plusTokens map[string]struct{}
 	// Values of at least managedHeaderContainMinBytes managed under names other
 	// than User-Agent. A User-Agent value only masks a whole User-Agent: a rule
 	// on a common prefix ("Mozilla/5.0") must not blank every browser's.
@@ -93,12 +96,19 @@ func compileManagedHeaderPolicy(pairs []managedHeaderCredential) *managedHeaderP
 		p.values[value] = struct{}{}
 		p.valueLens[len(value)] = true
 		p.question = p.question || strings.IndexByte(value, '?') >= 0
+		// CRS urlDecodeUni (and form decoding) turn a literal '+' into a space.
+		if strings.IndexByte(value, '+') >= 0 {
+			if spaced := strings.ReplaceAll(value, "+", " "); len(value) >= managedHeaderContainMinBytes {
+				p.contain.add(spaced)
+			} else {
+				if p.plusTokens == nil {
+					p.plusTokens = map[string]struct{}{}
+				}
+				p.plusTokens[spaced] = struct{}{}
+			}
+		}
 		if len(value) >= managedHeaderContainMinBytes {
 			p.contain.add(value)
-			// CRS urlDecodeUni (and form decoding) turn a literal '+' into a space.
-			if strings.IndexByte(value, '+') >= 0 {
-				p.contain.add(strings.ReplaceAll(value, "+", " "))
-			}
 		}
 		for _, element := range strings.Split(pair.Value, ",") {
 			if ip, err := netip.ParseAddr(trimSpace(element)); err == nil {
@@ -302,7 +312,11 @@ func (p *managedHeaderPolicy) tokenCarries(t string) bool {
 			for j := 0; j < n; j++ {
 				buf[j] = foldByte(t[i+j])
 			}
-			if _, ok := p.values[string(buf[:n])]; !ok {
+			_, ok := p.values[string(buf[:n])]
+			if !ok && p.plusTokens != nil {
+				_, ok = p.plusTokens[string(buf[:n])]
+			}
+			if !ok {
 				continue
 			}
 			if end < len(t) && isAlnum(t[end-1]) && isAlnum(t[end]) {
@@ -667,22 +681,30 @@ func telemetryIdentity(r *http.Request) requestTelemetryIdentity {
 }
 
 // telemetryPath is the request path telemetry records: a managed value in it
-// is replaced by the URL marker (see redactURLTarget). A path with nothing
-// masked is returned whole, so its path_bucket never depends on the scan window.
+// is replaced by the URL marker (see redactURLTarget). A path longer than the
+// scan window is recorded as the redacted window, so path_bucket (which reads
+// segments past the kept bytes) never sees text the scan did not, and a
+// segment the window cuts past the kept bytes, which could be a value's
+// prefix, becomes the marker.
 func telemetryPath(r *http.Request) string {
 	path := r.URL.Path
 	state := requestManagedHeaderState(r)
 	if path == "" || state == nil || state.policy == nil {
 		return path
 	}
-	scan := managedURLScanBytes(path, requestEventPathMaxBytes)
-	// A value split at '?' starts within its encoded length of the end of the
-	// path, so a path longer than the window keeps no part of it.
-	hasQuery := len(scan) == len(path) && (r.URL.RawQuery != "" || r.URL.ForceQuery)
-	out, _ := state.policy.redactURLTarget(state.policy.urlScanWindow(path, requestEventPathMaxBytes, false), managedURLScanBytes(r.URL.RawQuery, 0), hasQuery, state.masked.Load())
-	if out == scan {
-		return path
+	policy := state.policy
+	window := policy.urlScanWindow(path, requestEventPathMaxBytes, false)
+	cut := managedURLScanBytes(path, requestEventPathMaxBytes)
+	if len(cut) < len(path) && path[len(cut)] != '/' {
+		if start := strings.LastIndexByte(cut, '/') + 1; start >= requestEventPathMaxBytes {
+			window = cut[:start] + policy.maskedURLPart
+		}
 	}
+	// Only a value holding a '?' reaches the path from the query, and a value
+	// split at '?' starts within its encoded length of the end of the path, so
+	// a path longer than the window keeps no part of it.
+	hasQuery := policy.question && len(cut) == len(path) && (r.URL.RawQuery != "" || r.URL.ForceQuery)
+	out, _ := policy.redactURLTarget(window, managedURLScanBytes(r.URL.RawQuery, 0), hasQuery, state.masked.Load())
 	return out
 }
 
