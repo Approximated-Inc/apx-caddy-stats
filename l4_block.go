@@ -54,14 +54,14 @@ func (h *L4BlockHandler) Provision(ctx caddy.Context) error {
 
 func (h *L4BlockHandler) Validate() error {
 	if !validL4BlockReason(h.Reason) {
-		return fmt.Errorf("apx_l4_block_stats reason must be ip, sni, ja3, or ja4")
+		return fmt.Errorf("apx_l4_block_stats reason must be ip, sni, ja3, ja4, or abuseipdb")
 	}
 	return nil
 }
 
 func validL4BlockReason(reason string) bool {
 	switch reason {
-	case "ip", "sni", "ja3", "ja4":
+	case "ip", "sni", "ja3", "ja4", "abuseipdb":
 		return true
 	default:
 		return false
@@ -92,7 +92,11 @@ func (a *StatsApp) recordL4BlockAt(ip, reason string, minute uint32) {
 	defer a.l4BlockMu.Unlock()
 	if _, exists := a.l4Blocks[key]; !exists {
 		if len(a.l4Blocks) >= l4BlockMaxKeys {
-			a.l4BlockOverflow++
+			if reason == "abuseipdb" {
+				a.l4BlockReputationOverflow++
+			} else {
+				a.l4BlockOverflow++
+			}
 			return
 		}
 		if a.l4Blocks == nil {
@@ -103,18 +107,24 @@ func (a *StatsApp) recordL4BlockAt(ip, reason string, minute uint32) {
 	a.l4Blocks[key]++
 }
 
-// Overflow uses one counter, timestamped at flush, to bound all auxiliary state.
+// Each fixed source uses one scalar, timestamped at flush, to bound auxiliary state.
 // Its sentinel IP is not an observed client and must never be bot-classified.
 func (a *StatsApp) l4BlockSnapshot(flushMinute uint32) map[l4BlockKey]uint64 {
 	a.l4BlockMu.Lock()
 	defer a.l4BlockMu.Unlock()
 	snap := a.l4Blocks
 	a.l4Blocks = nil
-	if a.l4BlockOverflow > 0 {
+	if a.l4BlockOverflow > 0 || a.l4BlockReputationOverflow > 0 {
 		if snap == nil {
 			snap = make(map[l4BlockKey]uint64)
 		}
-		snap[l4BlockKey{Minute: flushMinute, IP: "::", Reason: "overflow"}] = a.l4BlockOverflow
+		if a.l4BlockOverflow > 0 {
+			snap[l4BlockKey{Minute: flushMinute, IP: "::", Reason: "overflow"}] = a.l4BlockOverflow
+		}
+		if a.l4BlockReputationOverflow > 0 {
+			snap[l4BlockKey{Minute: flushMinute, IP: "::", Reason: "abuseipdb_overflow"}] = a.l4BlockReputationOverflow
+		}
+		a.l4BlockReputationOverflow = 0
 		a.l4BlockOverflow = 0
 	}
 	return snap

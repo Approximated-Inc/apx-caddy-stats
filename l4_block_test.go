@@ -123,11 +123,11 @@ func TestL4BlockHandlerRecordsBeforeTerminalClose(t *testing.T) {
 func TestL4BlockHandlerModuleAndValidation(t *testing.T) {
 	_, err := caddy.GetModule("layer4.handlers.apx_l4_block_stats")
 	require.NoError(t, err)
-	for _, reason := range []string{"ip", "sni", "ja3", "ja4"} {
+	for _, reason := range []string{"ip", "sni", "ja3", "ja4", "abuseipdb"} {
 		require.NoError(t, (&L4BlockHandler{Reason: reason}).Validate())
 		require.NoError(t, (&L4BlockHandler{Reason: reason, app: &StatsApp{}}).Provision(caddy.Context{}))
 	}
-	for _, reason := range []string{"", "overflow", "allowed", "IP"} {
+	for _, reason := range []string{"", "overflow", "abuseipdb_overflow", "allowed", "IP"} {
 		require.Error(t, (&L4BlockHandler{Reason: reason}).Validate())
 	}
 }
@@ -154,6 +154,81 @@ func TestL4BlockFlushWireAndEmptyDrain(t *testing.T) {
 			require.Equal(t, "overflow", row["reason"])
 			require.Equal(t, "::", row["ip"])
 			require.Equal(t, float64(3), row["connection_count"])
+		}
+	}
+}
+
+func TestL4BlockSourceOverflowSharesCapAndPreservesReason(t *testing.T) {
+	a := &StatsApp{}
+	for i := 0; i < l4BlockMaxKeys; i++ {
+		a.recordL4BlockAt(fmt.Sprintf("2001:db8::%x", i+1), "abuseipdb", 100)
+	}
+	for i := 0; i < 7; i++ {
+		a.recordL4BlockAt("203.0.113.10", "abuseipdb", 101)
+	}
+	for i := 0; i < 3; i++ {
+		a.recordL4BlockAt("203.0.113.10", "ip", 101)
+	}
+	a.recordL4BlockAt("2001:db8::1", "abuseipdb", 100)
+	snap := a.l4BlockSnapshot(102)
+	require.Len(t, snap, l4BlockMaxKeys+2)
+	require.Equal(t, uint64(2), snap[l4BlockKey{Minute: 100, IP: "2001:db8::1", Reason: "abuseipdb"}])
+	require.Equal(t, uint64(7), snap[l4BlockKey{Minute: 102, IP: "::", Reason: "abuseipdb_overflow"}])
+	require.Equal(t, uint64(3), snap[l4BlockKey{Minute: 102, IP: "::", Reason: "overflow"}])
+	require.Empty(t, a.l4BlockSnapshot(103))
+}
+
+func TestL4BlockConcurrentSourceRecordAndDrain(t *testing.T) {
+	a := &StatsApp{}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 2000; j++ {
+				a.recordL4BlockAt("203.0.113.8", "abuseipdb", 100)
+			}
+		}()
+	}
+	var total uint64
+	for i := 0; i < 100; i++ {
+		for key, n := range a.l4BlockSnapshot(100) {
+			require.Equal(t, "abuseipdb", key.Reason)
+			total += n
+		}
+	}
+	wg.Wait()
+	for _, n := range a.l4BlockSnapshot(100) {
+		total += n
+	}
+	require.Equal(t, uint64(64000), total)
+}
+
+func TestL4BlockSourceWireAndFlushMinute(t *testing.T) {
+	srv, captured := captureServer(t, 204)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "secret")
+	a.recordL4BlockAt("[2001:db8::1]:443", "abuseipdb", 100)
+	a.l4BlockReputationOverflow = 7
+	a.flushOnce(0)
+	a.flushOnce(0)
+	posts := captured()
+	require.Len(t, posts, 1)
+	require.Len(t, posts[0].rows, 2)
+	for _, row := range posts[0].rows {
+		require.Equal(t, "l4_block", row["_type"])
+		require.Equal(t, float64(42), row["proxy_server_id"])
+		switch row["reason"] {
+		case "abuseipdb":
+			require.Equal(t, "2001:db8::1", row["ip"])
+			require.Equal(t, formatTs(100), row["ts"])
+			require.Equal(t, float64(1), row["connection_count"])
+		case "abuseipdb_overflow":
+			require.Equal(t, "::", row["ip"])
+			require.NotEqual(t, formatTs(100), row["ts"])
+			require.Equal(t, float64(7), row["connection_count"])
+		default:
+			t.Fatalf("unexpected reason: %v", row["reason"])
 		}
 	}
 }
