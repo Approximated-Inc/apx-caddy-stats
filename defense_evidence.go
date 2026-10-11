@@ -1,9 +1,7 @@
 package apxstats
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -18,10 +16,21 @@ import (
 const defenseEvidenceHeader = "X-Apx-Defense-Evidence"
 const defenseEvidenceSignature = "APX_DEFENSE_EVIDENCE/2"
 
+// The stamped evidence marker uses only bytes OWASP CRS 920274 (paranoia
+// level 4) accepts in a request Header (32,34,38,42-59,61,65-90,95,97-122),
+// so stamping it never trips the WAF it informs. Its one canonical form is
+//
+//	http=<0|1>;coraza_all=<0|1>;coraza_rule_ids=<ascending ids, comma separated>
+const (
+	evidenceHTTPField  = "http="
+	evidenceAllField   = ";coraza_all="
+	evidenceRulesField = ";coraza_rule_ids="
+)
+
 type defenseEvidence struct {
-	HTTP          bool     `json:"http"`
-	CorazaAll     bool     `json:"coraza_all"`
-	CorazaRuleIDs []uint32 `json:"coraza_rule_ids"`
+	HTTP          bool
+	CorazaAll     bool
+	CorazaRuleIDs []uint32
 }
 
 func (e defenseEvidence) corazaExempt(id uint32) bool {
@@ -30,6 +39,76 @@ func (e defenseEvidence) corazaExempt(id uint32) bool {
 	}
 	i := sort.Search(len(e.CorazaRuleIDs), func(i int) bool { return e.CorazaRuleIDs[i] >= id })
 	return i < len(e.CorazaRuleIDs) && e.CorazaRuleIDs[i] == id
+}
+
+func (e defenseEvidence) marker() string {
+	var b strings.Builder
+	b.Grow(len(evidenceHTTPField) + len(evidenceAllField) + len(evidenceRulesField) + 2 + 7*len(e.CorazaRuleIDs))
+	b.WriteString(evidenceHTTPField)
+	b.WriteByte(evidenceDigit(e.HTTP))
+	b.WriteString(evidenceAllField)
+	b.WriteByte(evidenceDigit(e.CorazaAll))
+	b.WriteString(evidenceRulesField)
+	var digits [10]byte
+	for i, id := range e.CorazaRuleIDs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(strconv.AppendUint(digits[:0], uint64(id), 10))
+	}
+	return b.String()
+}
+
+func evidenceDigit(v bool) byte {
+	if v {
+		return '1'
+	}
+	return '0'
+}
+
+func parseEvidenceDigit(c byte) (bool, bool) {
+	return c == '1', c == '0' || c == '1'
+}
+
+// parseDefenseEvidenceMarker accepts only the canonical marker over known
+// catalog IDs: strictly ascending, no leading zeros, no empty elements.
+func parseDefenseEvidenceMarker(marker string) (defenseEvidence, bool) {
+	var e defenseEvidence
+	rest, ok := strings.CutPrefix(marker, evidenceHTTPField)
+	if !ok || rest == "" {
+		return defenseEvidence{}, false
+	}
+	if e.HTTP, ok = parseEvidenceDigit(rest[0]); !ok {
+		return defenseEvidence{}, false
+	}
+	if rest, ok = strings.CutPrefix(rest[1:], evidenceAllField); !ok || rest == "" {
+		return defenseEvidence{}, false
+	}
+	if e.CorazaAll, ok = parseEvidenceDigit(rest[0]); !ok {
+		return defenseEvidence{}, false
+	}
+	if rest, ok = strings.CutPrefix(rest[1:], evidenceRulesField); !ok {
+		return defenseEvidence{}, false
+	}
+	e.CorazaRuleIDs = []uint32{}
+	previous := uint32(0)
+	for rest != "" {
+		element := rest
+		if i := strings.IndexByte(rest, ','); i >= 0 {
+			if element, rest = rest[:i], rest[i+1:]; rest == "" {
+				return defenseEvidence{}, false
+			}
+		} else {
+			rest = ""
+		}
+		id, err := strconv.ParseUint(element, 10, 32)
+		if err != nil || element[0] == '0' || uint32(id) <= previous || !validDefenseCRSID(uint32(id)) {
+			return defenseEvidence{}, false
+		}
+		e.CorazaRuleIDs = append(e.CorazaRuleIDs, uint32(id))
+		previous = uint32(id)
+	}
+	return e, true
 }
 
 type defenseSnapshot struct {
@@ -192,8 +271,7 @@ func (h *DefenseEvidenceHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			if r.Header == nil {
 				r.Header = make(http.Header)
 			}
-			marker, _ := json.Marshal(snapshot.Evidence)
-			r.Header.Set(defenseEvidenceHeader, string(marker))
+			r.Header.Set(defenseEvidenceHeader, snapshot.Evidence.marker())
 			if snapshot.ObserveCoraza {
 				r.Header.Set("X-Apx-Coraza-Observe", "true")
 			}
@@ -222,19 +300,8 @@ func defenseEvidenceFromHeaders(headers map[string][]string) (defenseEvidence, b
 	if count != 1 || len(marker) > 64+7*len(defenseCRSIDs) {
 		return defenseEvidence{}, false
 	}
-	var evidence defenseEvidence
-	if json.Unmarshal([]byte(marker), &evidence) != nil || evidence.CorazaRuleIDs == nil {
-		return defenseEvidence{}, false
-	}
-	previous := uint32(0)
-	for _, id := range evidence.CorazaRuleIDs {
-		if id <= previous || !validDefenseCRSID(id) {
-			return defenseEvidence{}, false
-		}
-		previous = id
-	}
-	canonical, err := json.Marshal(evidence)
-	if err != nil || !bytes.Equal(canonical, []byte(marker)) {
+	evidence, ok := parseDefenseEvidenceMarker(marker)
+	if !ok || evidence.marker() != marker {
 		return defenseEvidence{}, false
 	}
 	return evidence, true

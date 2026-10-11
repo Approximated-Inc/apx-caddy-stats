@@ -48,7 +48,7 @@ func TestManagedHeaderPrivacyWriterBeforeTruncationPreservesRowsAndProof(t *test
 			id := fmt.Sprintf("privacy-writer-%s-%v", proof, excluded)
 			r := privacyRequest(t, []managedHeaderCredential{{Name: "X-Key", Value: secret}}, http.Header{"X-Key": {secret}})
 			release := (&CorazaPrivacyBridge{}).Bind(id, r)
-			headers := map[string][]string{"X-Apx-L7-Header-Exempt": {fmt.Sprint(excluded)}, "X-Apx-Defense-Evidence": {fmt.Sprintf(`{"http":false,"coraza_all":%v,"coraza_rule_ids":[]}`, excluded)}}
+			headers := map[string][]string{"X-Apx-L7-Header-Exempt": {fmt.Sprint(excluded)}, "X-Apx-Defense-Evidence": {defenseEvidence{CorazaAll: excluded}.marker()}}
 			al := buildAuditLog(1700000000000000000, id, "host", true, headers,
 				&fakeMsgData{id: 920274, msg: strings.Repeat("m", corazaRuleMsgMaxBytes-4) + secret, data: strings.Repeat("d", corazaMatchDataMaxBytes-4) + secret},
 				&fakeMsgData{id: 942100, msg: "independent finding", data: "ordinary"})

@@ -23,9 +23,9 @@ func TestDefenseEvidenceCorazaIndependent(t *testing.T) {
 		marker string
 		want   []bool
 	}{
-		{`{"http":true,"coraza_all":false,"coraza_rule_ids":[]}`, []bool{false, false}},
-		{`{"http":false,"coraza_all":false,"coraza_rule_ids":[942100]}`, []bool{true, false}},
-		{`{"http":false,"coraza_all":true,"coraza_rule_ids":[]}`, []bool{true, true}},
+		{`http=1;coraza_all=0;coraza_rule_ids=`, []bool{false, false}},
+		{`http=0;coraza_all=0;coraza_rule_ids=942100`, []bool{true, false}},
+		{`http=0;coraza_all=1;coraza_rule_ids=`, []bool{true, true}},
 	} {
 		al := buildAuditLog(1700000000000000000, "tx", "h", false, map[string][]string{"X-Apx-Defense-Evidence": {tc.marker}}, &fakeMsgData{id: 942100}, &fakeMsgData{id: 942101})
 		al.tx.(*fakeTx).producer = fakeProducer{components: []string{"APX_DEFENSE_EVIDENCE/2"}}
@@ -76,12 +76,12 @@ func TestDefenseEvidenceOuterCloneCapture(t *testing.T) {
 				}
 				caddyhttp.SetVar(r.Context(), "apx_challenge_outcome", "failed")
 				for boundary := 0; boundary < 2; boundary++ {
-					r.Header = http.Header{"x-apx-defense-evidence": {`{"http":true,"coraza_all":true,"coraza_rule_ids":[]}`}, "X-Apx-Coraza-Observe": {"true", "true"}, "X-Apx-Coraza-Skip-942100": {"true"}}
+					r.Header = http.Header{"x-apx-defense-evidence": {`http=1;coraza_all=1;coraza_rule_ids=`}, "X-Apx-Coraza-Observe": {"true", "true"}, "X-Apx-Coraza-Skip-942100": {"true"}}
 					require.NoError(t, stamp.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) error {
-						var marker map[string]any
-						require.NoError(t, json.Unmarshal([]byte(r.Header.Get("X-Apx-Defense-Evidence")), &marker))
-						require.Equal(t, exempt, marker["http"])
-						require.Equal(t, false, marker["coraza_all"])
+						marker, ok := defenseEvidenceFromHeaders(r.Header)
+						require.True(t, ok, "the stamped marker did not parse")
+						require.Equal(t, exempt, marker.HTTP)
+						require.False(t, marker.CorazaAll)
 						require.Empty(t, r.Header.Values("X-Apx-Coraza-Skip-942100"))
 						require.Equal(t, map[bool]string{true: "true", false: ""}[exempt], r.Header.Get("X-Apx-Coraza-Observe"))
 						require.Equal(t, map[bool]string{true: "true", false: ""}[exempt], r.Header.Get("X-Apx-Coraza-Skip-942101"))
@@ -108,7 +108,7 @@ func TestDefenseEvidenceOuterCloneCapture(t *testing.T) {
 }
 
 func TestDefenseEvidenceMalformedAndVersionProof(t *testing.T) {
-	valid := `{"http":false,"coraza_all":true,"coraza_rule_ids":[]}`
+	valid := `http=0;coraza_all=1;coraza_rule_ids=`
 	for _, tc := range []struct {
 		name       string
 		marker     []string
@@ -117,22 +117,30 @@ func TestDefenseEvidenceMalformedAndVersionProof(t *testing.T) {
 		want       bool
 	}{
 		{"valid", []string{valid}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, true},
+		{"valid_ids", []string{`http=0;coraza_all=0;coraza_rule_ids=920274,942100`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, true},
 		{"nil_producer", []string{valid}, nil, nil, false},
 		{"unsigned_forged", []string{valid}, nil, []string{"OWASP_CRS/4"}, false},
 		{"missing_no_v1_fallback", nil, nil, []string{"APX_DEFENSE_EVIDENCE/2", "APX_HEADER_EXEMPT_TELEMETRY/1"}, false},
 		{"duplicates", []string{valid, valid}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
 		{"case_duplicates", []string{valid}, map[string][]string{"x-apx-defense-evidence": {valid}}, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
 		{"unknown_version", []string{valid}, nil, []string{"APX_DEFENSE_EVIDENCE/3", "APX_HEADER_EXEMPT_TELEMETRY/1"}, false},
-		{"unknown_field", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[],"extra":1}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"duplicate_json_key", []string{`{"http":false,"coraza_all":false,"coraza_all":true,"coraza_rule_ids":[]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"missing_http", []string{`{"coraza_all":true,"coraza_rule_ids":[]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"null_bool", []string{`{"http":null,"coraza_all":true,"coraza_rule_ids":[]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"string_bool", []string{`{"http":"false","coraza_all":true,"coraza_rule_ids":[]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"null_selectors", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":null}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"invalid_crs", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[942110]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"inline_id", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[1234]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"unsorted", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[942101,942100]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
-		{"duplicate_ids", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[942100,942100]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"unknown_field", []string{valid + `;extra=1`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"duplicate_field", []string{`http=0;coraza_all=0;coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"missing_http", []string{`coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"empty_bool", []string{`http=;coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"word_bool", []string{`http=false;coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"missing_selectors", []string{`http=0;coraza_all=1`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"invalid_crs", []string{`http=0;coraza_all=1;coraza_rule_ids=942110`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"inline_id", []string{`http=0;coraza_all=1;coraza_rule_ids=1234`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"unsorted", []string{`http=0;coraza_all=1;coraza_rule_ids=942101,942100`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"duplicate_ids", []string{`http=0;coraza_all=1;coraza_rule_ids=942100,942100`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"leading_zero", []string{`http=0;coraza_all=1;coraza_rule_ids=0942100`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"signed_id", []string{`http=0;coraza_all=1;coraza_rule_ids=+942100`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"trailing_comma", []string{`http=0;coraza_all=1;coraza_rule_ids=942100,`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"empty_element", []string{`http=0;coraza_all=1;coraza_rule_ids=942100,,942101`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"whitespace", []string{`http=0; coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"uppercase", []string{`HTTP=0;coraza_all=1;coraza_rule_ids=`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
+		{"legacy_json", []string{`{"http":false,"coraza_all":true,"coraza_rule_ids":[]}`}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
 		{"oversized", []string{strings.Repeat(" ", 10000) + valid}, nil, []string{"APX_DEFENSE_EVIDENCE/2"}, false},
 		{"v1_retained", nil, nil, []string{"APX_HEADER_EXEMPT_TELEMETRY/1"}, true},
 	} {
@@ -169,7 +177,7 @@ func TestDefenseEvidenceHolderOnlyAndMissingSnapshot(t *testing.T) {
 			require.NotNil(t, requestDefenseHolder(r))
 			return capture.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				return stamp.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) error {
-					require.Equal(t, `{"http":true,"coraza_all":false,"coraza_rule_ids":[]}`, r.Header.Get(defenseEvidenceHeader))
+					require.Equal(t, `http=1;coraza_all=0;coraza_rule_ids=`, r.Header.Get(defenseEvidenceHeader))
 					return nil
 				}))
 			}))
@@ -180,7 +188,7 @@ func TestDefenseEvidenceHolderOnlyAndMissingSnapshot(t *testing.T) {
 	caddyhttp.SetVar(r.Context(), "e_http", "true")
 	caddyhttp.SetVar(r.Context(), "e_observe", "true")
 	require.NoError(t, capture.ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		r.Header.Set(defenseEvidenceHeader, `{"http":true,"coraza_all":true,"coraza_rule_ids":[]}`)
+		r.Header.Set(defenseEvidenceHeader, `http=1;coraza_all=1;coraza_rule_ids=`)
 		r.Header.Set("X-Apx-Coraza-Observe", "true")
 		return stamp.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) error {
 			require.Empty(t, r.Header.Get(defenseEvidenceHeader))
@@ -329,9 +337,9 @@ SecRule REQUEST_URI "@unconditionalMatch" "id:949110,phase:2,deny,status:403,log
 					variables[name] = map[bool]string{true: "true", false: "false"}[value]
 				}
 				edge := &headers.Handler{}
-				config := `{"request":{"set":{"X-Apx-Defense-Evidence":["{\"http\":true,\"coraza_all\":true,\"coraza_rule_ids\":[942100]}"],"X-Apx-Coraza-Observe":["true"],"X-Apx-Coraza-Skip-942101":["true"]}}}`
+				config := `{"request":{"set":{"X-Apx-Defense-Evidence":["http=1;coraza_all=1;coraza_rule_ids=942100"],"X-Apx-Coraza-Observe":["true"],"X-Apx-Coraza-Skip-942101":["true"]}}}`
 				if mutation == "copy" {
-					r.Header.Set("X-Attacker-Evidence", `{"http":true,"coraza_all":true,"coraza_rule_ids":[942100]}`)
+					r.Header.Set("X-Attacker-Evidence", `http=1;coraza_all=1;coraza_rule_ids=942100`)
 					repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 					repl.Set("http.request.header.X-Attacker-Evidence", r.Header.Get("X-Attacker-Evidence"))
 					config = `{"request":{"set":{"X-Apx-Defense-Evidence":["{http.request.header.X-Attacker-Evidence}"],"X-Apx-Coraza-Observe":["true"],"X-Apx-Coraza-Skip-942101":["true"]}}}`
@@ -381,7 +389,7 @@ SecRule REQUEST_URI "@unconditionalMatch" "id:949110,phase:2,deny,status:403,log
 						return captureForCase.ServeHTTP(w, r.Clone(r.Context()), caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 							return edge.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 								if mutation != "delete" {
-									require.Equal(t, `{"http":true,"coraza_all":true,"coraza_rule_ids":[942100]}`, r.Header.Get(defenseEvidenceHeader))
+									require.Equal(t, `http=1;coraza_all=1;coraza_rule_ids=942100`, r.Header.Get(defenseEvidenceHeader))
 									require.Equal(t, "true", r.Header.Get("X-Apx-Coraza-Observe"))
 								}
 								late := caddyhttp.VarsMiddleware{"e_http": "true", "e_all": "true", "e_rule": "true", "e_observe": "true", "e_skip": "true", "apx_l7_header_exempt": "true"}
@@ -436,7 +444,7 @@ SecRule REQUEST_URI "@unconditionalMatch" "id:942100,phase:1,pass,log,auditlog,m
 					tx.ProcessConnection("203.0.113.7", 1234, "127.0.0.1", 80)
 					tx.ProcessURI(map[int]string{0: "/old", 1: "/new"}[generation], "GET", "HTTP/1.1")
 					tx.AddRequestHeader("X-Apx-L7-Header-Exempt", "true")
-					tx.AddRequestHeader(defenseEvidenceHeader, `{"http":true,"coraza_all":false,"coraza_rule_ids":[]}`)
+					tx.AddRequestHeader(defenseEvidenceHeader, `http=1;coraza_all=0;coraza_rule_ids=`)
 					tx.ProcessRequestHeaders()
 					tx.ProcessLogging()
 				}(generation)
