@@ -667,9 +667,9 @@ func responseBytes(w *recorder) uint64 {
 	return n
 }
 
-// recorder captures status + bytes-out while still streaming to w. Same
-// pattern as the trace handler's responseRecorder; kept private here to
-// avoid coupling to that module.
+// recorder captures status + bytes-out while still streaming to w.
+// Flush, Hijack and Push walk Unwrap rather than type-asserting the inner
+// writer: Caddy 2.11.6+'s IdleTimeoutWriter has neither Flush nor Hijack.
 type recorder struct {
 	http.ResponseWriter
 	status   int
@@ -706,34 +706,44 @@ func (r *recorder) Write(b []byte) (int, error) {
 // Unwrap lets http.ResponseController and Caddy reach the inner writer.
 func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// Flush delegates if supported; required for SSE / streaming responses.
-func (r *recorder) Flush() {
-	if f, ok := r.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+// Flush serves callers that type-assert http.Flusher; required for SSE /
+// streaming responses.
+func (r *recorder) Flush() { _ = r.FlushError() }
+
+// FlushError is what http.ResponseController (and so reverse_proxy) calls.
+func (r *recorder) FlushError() error {
+	return http.NewResponseController(r.ResponseWriter).Flush()
 }
 
-// Hijack delegates if supported; required for WebSocket upgrades.
+// Hijack is required for WebSocket upgrades.
 //
 // NOTE: once hijacked we lose visibility into bytes-out — the handler
 // records what we have at the time of takeover (likely 0 for the
 // upgrade response). That's acceptable for v1; raw-TCP traffic counters
 // would need a different approach (transport-level counting).
 func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := r.ResponseWriter.(http.Hijacker); ok {
+	conn, brw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil {
 		r.wrote = true
 		r.hijacked = true
-		return hj.Hijack()
 	}
-	return nil, nil, http.ErrNotSupported
+	return conn, brw, err
 }
 
-// Push delegates if supported (HTTP/2 server push).
+// Push (HTTP/2 server push) walks Unwrap the way ResponseController does;
+// ResponseController has no Push of its own.
 func (r *recorder) Push(target string, opts *http.PushOptions) error {
-	if p, ok := r.ResponseWriter.(http.Pusher); ok {
-		return p.Push(target, opts)
+	w := r.ResponseWriter
+	for {
+		switch t := w.(type) {
+		case http.Pusher:
+			return t.Push(target, opts)
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return http.ErrNotSupported
+		}
 	}
-	return http.ErrNotSupported
 }
 
 var (
