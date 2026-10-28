@@ -37,6 +37,58 @@ Metrics: `apx_stats_stop_wait_seconds`,
 `apx_stats_ship_queue_dropped_rows_total`. Dropped rows also count in
 `apx_stats_dropped_rows_total`.
 
+## Overload control
+
+`apps.apx_stats.overload` turns on a node-local overload controller. Absent,
+the level reads 0 and nothing changes.
+
+```json
+{"overload": {"waf": "observe", "admission": {"mode": "observe"}}}
+```
+
+Modes are `off`, `observe` (count only) and `enforce`. Thresholds are plugin
+defaults; an optional `thresholds` object overrides them for calibration.
+
+The controller is process-global, so it survives reloads, and changes level
+without a reload. Once a second it reads `/proc/stat` steal (and cgroup v2
+`throttled_usec`, 10 s EWMA), Go scheduler latency (`/sched/latencies`, p99
+over 10 s) and a modelled shared-CPU burst balance.
+
+| Level | Enters on (3 consecutive samples) | Leaves |
+|---|---|---|
+| 1 conserve | throttle ≥ 100‰, sched p99 ≥ 20 ms, or a calibrated burst balance empty in < 300 s | 120 s calm (throttle < 50‰, sched < 10 ms), after 30 s at the level |
+| 2 shed | throttle ≥ 300‰ or sched p99 ≥ 100 ms | 60 s without those, after 30 s; falls to 1 |
+
+The burst model is `uncalibrated` (never triggers) until a throttle onset or a
+fresh process (uptime < 120 s), and `unthrottled` when the node drains past
+the largest balance without steal.
+
+`apx.overload` is an in-process bridge for the Coraza fork's
+`overload_policy`. At level ≥ 1 in enforce mode, `skip` routes (detect mode)
+skip WAF evaluation and `skip_static` routes (block mode) skip only static
+assets that pass a strict screen: GET/HEAD, no body, a plain path and query,
+a dot only in the final path segment (so `/index.php/x.css` PATH_INFO is
+evaluated), and headers CRS reads for injections kept plain: `Cookie`,
+`User-Agent` and `Referer` limited to a strict character set with no SQL
+keywords (`select`, `union`, `sleep`, ...), and no markup, `${`, shellshock
+`() {`, backticks or line breaks in any header. Anything else is evaluated.
+Observe mode counts would-skip.
+
+The current overload config is the newest started, not yet stopped
+`apx_stats` app's: a load that fails after `apx_stats` started rolls back to
+the surviving app's config, and removing `apx_stats` turns control off.
+
+The stats batch carries one `node_state` row per completed minute that was
+not normal or had a non-zero counter, plus a heartbeat every 10 minutes:
+
+```json
+{"_type":"node_state","ts":"2026-10-28T17:10:00Z","proxy_server_id":768,"machine_id":"e2865013c51398","level_max":2,"l1_seconds":40,"l2_seconds":20,"reasons":3,"sched_p99_us_max":180000,"burst_est_s_min":-1,"burst_model":"uncalibrated","inflight_max":412,"admission_limit_min":24,"waf_skipped_detect":5120,"waf_skipped_static":0,"waf_would_skip":0,"shed_p0":0,"shed_p1":3,"shed_p2":88,"shed_p3":940,"would_shed":0,"gomaxprocs":1}
+```
+
+`reasons` bits: 1 throttle, 2 sched, 4 burst, 8 admission hard cap.
+`burst_est_s_min` is -1 when unknown and capped at 1 000 000.
+Metrics: `apx_stats_overload_level`, `apx_stats_overload_waf_skips_total{kind}`.
+
 ## Request correlation
 
 With request events enabled in `mode_v2`, `request_id` contains Caddy's
