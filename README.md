@@ -48,6 +48,25 @@ not normal or had a non-zero counter, plus a heartbeat every 10 minutes:
 `reasons` bits: 1 throttle, 2 sched, 4 burst, 8 admission hard cap.
 Metrics: `apx_stats_overload_level`, `apx_stats_overload_waf_skips_total{kind}`.
 
+### Admission
+
+`http.handlers.apx_admission` goes right after `apx_stats` in the stats
+wrapper: `[apx_stats, apx_admission, subroute]`. It reads
+`overload.admission` (`mode`, optional `min_limit` and `hard_limit`).
+
+- Classes: P0 `/__apx_*`, ACME, `/healthy`, `/apxflyhealthcheck*` (never
+  shed); P1 HTML navigations; P3 static assets; P2 everything else.
+  WebSocket upgrades and event streams pass through uncounted.
+- At level 2 the limit is `clamp(ceil(completions/s, 10 s EWMA), 8, hard)`.
+  P3 sheds at in-flight ≥ 0.5 L, P2 at ≥ L, P1 at ≥ 1.5 L.
+- The hard cap applies at any level: P2/P3 at `max(256, 2 × MemTotal MB)`,
+  P1 at 1.25 × that.
+- A shed is `503` with `Retry-After: 1..3`, `Cache-Control: no-store`,
+  `apx-overload: 1` and a short body, on a kept-alive connection. It has no
+  vhost, so it records no counter row; `node_state.shed_*` counts it.
+- Observe mode counts `would_shed` and admits. The admit path allocates
+  nothing (≈ 23 ns); a shed takes ≈ 130 ns.
+
 ## Request correlation
 
 With request events enabled in `mode_v2`, `request_id` contains Caddy's
