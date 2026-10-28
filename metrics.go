@@ -75,6 +75,36 @@ var metricDroppedRows = promauto.NewCounter(
 	},
 )
 
+// metricStopWait observes how long StatsApp.Stop waited for the final
+// batch to ship (capped by ingest.stop_wait_ms).
+var metricStopWait = promauto.NewHistogram(
+	prometheus.HistogramOpts{
+		Name:    "apx_stats_stop_wait_seconds",
+		Help:    "apx-caddy-stats time Stop waited for the final batch to ship",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	},
+)
+
+// metricRetiredShip counts shutdown-phase and retired-HTTP ships.
+//
+//	result = "ok" | "deadline" | "busy" | "permanent" | "exhausted"
+var metricRetiredShip = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "apx_stats_retired_ship_total",
+		Help: "apx-caddy-stats ships by stopping or retired generations",
+	},
+	[]string{"result"},
+)
+
+// metricShipQueueDroppedRows counts rows dropped because the ship queue
+// was full (the oldest queued batch is dropped).
+var metricShipQueueDroppedRows = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_stats_ship_queue_dropped_rows_total",
+		Help: "apx-caddy-stats rows dropped from a full ship queue",
+	},
+)
+
 // metricOverloadLevel is the node's overload level: 0 normal, 1 conserve,
 // 2 shed. 0 while overload control is disabled.
 var metricOverloadLevel = promauto.NewGauge(

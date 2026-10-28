@@ -6,6 +6,31 @@ No permission is granted to use, copy, modify, merge, publish, distribute,
 sublicense, or sell copies of this software or any associated files without
 prior written permission from the copyright holder.
 
+## Shutdown and reload
+
+Caddy builds a new `apx_stats` app on every config load and stops the old
+one. `Stop()` never waits on the network for long: the flush loop only drains
+and encodes, and a separate ship worker POSTs.
+
+- On Stop, an in-flight tick POST is cancelled and its body is retried under
+  the shutdown deadline. The final drain is queued behind it.
+- `Stop()` waits for the final batch at most `ingest.stop_wait_ms` (default
+  2000). A healthy ingest finishes inside that wait, so a graceful shutdown
+  loses nothing. Against a hung ingest Stop returns at the wait and the ship
+  continues in the background.
+- All shipping after Stop (the final batch with `shutdown_max_retries`, and
+  each retired-HTTP delivery) is bounded by `ingest.shutdown_deadline_ms`
+  (default 30000). The deadline cuts a hung POST at once.
+- Stopping and retired generations share two process-wide ship slots. A
+  generation that can't get one drops its batch and counts it, so rapid
+  reloads against a hung ingest can't pile up goroutines or bodies.
+- At most two encoded batches wait to ship. A full queue drops the oldest.
+
+Metrics: `apx_stats_stop_wait_seconds`,
+`apx_stats_retired_ship_total{result=ok|deadline|busy|permanent|exhausted}`,
+`apx_stats_ship_queue_dropped_rows_total`. Dropped rows also count in
+`apx_stats_dropped_rows_total`.
+
 ## Overload control
 
 `apps.apx_stats.overload` turns on a node-local overload controller. Absent,
