@@ -220,9 +220,9 @@ type StatsApp struct {
 	Ingest *IngestConfig `json:"ingest,omitempty"`
 
 	// Overload enables node-local overload control (overload.go). Absent
-	// means disabled. Process-global: the last app to Start wins.
-	Overload         *OverloadConfig `json:"overload,omitempty"`
-	overloadRetained bool
+	// means disabled. Process-global: the newest started, not yet stopped app wins.
+	Overload      *OverloadConfig `json:"overload,omitempty"`
+	overloadOwner *overloadOwner
 
 	logger    *zap.Logger
 	secret    string
@@ -638,9 +638,7 @@ func mixString(h uint64, s string) uint64 {
 // Start launches the periodic flush goroutine and the governor's RSS
 // refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
-	applyOverloadConfig(a.Overload)
-	overloadRetain()
-	a.overloadRetained = true
+	a.overloadOwner = overloadRetain(a.Overload)
 	a.startShipper()
 	a.wg.Add(1)
 	go a.flushLoop()
@@ -662,8 +660,8 @@ func (a *StatsApp) Stop() error {
 	// already swapped in the replacement app's pointer at its Provision).
 	corazaApp.CompareAndSwap(a, nil)
 	a.stopOnce.Do(func() {
-		if a.overloadRetained {
-			overloadRelease()
+		if a.overloadOwner != nil {
+			overloadRelease(a.overloadOwner)
 		}
 		close(a.stopCh)
 		// After the old config drains (grace_period is 1s), return the freed

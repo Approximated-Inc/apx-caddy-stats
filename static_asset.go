@@ -66,14 +66,126 @@ func wafSkippableStatic(r *http.Request) bool {
 	if !plainStaticPath(path) || !plainStaticQuery(query) || r.URL.Fragment != "" {
 		return false
 	}
-	for _, vs := range r.Header {
+	// Only the final segment may hold a dot: /index.php/x.css is PATH_INFO
+	// into a script, not a file. Costs the skip on dotted directories
+	// (/v1.2/app.js), which are then evaluated as usual.
+	if i := strings.LastIndexByte(path, '/'); strings.IndexByte(path[:i], '.') >= 0 {
+		return false
+	}
+	for name, vs := range r.Header {
 		for _, v := range vs {
-			if headerHasInjectionMarker(v) {
+			if !staticSkipHeaderSafe(name, v) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// staticSkipHeaderSafe screens one header value for the block-mode skip.
+// CRS reads cookies, User-Agent and Referer for SQLi/XSS/RCE, so those get
+// a strict character set and an SQL keyword check; every header gets the
+// shellshock, log4shell, markup and line-break checks. Over-strict is fine:
+// a rejected request is evaluated as usual.
+func staticSkipHeaderSafe(name, v string) bool {
+	if headerHasInjectionMarker(v) {
+		return false
+	}
+	switch name {
+	case "Cookie":
+		return cookieHeaderSafe(v) && !hasSQLKeyword(v)
+	case "User-Agent":
+		return textHeaderSafe(v, true) && !hasSQLKeyword(v)
+	case "Referer":
+		return textHeaderSafe(v, false) && !hasSQLKeyword(v)
+	}
+	return true
+}
+
+// cookieHeaderSafe: name=value pairs joined by "; ", each byte in
+// [A-Za-z0-9_.~=:/+-]. No quotes, spaces, '%' (CRS url-decodes cookies),
+// comment markers or parentheses.
+func cookieHeaderSafe(v string) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '.', c == '~', c == '=', c == ':', c == '/', c == '+':
+		case c == '-':
+			if i+1 < len(v) && v[i+1] == '-' {
+				return false
+			}
+		case c == ';':
+			if i+1 >= len(v) || v[i+1] != ' ' {
+				return false
+			}
+			i++
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// textHeaderSafe allows letters, digits and _ . ~ = : / + - , ( ) ; ? & !
+// plus spaces when spaces is set. No quotes, backticks, backslashes, '%',
+// '*', '|', '#', '--' or path markers like /bin/ and /etc/.
+func textHeaderSafe(v string, spaces bool) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '.', c == '~', c == '=', c == ':', c == '+', c == ',',
+			c == '(', c == ')', c == ';', c == '?', c == '&', c == '!':
+		case c == ' ':
+			if !spaces {
+				return false
+			}
+		case c == '-':
+			if i+1 < len(v) && v[i+1] == '-' {
+				return false
+			}
+		case c == '/':
+			if hasPrefixFold(v[i:], "/bin/") || hasPrefixFold(v[i:], "/etc/") {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sqlKeywords are words with no business in a browser's static-asset
+// request headers. Matched as whole words, ASCII case-insensitive.
+var sqlKeywords = [...]string{
+	"select", "union", "insert", "update", "delete", "drop", "truncate", "alter",
+	"sleep", "pg_sleep", "benchmark", "waitfor", "exec", "execute", "declare",
+	"having", "information_schema", "load_file", "outfile", "dumpfile", "xp_cmdshell",
+}
+
+func hasSQLKeyword(v string) bool {
+	start := -1
+	for i := 0; i <= len(v); i++ {
+		word := i < len(v) && (v[i] >= 'a' && v[i] <= 'z' || v[i] >= 'A' && v[i] <= 'Z' || v[i] == '_')
+		switch {
+		case word && start < 0:
+			start = i
+		case !word && start >= 0:
+			w := v[start:i]
+			for _, k := range sqlKeywords {
+				if len(k) == len(w) && strings.EqualFold(k, w) {
+					return true
+				}
+			}
+			start = -1
+		}
+	}
+	return false
+}
+
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // plainStaticPath matches ^/[A-Za-z0-9_.~/-]{1,256}$ with no ".." or "//".
@@ -117,14 +229,26 @@ func plainStaticQuery(q string) bool {
 	return true
 }
 
+// headerHasInjectionMarker: markup, NUL/CR/LF, backticks, ${ (log4shell,
+// shell expansion) and "()" followed by "{" (shellshock), in any header.
 func headerHasInjectionMarker(v string) bool {
 	for i := 0; i < len(v); i++ {
 		switch v[i] {
-		case '<', 0, '\r', '\n':
+		case '<', 0, '\r', '\n', '`':
 			return true
 		case '$':
 			if i+1 < len(v) && v[i+1] == '{' {
 				return true
+			}
+		case '(':
+			if i+1 < len(v) && v[i+1] == ')' {
+				j := i + 2
+				for j < len(v) && (v[j] == ' ' || v[j] == '\t') {
+					j++
+				}
+				if j < len(v) && v[j] == '{' {
+					return true
+				}
 			}
 		}
 	}
