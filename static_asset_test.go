@@ -47,6 +47,11 @@ func TestWAFSkippableStatic(t *testing.T) {
 		get(t, "/a.js?v=3"),
 		get(t, "/static/app-1.2_x~y.min.css?v=1&b=2"),
 		get(t, "/a.js", "User-Agent: Mozilla/5.0 (X11) Firefox/120", "Cookie: s=abc; t=1"),
+		get(t, "/_next/static/chunks/main-abc.js",
+			"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+			`Sec-Ch-Ua: "Chromium";v="124", "Google Chrome";v="124"`,
+			"Referer: https://shop.example.com/products?id=7&page=2",
+			"Cookie: _ga=GA1.2.123.456; session=eyJhbGciOiJIUzI1NiJ9.e30.abc-_x; cart=a+b/c=="),
 	}
 	for _, r := range yes {
 		require.True(t, wafSkippableStatic(r), r.RequestURI)
@@ -70,6 +75,22 @@ func TestWAFSkippableStatic(t *testing.T) {
 		"chunked":            rawRequest(t, "GET /a.js HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
 		"long path":          get(t, "/"+strings.Repeat("a", 254)+".js"),
 		"space-free unicode": get(t, "/\xc3\xa9.js"),
+		// PATH_INFO into a script, and the header payloads CRS would block.
+		"path info":         get(t, "/index.php/x.css"),
+		"dotted dir":        get(t, "/v1.2/app.js"),
+		"sqli cookie":       get(t, "/a.js", "Cookie: id=1' UNION SELECT password FROM users--"),
+		"quoteless cookie":  get(t, "/a.js", "Cookie: id=1+UNION+SELECT+password+FROM+users"),
+		"comment cookie":    get(t, "/a.js", "Cookie: id=1/**/OR/**/1=1"),
+		"encoded cookie":    get(t, "/a.js", "Cookie: id=1%27%20OR%201=1"),
+		"spaced cookie":     get(t, "/a.js", "Cookie: id=1 OR 1=1"),
+		"shellshock ua":     get(t, "/a.js", "User-Agent: () { :; }; /bin/bash -c 'id'"),
+		"shellshock other":  get(t, "/a.js", "X-Thing: (){ :;}; echo"),
+		"sqli ua":           get(t, "/a.js", "User-Agent: x UNION SELECT password FROM users"),
+		"quote ua":          get(t, "/a.js", "User-Agent: x' or 1=1"),
+		"sleep ua":          get(t, "/a.js", "User-Agent: Mozilla sleep(5)"),
+		"traversal referer": get(t, "/a.js", "Referer: http://x/../../etc/passwd"),
+		"space referer":     get(t, "/a.js", "Referer: http://x/ 1 OR 1=1"),
+		"backtick header":   get(t, "/a.js", "X-Thing: `id`"),
 	}
 	for name, r := range no {
 		require.False(t, wafSkippableStatic(r), name)

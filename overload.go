@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,10 +12,11 @@ import (
 
 // Overload control is node-local and process-global. Caddy builds a new
 // StatsApp on every reload, so the controller lives at package level: state
-// in atomics, config in an atomic pointer, one sampler goroutine refcounted
-// by StatsApp.Start/Stop (Caddy starts the new generation before stopping
-// the old, so a reload never drops the count to zero). No config reload is
-// needed to change level.
+// in atomics, config in an atomic pointer, one sampler goroutine kept while
+// any started StatsApp is live (Caddy starts the new generation before
+// stopping the old, so a reload never drops to zero). The current config is
+// the newest live app's, so a load that fails after apx_stats started rolls
+// back with it. No config reload is needed to change level.
 
 // Overload modes, for both the WAF and admission.
 const (
@@ -293,7 +295,7 @@ type overloadController struct {
 	level atomic.Int32
 
 	mu      sync.Mutex
-	refs    int
+	owners  []*overloadOwner // started apps, oldest first
 	stop    chan struct{}
 	done    chan struct{}
 	signals overloadSignals
@@ -325,8 +327,8 @@ func (c *overloadController) Level() int {
 	return int(c.level.Load())
 }
 
-// applyOverloadConfig stores the config every hot path reads. Called from
-// StatsApp.Start, so a load that fails before Start never changes it.
+// applyOverloadConfig stores the config every hot path reads. Only the owner
+// registry below calls it (and tests).
 func applyOverloadConfig(c *OverloadConfig) {
 	rt := resolveOverloadConfig(c, clampTotalRAM(detectTotalRAM()))
 	overload.cfg.Store(rt)
@@ -336,37 +338,59 @@ func applyOverloadConfig(c *OverloadConfig) {
 	}
 }
 
-// overloadRetain starts the sampler on the first live app.
-func overloadRetain() {
+// overloadOwner is one started StatsApp's claim on the controller.
+type overloadOwner struct{ cfg *OverloadConfig }
+
+// overloadRetain registers a started app; its config becomes current and
+// the first live app starts the sampler. A previous sampler is waited for
+// first, so two never share c.sampler.
+func overloadRetain(cfg *OverloadConfig) *overloadOwner {
 	c := overload
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.refs++
-	if c.refs == 1 {
+	o := &overloadOwner{cfg: cfg}
+	c.owners = append(c.owners, o)
+	applyOverloadConfig(cfg)
+	if len(c.owners) == 1 {
+		if c.done != nil {
+			<-c.done
+		}
 		c.stop = make(chan struct{})
 		c.done = make(chan struct{})
 		go c.sampleLoop(c.stop, c.done, c.signals)
 	}
+	return o
 }
 
-// overloadRelease stops the sampler when the last app stops.
-func overloadRelease() {
+// overloadRelease drops o. The newest live owner's config is current, so
+// when a load fails after its apx_stats started (Caddy stops the new apps
+// and keeps the old config) the surviving app's config comes back. The
+// last release turns control off, so nothing keeps skipping or shedding on
+// a level no sampler updates.
+func overloadRelease(o *overloadOwner) {
 	c := overload
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.refs == 0 {
+	i := slices.Index(c.owners, o)
+	if i < 0 {
 		return
 	}
-	c.refs--
-	if c.refs == 0 {
-		close(c.stop)
+	newest := i == len(c.owners)-1
+	c.owners = slices.Delete(c.owners, i, i+1)
+	if len(c.owners) > 0 {
+		if newest {
+			applyOverloadConfig(c.owners[len(c.owners)-1].cfg)
+		}
+		return
 	}
+	applyOverloadConfig(nil)
+	close(c.stop)
 }
 
 func (c *overloadController) samplerRunning() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.refs == 0 || c.done == nil {
+	if len(c.owners) == 0 || c.done == nil {
 		return false
 	}
 	select {
@@ -484,10 +508,7 @@ func (c *overloadController) sampleOnce(now time.Time, sig overloadSignals) {
 		admissionLimitNow.Store(0)
 	}
 
-	est := int64(-1) // unknown, or not draining
-	if tte >= 0 {
-		est = int64(tte)
-	}
+	est := burstEstSeconds(tte)
 	nodeStates.observe(now, nodeStateSample{
 		level:          s.level.level,
 		reasons:        s.level.reasons,

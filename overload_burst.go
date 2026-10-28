@@ -1,6 +1,9 @@
 package apxstats
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // burstState: "unknown is a state". Only a calibrated model can trigger.
 type burstState int
@@ -109,4 +112,21 @@ func (m *burstModel) tte(busy float64) float64 {
 		return -1
 	}
 	return m.b / (busy - base)
+}
+
+// maxBurstEstS caps the reported time-to-empty. busy a hair above the
+// baseline gives an estimate past Int32, which the ingest rejects with the
+// whole node_state row; anything this far out never triggers anyway.
+const maxBurstEstS = 1_000_000
+
+// burstEstSeconds is the node_state burst_est_s value: -1 when unknown or
+// not draining, otherwise tte in whole seconds, capped at maxBurstEstS.
+func burstEstSeconds(tte float64) int64 {
+	switch {
+	case tte < 0 || math.IsNaN(tte):
+		return -1
+	case tte >= maxBurstEstS:
+		return maxBurstEstS
+	}
+	return int64(tte)
 }

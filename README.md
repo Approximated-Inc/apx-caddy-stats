@@ -12,15 +12,21 @@ Caddy builds a new `apx_stats` app on every config load and stops the old
 one. `Stop()` never waits on the network for long: the flush loop only drains
 and encodes, and a separate ship worker POSTs.
 
-- On Stop, an in-flight tick POST is cancelled and its body is retried under
-  the shutdown deadline. The final drain is queued behind it.
-- `Stop()` waits for the final batch at most `ingest.stop_wait_ms` (default
-  2000). A healthy ingest finishes inside that wait, so a graceful shutdown
-  loses nothing. Against a hung ingest Stop returns at the wait and the ship
-  continues in the background.
+- On Stop, an in-flight tick POST is left to finish (cancelling one the
+  ingest has already read would double the batch on resend); its further
+  retries stop, and if it failed its body is retried under the shutdown
+  deadline. The final drain is queued behind it.
+- `Stop()` waits for the final drain, encode and ship at most
+  `ingest.stop_wait_ms` (default 2000), counted from Stop. A healthy ingest
+  finishes inside that wait, so a graceful reload loses nothing. Against a
+  hung ingest, or a final encode slowed by a starved CPU, Stop returns at the
+  wait and the work continues in the background.
+- On process exit (Caddy os.Exits right after stopping apps) Stop waits up to
+  the shutdown deadline instead, so the final batch keeps its retries until
+  the platform kills the process (Fly: `kill_timeout`, 5 s).
 - All shipping after Stop (the final batch with `shutdown_max_retries`, and
   each retired-HTTP delivery) is bounded by `ingest.shutdown_deadline_ms`
-  (default 30000). The deadline cuts a hung POST at once.
+  (default 30000), measured from Stop. The deadline cuts a hung POST at once.
 - Stopping and retired generations share two process-wide ship slots. A
   generation that can't get one drops its batch and counts it, so rapid
   reloads against a hung ingest can't pile up goroutines or bodies.
@@ -61,7 +67,16 @@ the largest balance without steal.
 `overload_policy`. At level ≥ 1 in enforce mode, `skip` routes (detect mode)
 skip WAF evaluation and `skip_static` routes (block mode) skip only static
 assets that pass a strict screen: GET/HEAD, no body, a plain path and query,
-no injection markers in headers. Observe mode counts would-skip.
+a dot only in the final path segment (so `/index.php/x.css` PATH_INFO is
+evaluated), and headers CRS reads for injections kept plain: `Cookie`,
+`User-Agent` and `Referer` limited to a strict character set with no SQL
+keywords (`select`, `union`, `sleep`, ...), and no markup, `${`, shellshock
+`() {`, backticks or line breaks in any header. Anything else is evaluated.
+Observe mode counts would-skip.
+
+The current overload config is the newest started, not yet stopped
+`apx_stats` app's: a load that fails after `apx_stats` started rolls back to
+the surviving app's config, and removing `apx_stats` turns control off.
 
 The stats batch carries one `node_state` row per completed minute that was
 not normal or had a non-zero counter, plus a heartbeat every 10 minutes:
@@ -71,6 +86,7 @@ not normal or had a non-zero counter, plus a heartbeat every 10 minutes:
 ```
 
 `reasons` bits: 1 throttle, 2 sched, 4 burst, 8 admission hard cap.
+`burst_est_s_min` is -1 when unknown and capped at 1 000 000.
 Metrics: `apx_stats_overload_level`, `apx_stats_overload_waf_skips_total{kind}`.
 
 ### Admission

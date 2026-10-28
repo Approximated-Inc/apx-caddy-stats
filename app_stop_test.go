@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -173,18 +174,23 @@ func TestStopHungIngestReturnsQuickly(t *testing.T) {
 	require.EqualValues(t, 1, ing.seen.Load(), "the final batch was attempted")
 }
 
-// A2: a tick POST in flight on a hung ingest is cut by Stop and its body is
-// retried under the shutdown deadline, not dropped and not waited on.
-func TestStopCancelsInFlightTickAndRequeuesIt(t *testing.T) {
+// A2: Stop never cuts a tick attempt already in flight. The ingest pushes
+// rows before it answers, so cancelling a POST it has read and resending the
+// body would count the batch twice. The attempt finishes, and its body is
+// not resent.
+func TestStopLetsInFlightTickFinishWithoutResend(t *testing.T) {
 	capture, posts := captureServer(t, 200)
 	defer capture.Close()
 	entered := make(chan struct{})
 	var first atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if first.CompareAndSwap(false, true) {
-			_, _ = io.Copy(io.Discard, r.Body)
+			// Take the rows, then answer slowly, like an ingest that has
+			// already buffered the batch.
+			capture.Config.Handler.ServeHTTP(httptest.NewRecorder(), r)
 			close(entered)
-			<-r.Context().Done() // the tick POST hangs until cancelled
+			time.Sleep(400 * time.Millisecond)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		capture.Config.Handler.ServeHTTP(w, r)
@@ -201,15 +207,133 @@ func TestStopCancelsInFlightTickAndRequeuesIt(t *testing.T) {
 
 	d := stopWithin(t, a, 5*time.Second)
 	require.Less(t, d, 2500*time.Millisecond)
+	require.Equal(t, map[float64]int{1: 1, 2: 1}, postedVhosts(posts()), "tick batch received once, final batch shipped before Stop returned")
+}
+
+// A2b: a tick attempt hung at Stop does not hold Stop, and the shutdown
+// deadline (not the 10 s client timeout) cuts it.
+func TestStopHungTickCutAtShutdownDeadline(t *testing.T) {
+	ing := newHungIngest(t)
+	a := newTestApp(t, ing.srv.URL, "key")
+	realisticShutdownConfig(a)
+	a.cfg.flushInterval = 20 * time.Millisecond
+	a.cfg.shutdownDeadline = 300 * time.Millisecond
+	a.Record(Key{VhostID: 1, Status: 200}, CounterDelta{})
+	require.NoError(t, a.Start())
+	<-ing.entered
+	a.Record(Key{VhostID: 2, Status: 200}, CounterDelta{})
+
+	d := stopWithin(t, a, 5*time.Second)
+	require.Less(t, d, 2500*time.Millisecond)
+	select {
+	case <-a.shipDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung tick attempt outlived the shutdown deadline")
+	}
+	require.EqualValues(t, 2, a.Dropped(), "tick and final rows counted dropped")
+}
+
+// A8: on process exit Caddy os.Exits right after Stop, so Stop waits for the
+// final batch up to the shutdown deadline, not just stop_wait.
+func TestStopOnProcessExitWaitsForShutdownDeadline(t *testing.T) {
+	capture, posts := captureServer(t, 200)
+	defer capture.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		capture.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	prev := processExiting
+	processExiting = func() bool { return true }
+	defer func() { processExiting = prev }()
+	a := newTestApp(t, srv.URL, "key")
+	realisticShutdownConfig(a)
+	defer finishShipper(t, a)
+	a.cfg.stopWait = 100 * time.Millisecond
+	a.cfg.shutdownDeadline = 3 * time.Second
+	a.Record(Key{VhostID: 3, Status: 200}, CounterDelta{})
+	require.NoError(t, a.Start())
+
+	stopWithin(t, a, 5*time.Second)
+	require.Len(t, posts(), 1, "final batch shipped before Stop returned on exit")
+}
+
+// A9: Stop's wait starts at Stop, so a final drain that cannot finish (here
+// a shard lock held, standing in for a slow gzip on a starved node) does not
+// hold Stop past stop_wait. The batch still ships once the drain completes.
+func TestStopWaitCoversFinalDrain(t *testing.T) {
+	server, posts := captureServer(t, 200)
+	defer server.Close()
+	a := newTestApp(t, server.URL, "key")
+	realisticShutdownConfig(a)
+	defer finishShipper(t, a)
+	a.cfg.stopWait = 200 * time.Millisecond
+	a.Record(Key{VhostID: 4, Status: 200}, CounterDelta{})
+	require.NoError(t, a.Start())
+	a.shards[0].mu.Lock()
+	go func() {
+		time.Sleep(time.Second)
+		a.shards[0].mu.Unlock()
+	}()
+
+	d := stopWithin(t, a, 5*time.Second)
+	require.Less(t, d, 700*time.Millisecond)
+	require.Eventually(t, func() bool { return postedVhosts(posts())[4] == 1 }, 3*time.Second, 10*time.Millisecond)
+}
+
+// A10: a retired delivery labels its failure by cause. Cancelling the
+// deadline before labelling made every failure read "deadline".
+func TestRetiredDeliveryLabelsPermanentFailure(t *testing.T) {
+	server, _ := captureServer(t, 401)
+	defer server.Close()
+	a := newTestApp(t, server.URL, "key")
+	permanent := counterValue(metricRetiredShip.WithLabelValues("permanent"))
+	deadline := counterValue(metricRetiredShip.WithLabelValues("deadline"))
+	a.Record(Key{VhostID: 5, Status: 200}, CounterDelta{})
+	a.httpDeliveryPending = true
+	a.httpDeliveryDone = make(chan struct{})
+	a.deliverRetiredHTTP()
+
+	require.EqualValues(t, 1, a.Dropped())
+	require.Equal(t, permanent+1, counterValue(metricRetiredShip.WithLabelValues("permanent")))
+	require.Equal(t, deadline, counterValue(metricRetiredShip.WithLabelValues("deadline")))
+}
+
+// A11: a consumed job does not stay reachable from the queue's backing
+// array, so a retired generation never pins bodies it already shipped.
+func TestShipQueueReleasesConsumedJobs(t *testing.T) {
+	q := newShipQueue()
+	q.push(&shipJob{body: []byte("a")})
+	q.push(&shipJob{body: []byte("b")})
+	q.push(&shipJob{body: []byte("c")}) // drops "a"
+	backing := q.jobs[:cap(q.jobs)]
+	for range 2 {
+		_, ok := q.pop()
+		require.True(t, ok)
+	}
+	for i, j := range backing {
+		require.Nil(t, j, "slot %d still holds a consumed job", i)
+	}
+}
+
+func counterValue(c interface{ Write(*dto.Metric) error }) float64 {
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		panic(err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+func postedVhosts(posts []capturedPost) map[float64]int {
 	vhosts := map[float64]int{}
-	for _, p := range posts() {
+	for _, p := range posts {
 		for _, row := range p.rows {
 			if row["request_count"] != nil {
 				vhosts[row["vhost_id"].(float64)]++
 			}
 		}
 	}
-	require.Equal(t, map[float64]int{1: 1, 2: 1}, vhosts, "tick body requeued and final batch shipped before Stop returned")
+	return vhosts
 }
 
 // A3: a slow-but-healthy ingest still gets the final batch before Stop
@@ -313,6 +437,8 @@ func TestShipQueueDropsOldest(t *testing.T) {
 	a.shutdownReady = make(chan struct{})
 	a.tickCtx, a.tickCancel = context.WithCancel(context.Background())
 	defer a.tickCancel()
+	a.attemptCtx, a.attemptCancel = context.WithCancel(context.Background())
+	defer a.attemptCancel()
 	go a.shipLoop()
 	a.shipQ.close()
 	<-a.shipDone
