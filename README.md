@@ -6,6 +6,37 @@ No permission is granted to use, copy, modify, merge, publish, distribute,
 sublicense, or sell copies of this software or any associated files without
 prior written permission from the copyright holder.
 
+## Shutdown and reload
+
+Caddy builds a new `apx_stats` app on every config load and stops the old
+one. `Stop()` never waits on the network for long: the flush loop only drains
+and encodes, and a separate ship worker POSTs.
+
+- On Stop, an in-flight tick POST is left to finish (cancelling one the
+  ingest has already read would double the batch on resend); its further
+  retries stop, and if it failed its body is retried under the shutdown
+  deadline. The final drain is queued behind it.
+- `Stop()` waits for the final drain, encode and ship at most
+  `ingest.stop_wait_ms` (default 2000), counted from Stop. A healthy ingest
+  finishes inside that wait, so a graceful reload loses nothing. Against a
+  hung ingest, or a final encode slowed by a starved CPU, Stop returns at the
+  wait and the work continues in the background.
+- On process exit (Caddy os.Exits right after stopping apps) Stop waits up to
+  the shutdown deadline instead, so the final batch keeps its retries until
+  the platform kills the process (Fly: `kill_timeout`, 5 s).
+- All shipping after Stop (the final batch with `shutdown_max_retries`, and
+  each retired-HTTP delivery) is bounded by `ingest.shutdown_deadline_ms`
+  (default 30000), measured from Stop. The deadline cuts a hung POST at once.
+- Stopping and retired generations share two process-wide ship slots. A
+  generation that can't get one drops its batch and counts it, so rapid
+  reloads against a hung ingest can't pile up goroutines or bodies.
+- At most two encoded batches wait to ship. A full queue drops the oldest.
+
+Metrics: `apx_stats_stop_wait_seconds`,
+`apx_stats_retired_ship_total{result=ok|deadline|busy|permanent|exhausted}`,
+`apx_stats_ship_queue_dropped_rows_total`. Dropped rows also count in
+`apx_stats_dropped_rows_total`.
+
 ## Request correlation
 
 With request events enabled in `mode_v2`, `request_id` contains Caddy's
