@@ -226,8 +226,9 @@ func TestSchedP99Delta(t *testing.T) {
 
 // fakeSignals reports 1 s scheduler latencies on every sample.
 type fakeSignals struct {
-	mu sync.Mutex
-	n  uint64
+	mu   sync.Mutex
+	n    uint64
+	calm bool
 }
 
 func (f *fakeSignals) procStat() (cpuTimes, bool)          { return cpuTimes{}, false }
@@ -236,7 +237,9 @@ func (f *fakeSignals) uptime() (float64, bool)             { return 5000, true }
 func (f *fakeSignals) schedHistogram() ([]uint64, []float64, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.n += 100
+	if !f.calm {
+		f.n += 100
+	}
 	return []uint64{0, 0, f.n}, []float64{0, 0.01, 0.5, 1e300}, true
 }
 
@@ -244,7 +247,8 @@ func (f *fakeSignals) schedHistogram() ([]uint64, []float64, bool) {
 func TestOverloadControllerSurvivesReload(t *testing.T) {
 	resetOverload(t)
 	origSig, origInterval := overload.signals, overloadSampleInterval
-	overload.signals, overloadSampleInterval = &fakeSignals{}, 5*time.Millisecond
+	sig := &fakeSignals{}
+	overload.signals, overloadSampleInterval = sig, 5*time.Millisecond
 	defer func() { overload.signals, overloadSampleInterval = origSig, origInterval }()
 
 	server, _ := captureServer(t, 200)
@@ -253,6 +257,9 @@ func TestOverloadControllerSurvivesReload(t *testing.T) {
 	app1 := newTestApp(t, server.URL, "k", func(a *StatsApp) { a.Overload = cfg })
 	require.NoError(t, app1.Start())
 	require.Eventually(t, func() bool { return overload.Level() == 2 }, 2*time.Second, 5*time.Millisecond)
+	sig.mu.Lock()
+	sig.calm = true // from here only held state (dwell, exit hold) keeps level 2
+	sig.mu.Unlock()
 
 	app2 := newTestApp(t, server.URL, "k", func(a *StatsApp) { a.Overload = cfg })
 	require.NoError(t, app2.Start())
