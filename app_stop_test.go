@@ -2,6 +2,7 @@ package apxstats
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,8 +12,71 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/require"
 )
+
+// A7: a real Caddy /load against a hung ingest. Each load stops the old
+// apx_stats app, whose final batch can't ship. Before the fix each load took
+// ≈ 93 s with these settings (10 s timeout, 7 shutdown retries).
+func TestCaddyReloadNotStalledByHungIngest(t *testing.T) {
+	ing := newHungIngest(t)
+	addr := freeLoopbackAddr(t)
+	config := func(grace string) []byte {
+		raw, err := json.Marshal(map[string]any{
+			"admin":   map[string]any{"disabled": true, "config": map[string]any{"persist": false}},
+			"storage": map[string]any{"module": "file_system", "root": t.TempDir()},
+			"logging": map[string]any{"logs": map[string]any{"default": map[string]any{"level": "ERROR"}}},
+			"apps": map[string]any{
+				"apx_stats": map[string]any{
+					"proxy_server_id": 89,
+					"ingest": map[string]any{
+						"url":               ing.srv.URL,
+						"auth_token":        "test-token",
+						"flush_interval_ms": 3_600_000,
+						"timeout_ms":        10_000,
+						// Short only so this test frees its retired slots
+						// quickly; the wait under test is stop_wait_ms (default).
+						"shutdown_deadline_ms": 1_500,
+					},
+				},
+				"http": map[string]any{
+					"grace_period": grace,
+					"servers": map[string]any{"edge": map[string]any{
+						"listen":          []string{addr},
+						"automatic_https": map[string]any{"disable": true},
+						"routes": []any{map[string]any{"handle": []any{
+							map[string]any{"handler": "apx_stats"},
+							map[string]any{"handler": "vars", "vhost_id": "101"},
+							map[string]any{"handler": "static_response", "status_code": 200},
+						}}},
+					}},
+				},
+			},
+		})
+		require.NoError(t, err)
+		return raw
+	}
+	require.NoError(t, caddy.Load(config("1s"), true))
+	t.Cleanup(func() {
+		_ = caddy.Stop()
+		require.Eventually(t, func() bool { return len(retiredShipSlots) == 0 }, 5*time.Second, 20*time.Millisecond)
+	})
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	hit := func() {
+		resp, err := client.Get("http://" + addr + "/")
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+	}
+
+	for i, grace := range []string{"2s", "3s"} {
+		hit() // a counter row, so the stopping app has a final batch to ship
+		start := time.Now()
+		require.NoError(t, caddy.Load(config(grace), true))
+		require.Less(t, time.Since(start), 3*time.Second, "load %d", i+1)
+	}
+	require.GreaterOrEqual(t, ing.seen.Load(), int32(2), "each stopped app attempted its final batch")
+}
 
 // hungIngest blocks every request until the client gives up or the test
 // ends. It records how many POSTs it saw and the peak concurrency.
