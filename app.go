@@ -356,10 +356,16 @@ type StatsApp struct {
 
 	// Shipping runs on shipLoop, off flushLoop, so Stop never waits on the
 	// network for longer than stopWait. See ship_queue.go.
-	shipQ          *shipQueue
-	shipDone       chan struct{}
+	shipQ    *shipQueue
+	shipDone chan struct{}
+	// tickCtx is cancelled on Stop: it ends tick retries and backoff, but
+	// never an in-flight attempt (that could double a batch the ingest
+	// already took). attemptCtx bounds tick attempts; it is cancelled only
+	// when the shutdown deadline expires.
 	tickCtx        context.Context
 	tickCancel     context.CancelFunc
+	attemptCtx     context.Context
+	attemptCancel  context.CancelFunc
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	shutdownReady  chan struct{}
@@ -659,6 +665,7 @@ func (a *StatsApp) Stop() error {
 	// clear if we're still the published app (a hot-reload may have
 	// already swapped in the replacement app's pointer at its Provision).
 	corazaApp.CompareAndSwap(a, nil)
+	start := time.Now()
 	a.stopOnce.Do(func() {
 		if a.overloadOwner != nil {
 			overloadRelease(a.overloadOwner)
@@ -671,10 +678,9 @@ func (a *StatsApp) Stop() error {
 		// (separate stopOnce) via the package-level debounce timer.
 		scheduleFreeOSMemory(10 * time.Second)
 	})
-	// The loop and the governor refresher never touch the network, so this
-	// returns as soon as the final batch is encoded and queued.
-	a.wg.Wait()
-	a.awaitShipper()
+	// Bounded from Stop's entry, final drain and encode included (a large
+	// batch on a CPU-starved node can take seconds to gzip).
+	a.awaitShipper(start)
 	// Do not wait for old requests or network delivery here: Caddy reload must
 	// finish while old handlers are still active. Catch records after final drain.
 	a.httpDeliveryMu.Lock()
@@ -715,6 +721,9 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		}
 		a.httpDeliveryPending = false
 		a.httpDeliveryMu.Unlock()
+		// Stop can return before flushLoop's final drain; never drain
+		// alongside it.
+		a.wg.Wait()
 		// Use this retired generation's bounded retry policy and original
 		// destination. L4, fingerprints and Coraza remain on normal flush paths.
 		// Always drain (frees the buffers); ship only with a process-wide
@@ -730,10 +739,15 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownDeadlineOrDefault())
 		err := a.shipWithRetryN(ctx, body, a.cfg.maxRetries)
+		// Label before cancel: shipFailureResult reads ctx.Err().
+		result := "ok"
+		if err != nil {
+			result = shipFailureResult(ctx, err)
+		}
 		cancel()
 		releaseRetiredSlot()
 		if err != nil {
-			a.dropRows(rows, shipFailureResult(ctx, err), err)
+			a.dropRows(rows, result, err)
 		} else {
 			metricRetiredShip.WithLabelValues("ok").Inc()
 		}
@@ -1508,10 +1522,11 @@ func (a *StatsApp) maybeLogOverflow() {
 
 // flushLoop runs until Stop is called. On each tick it drains and
 // encodes the current maps and queues the body for shipLoop; it never
-// touches the network itself. On Stop it cancels the in-flight tick ship
-// (shipLoop retries that body under the shutdown deadline), does one final
-// drain, queues it, and closes the queue, so shutdown loses ≤ flushInterval
-// of buffered counters without Stop waiting on a hung ingest.
+// touches the network itself. On Stop it ends tick retries (an in-flight
+// tick attempt finishes; a failed one is retried under the shutdown
+// deadline), starts that deadline, does one final drain, queues it, and
+// closes the queue, so shutdown loses ≤ flushInterval of buffered counters
+// without Stop waiting on a hung ingest.
 func (a *StatsApp) flushLoop() {
 	defer a.wg.Done()
 	t := time.NewTicker(a.cfg.flushInterval)
@@ -1530,12 +1545,12 @@ func (a *StatsApp) flushLoop() {
 			// flush fails after the normal 3-retry budget (~3.4s), the
 			// buffer is dropped — and on a cluster with per-minute
 			// config_regen_immediate, a brief ingest hiccup can lose
-			// fleet-wide data simultaneously. Up to 7 retries (~30s
-			// total backoff) gives more leeway, still well under Fly's
-			// 60s graceful-shutdown SIGKILL window. The whole shutdown
-			// phase is bounded by shutdownDeadline.
-			body, rows, ok := a.drainAndEncode(false)
+			// fleet-wide data simultaneously. Up to 7 retries gives more
+			// leeway. The whole shutdown phase, encoding included, is
+			// bounded by shutdownDeadline; on process exit Stop waits for
+			// it (Fly's kill_timeout, 5 s, may cut it shorter).
 			a.beginShutdownShipping()
+			body, rows, ok := a.drainAndEncode(false)
 			if ok {
 				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true})
 			}
@@ -1705,6 +1720,14 @@ func (a *StatsApp) shipWithRetry(body []byte) error {
 // context. Cancelling ctx cuts an in-flight POST and any backoff sleep at
 // once, which is what bounds Stop and retired shipping.
 func (a *StatsApp) shipWithRetryN(ctx context.Context, body []byte, maxRetries int) error {
+	return a.shipWithRetryWait(ctx, ctx, body, maxRetries)
+}
+
+// shipWithRetryWait cuts attempts with ctx but stops retrying (backoff
+// sleeps, further attempts) as soon as wait is done, letting an in-flight
+// attempt finish. Cancelling a POST the ingest has already read would make
+// the retry double the batch.
+func (a *StatsApp) shipWithRetryWait(ctx, wait context.Context, body []byte, maxRetries int) error {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -1714,7 +1737,13 @@ func (a *StatsApp) shipWithRetryN(ctx context.Context, body []byte, maxRetries i
 			case <-ctx.Done():
 				t.Stop()
 				return ctx.Err()
+			case <-wait.Done():
+				t.Stop()
+				return wait.Err()
 			}
+		}
+		if err := wait.Err(); err != nil {
+			return err
 		}
 		err := a.shipOnce(ctx, body)
 		if err == nil {

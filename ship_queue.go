@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 )
 
@@ -63,8 +64,7 @@ func (q *shipQueue) signal() {
 func (q *shipQueue) push(j *shipJob) (dropped *shipJob) {
 	q.mu.Lock()
 	if len(q.jobs) >= shipQueueCap {
-		dropped = q.jobs[0]
-		q.jobs = q.jobs[1:]
+		dropped = q.shiftLocked()
 	}
 	q.jobs = append(q.jobs, j)
 	q.mu.Unlock()
@@ -81,6 +81,16 @@ func (q *shipQueue) pushFront(j *shipJob) {
 	q.signal()
 }
 
+// shiftLocked removes the head in place and clears the vacated slot, so a
+// retired generation's queue never pins bodies it already shipped.
+func (q *shipQueue) shiftLocked() *shipJob {
+	j := q.jobs[0]
+	n := copy(q.jobs, q.jobs[1:])
+	q.jobs[n] = nil
+	q.jobs = q.jobs[:n]
+	return j
+}
+
 func (q *shipQueue) close() {
 	q.mu.Lock()
 	q.closed = true
@@ -93,8 +103,7 @@ func (q *shipQueue) pop() (*shipJob, bool) {
 	for {
 		q.mu.Lock()
 		if len(q.jobs) > 0 {
-			j := q.jobs[0]
-			q.jobs = q.jobs[1:]
+			j := q.shiftLocked()
 			q.mu.Unlock()
 			return j, true
 		}
@@ -142,15 +151,22 @@ func (a *StatsApp) startShipper() {
 	a.shipDone = make(chan struct{})
 	a.shutdownReady = make(chan struct{})
 	a.tickCtx, a.tickCancel = context.WithCancel(context.Background())
+	a.attemptCtx, a.attemptCancel = context.WithCancel(context.Background())
 	go a.shipLoop()
 }
 
 // beginShutdownShipping starts the shutdown deadline. Called by flushLoop
-// once, on stop, after cancelling the tick context.
+// once, on stop, after cancelling the tick context. A tick attempt still in
+// flight is cut only when the deadline expires.
 func (a *StatsApp) beginShutdownShipping() {
 	a.shutdownCtx, a.shutdownCancel = context.WithTimeout(context.Background(), a.cfg.shutdownDeadlineOrDefault())
+	context.AfterFunc(a.shutdownCtx, a.attemptCancel)
 	close(a.shutdownReady)
 }
+
+// processExiting reports whether Caddy is exiting the process (it then
+// os.Exits right after stopping apps). A variable so tests can set it.
+var processExiting = caddy.Exiting
 
 func (a *StatsApp) enqueueShip(j *shipJob) {
 	if dropped := a.shipQ.push(j); dropped != nil {
@@ -164,23 +180,29 @@ func (a *StatsApp) enqueueShip(j *shipJob) {
 	}
 }
 
-// awaitShipper waits for shipLoop to finish, at most stopWait. A healthy
-// ingest (50–300 ms POST) finishes inside the wait, so graceful shutdown
-// keeps today's no-loss behaviour; a hung one keeps going in the
-// background under the shutdown deadline.
-func (a *StatsApp) awaitShipper() {
+// awaitShipper waits for the final drain, encode and ship (shipDone closes
+// only after flushLoop closed the queue), at most stopWait from start. A
+// healthy ingest (50–300 ms POST) finishes inside the wait, so graceful
+// shutdown keeps today's no-loss behaviour; a hung one keeps going in the
+// background under the shutdown deadline. On process exit nothing runs
+// after Stop, so it waits up to the shutdown deadline instead.
+func (a *StatsApp) awaitShipper(start time.Time) {
 	if a.shipDone == nil {
+		a.wg.Wait()
 		return
 	}
-	start := time.Now()
-	t := time.NewTimer(a.cfg.stopWaitOrDefault())
+	wait := a.cfg.stopWaitOrDefault()
+	if processExiting() {
+		wait = a.cfg.shutdownDeadlineOrDefault()
+	}
+	t := time.NewTimer(wait - time.Since(start))
 	defer t.Stop()
 	select {
 	case <-a.shipDone:
 	case <-t.C:
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: stop returned before the final batch shipped; continuing in the background",
-				zap.Duration("stop_wait", a.cfg.stopWaitOrDefault()))
+				zap.Duration("wait", wait))
 		}
 	}
 	metricStopWait.Observe(time.Since(start).Seconds())
@@ -202,10 +224,10 @@ func (a *StatsApp) shipLoop() {
 		if !ok {
 			return
 		}
-		ctx := a.tickCtx
+		ctx, wait := a.attemptCtx, a.tickCtx
 		if j.shutdown || a.tickCtx.Err() != nil {
 			<-a.shutdownReady
-			ctx = a.shutdownCtx
+			ctx, wait = a.shutdownCtx, a.shutdownCtx
 			if !j.shutdown {
 				j.shutdown = true
 				j.retries = a.cfg.shutdownMaxRetries
@@ -219,15 +241,15 @@ func (a *StatsApp) shipLoop() {
 				slot = true
 			}
 		}
-		err := a.shipWithRetryN(ctx, j.body, j.retries)
+		err := a.shipWithRetryWait(ctx, wait, j.body, j.retries)
 		switch {
 		case err == nil:
 			if j.shutdown {
 				metricRetiredShip.WithLabelValues("ok").Inc()
 			}
-		case !j.shutdown && a.tickCtx.Err() != nil:
-			// Cut short by Stop: put the body back at the head and retry it
-			// under the shutdown deadline instead of dropping it.
+		case !j.shutdown && !isPermanent(err) && a.tickCtx.Err() != nil:
+			// Retries ended by Stop: put the body back at the head and retry
+			// it under the shutdown deadline instead of dropping it.
 			a.shipQ.pushFront(j)
 		case j.shutdown:
 			a.dropRows(j.rows, shipFailureResult(ctx, err), err)
