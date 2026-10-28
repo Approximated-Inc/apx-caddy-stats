@@ -115,6 +115,13 @@ type IngestConfig struct {
 	// regen would otherwise lose data on every Caddy machine
 	// simultaneously. Default 7.
 	ShutdownMaxRetries int `json:"shutdown_max_retries,omitempty"`
+	// StopWaitMs is how long Stop() waits for the final batch to ship
+	// before returning, so a hung ingest can't stall a Caddy /load. The
+	// ship keeps going in the background afterwards. Default 2000.
+	StopWaitMs int `json:"stop_wait_ms,omitempty"`
+	// ShutdownDeadlineMs bounds all shipping after Stop() (the final batch
+	// with its retries, and each retired-HTTP delivery). Default 30000.
+	ShutdownDeadlineMs int `json:"shutdown_deadline_ms,omitempty"`
 
 	// L4SniMaxKeys caps the number of distinct SNIs the L4 SNI counter
 	// map holds per machine per minute. Set by Approximated's
@@ -342,6 +349,16 @@ type StatsApp struct {
 	httpDeliveryRunning bool
 	httpDeliveryDone    chan struct{}
 
+	// Shipping runs on shipLoop, off flushLoop, so Stop never waits on the
+	// network for longer than stopWait. See ship_queue.go.
+	shipQ          *shipQueue
+	shipDone       chan struct{}
+	tickCtx        context.Context
+	tickCancel     context.CancelFunc
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	shutdownReady  chan struct{}
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -372,6 +389,10 @@ type ingestRuntime struct {
 	maxUniqueHashes    int
 	maxRetries         int
 	shutdownMaxRetries int
+	// stopWait / shutdownDeadline: zero means the default (see
+	// stopWaitOrDefault / shutdownDeadlineOrDefault).
+	stopWait         time.Duration
+	shutdownDeadline time.Duration
 	// l4SniMaxKeys is the per-minute cap on distinct SNIs in the L4 SNI
 	// counter map. 0 disables L4 SNI tracking; the handler still runs
 	// but RecordL4Sni is a no-op so no map memory is allocated.
@@ -453,6 +474,8 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		maxUniqueHashes:    intDefault(a.Ingest.MaxUniqueHashes, 500_000),
 		maxRetries:         intDefault(a.Ingest.MaxRetries, 3),
 		shutdownMaxRetries: intDefault(a.Ingest.ShutdownMaxRetries, 7),
+		stopWait:           durationMs(a.Ingest.StopWaitMs, defaultStopWaitMs),
+		shutdownDeadline:   durationMs(a.Ingest.ShutdownDeadlineMs, defaultShutdownDeadlineMs),
 		// L4 SNI cap: no default fallback. 0 means "disabled"; the
 		// Approximated control plane sets this explicitly via the
 		// `l4_sni_max_keys` config field based on the cluster's vhost
@@ -607,6 +630,7 @@ func mixString(h uint64, s string) uint64 {
 // Start launches the periodic flush goroutine and the governor's RSS
 // refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
+	a.startShipper()
 	a.wg.Add(1)
 	go a.flushLoop()
 	if a.memGov != nil {
@@ -635,7 +659,10 @@ func (a *StatsApp) Stop() error {
 		// (separate stopOnce) via the package-level debounce timer.
 		scheduleFreeOSMemory(10 * time.Second)
 	})
+	// The loop and the governor refresher never touch the network, so this
+	// returns as soon as the final batch is encoded and queued.
 	a.wg.Wait()
+	a.awaitShipper()
 	// Do not wait for old requests or network delivery here: Caddy reload must
 	// finish while old handlers are still active. Catch records after final drain.
 	a.httpDeliveryMu.Lock()
@@ -678,7 +705,26 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		a.httpDeliveryMu.Unlock()
 		// Use this retired generation's bounded retry policy and original
 		// destination. L4, fingerprints and Coraza remain on normal flush paths.
-		a.flushBatch(a.cfg.maxRetries, true)
+		// Always drain (frees the buffers); ship only with a process-wide
+		// retired slot and under a deadline, so a hung ingest can't pile up
+		// goroutines and bodies across rapid reloads.
+		body, rows, ok := a.drainAndEncode(true)
+		if !ok {
+			continue
+		}
+		if !acquireRetiredSlot() {
+			a.dropRows(rows, "busy", nil)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownDeadlineOrDefault())
+		err := a.shipWithRetryN(ctx, body, a.cfg.maxRetries)
+		cancel()
+		releaseRetiredSlot()
+		if err != nil {
+			a.dropRows(rows, shipFailureResult(ctx, err), err)
+		} else {
+			metricRetiredShip.WithLabelValues("ok").Inc()
+		}
 	}
 }
 
@@ -1448,9 +1494,12 @@ func (a *StatsApp) maybeLogOverflow() {
 	}
 }
 
-// flushLoop runs until Stop is called. On each tick it drains the
-// current counter map and ships it. On Stop it does one final drain so
-// shutdown loses ≤ flushInterval of buffered counters.
+// flushLoop runs until Stop is called. On each tick it drains and
+// encodes the current maps and queues the body for shipLoop; it never
+// touches the network itself. On Stop it cancels the in-flight tick ship
+// (shipLoop retries that body under the shutdown deadline), does one final
+// drain, queues it, and closes the queue, so shutdown loses ≤ flushInterval
+// of buffered counters without Stop waiting on a hung ingest.
 func (a *StatsApp) flushLoop() {
 	defer a.wg.Done()
 	t := time.NewTicker(a.cfg.flushInterval)
@@ -1458,8 +1507,11 @@ func (a *StatsApp) flushLoop() {
 	for {
 		select {
 		case <-t.C:
-			a.flushOnce(a.cfg.maxRetries)
+			if body, rows, ok := a.drainAndEncode(false); ok {
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.maxRetries})
+			}
 		case <-a.stopCh:
+			a.tickCancel()
 			// Shutdown flush gets a wider retry budget than a steady-
 			// state tick: Caddy hot-reloads create a new App instance
 			// and call Stop() on the old one. If the old App's final
@@ -1468,8 +1520,14 @@ func (a *StatsApp) flushLoop() {
 			// config_regen_immediate, a brief ingest hiccup can lose
 			// fleet-wide data simultaneously. Up to 7 retries (~30s
 			// total backoff) gives more leeway, still well under Fly's
-			// 60s graceful-shutdown SIGKILL window.
-			a.flushOnce(a.cfg.shutdownMaxRetries)
+			// 60s graceful-shutdown SIGKILL window. The whole shutdown
+			// phase is bounded by shutdownDeadline.
+			body, rows, ok := a.drainAndEncode(false)
+			a.beginShutdownShipping()
+			if ok {
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true})
+			}
+			a.shipQ.close()
 			return
 		}
 	}
@@ -1491,7 +1549,22 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 	a.flushBatch(maxRetries, false)
 }
 
+// flushBatch is the synchronous drain + encode + ship, used by tests and
+// anything that must see the POST complete before returning.
 func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
+	body, rows, ok := a.drainAndEncode(httpOnly)
+	if !ok {
+		return
+	}
+	if err := a.shipWithRetryN(context.Background(), body, maxRetries); err != nil {
+		a.dropRows(rows, "", err)
+	}
+}
+
+// drainAndEncode drains the buffers (HTTP tracks only when httpOnly) and
+// encodes them. ok is false when there is nothing to ship or encoding
+// failed (the rows are then counted dropped here).
+func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok bool) {
 	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
 	if perShardInitialCap < 8 {
 		perShardInitialCap = 8
@@ -1568,10 +1641,10 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
 		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 {
-		return
+		return nil, 0, false
 	}
 
-	rowCount := len(snap) + len(uniqSnap) + len(l4SniSnap) +
+	rowCount = len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(ipSnap.topkRows) + len(ipSnap.sampled) +
 		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
@@ -1585,18 +1658,25 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: encode batch failed", zap.Error(err))
 		}
-		return
+		return nil, 0, false
 	}
+	return body, rowCount, true
+}
 
-	if err := a.shipWithRetryN(body, maxRetries); err != nil {
-		atomic.AddUint64(&a.dropped, uint64(rowCount))
-		metricDroppedRows.Add(float64(rowCount))
-		if a.logger != nil {
-			a.logger.Warn("apx_stats: ship failed; dropping batch",
-				zap.Int("rows", rowCount),
-				zap.Error(err),
-			)
-		}
+// dropRows counts a batch that will not ship. result, when set, labels the
+// retired-ship metric (shutdown-phase and retired-HTTP ships only).
+func (a *StatsApp) dropRows(rows int, result string, err error) {
+	atomic.AddUint64(&a.dropped, uint64(rows))
+	metricDroppedRows.Add(float64(rows))
+	if result != "" {
+		metricRetiredShip.WithLabelValues(result).Inc()
+	}
+	if a.logger != nil {
+		a.logger.Warn("apx_stats: ship failed; dropping batch",
+			zap.Int("rows", rows),
+			zap.String("result", result),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -1604,21 +1684,25 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 // short exponential backoff. 4xx responses are NOT retried — they
 // indicate a wire-format/auth problem that retries won't fix.
 func (a *StatsApp) shipWithRetry(body []byte) error {
-	return a.shipWithRetryN(body, a.cfg.maxRetries)
+	return a.shipWithRetryN(context.Background(), body, a.cfg.maxRetries)
 }
 
-// shipWithRetryN is like shipWithRetry but takes the retry budget as a
-// parameter — used by the shutdown path so a Stop() coinciding with an
-// ingest blip can use a wider retry window without temporarily mutating
-// `a.cfg` (which would be a goroutine-safety hazard if any other flush
-// path were ever to run concurrently).
-func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
+// shipWithRetryN is like shipWithRetry but takes the retry budget and a
+// context. Cancelling ctx cuts an in-flight POST and any backoff sleep at
+// once, which is what bounds Stop and retired shipping.
+func (a *StatsApp) shipWithRetryN(ctx context.Context, body []byte, maxRetries int) error {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(backoff(attempt))
+			t := time.NewTimer(backoff(attempt))
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			}
 		}
-		err := a.shipOnce(body)
+		err := a.shipOnce(ctx, body)
 		if err == nil {
 			metricShipAttempts.WithLabelValues("ok").Inc()
 			return nil
@@ -1629,6 +1713,9 @@ func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
 			return err
 		}
 		metricShipAttempts.WithLabelValues("transient").Inc()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
 	return lastErr
 }
@@ -1638,14 +1725,14 @@ func (a *StatsApp) shipWithRetryN(body []byte, maxRetries int) error {
 // key without reading the request body first.
 const proxyServerIDHeader = "apx-proxy-server-id"
 
-func (a *StatsApp) shipOnce(body []byte) error {
+func (a *StatsApp) shipOnce(ctx context.Context, body []byte) error {
 	start := time.Now()
 	defer func() {
 		metricShipDuration.Observe(time.Since(start).Seconds())
 	}()
 
 	req, err := http.NewRequestWithContext(
-		context.Background(),
+		ctx,
 		http.MethodPost,
 		a.cfg.url,
 		bytes.NewReader(body),
