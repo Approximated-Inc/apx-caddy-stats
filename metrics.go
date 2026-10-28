@@ -75,6 +75,26 @@ var metricDroppedRows = promauto.NewCounter(
 	},
 )
 
+// metricOverloadLevel is the node's overload level: 0 normal, 1 conserve,
+// 2 shed. 0 while overload control is disabled.
+var metricOverloadLevel = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "apx_stats_overload_level",
+		Help: "apx-caddy-stats node overload level (0 normal, 1 conserve, 2 shed)",
+	},
+)
+
+// metricOverloadWAFSkips counts WAF evaluations skipped for overload.
+//
+//	kind = "detect" | "static" | "would_skip"
+var metricOverloadWAFSkips = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "apx_stats_overload_waf_skips_total",
+		Help: "apx-caddy-stats WAF evaluations skipped (or would be, in observe) for overload",
+	},
+	[]string{"kind"},
+)
+
 // metricFingerprintOverflows counts new (ja3,ja4,outcome) keys dropped
 // because the per-minute fingerprint map was at cap.
 var metricFingerprintOverflows = promauto.NewCounter(

@@ -212,6 +212,11 @@ type StatsApp struct {
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
 
+	// Overload enables node-local overload control (overload.go). Absent
+	// means disabled. Process-global: the last app to Start wins.
+	Overload         *OverloadConfig `json:"overload,omitempty"`
+	overloadRetained bool
+
 	logger    *zap.Logger
 	secret    string
 	hashSalt  string
@@ -410,6 +415,9 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	if a.ProxyServerIDValue == 0 {
 		return fmt.Errorf("apx_stats app: proxy_server_id is required")
 	}
+	if err := a.Overload.Validate(); err != nil {
+		return err
+	}
 
 	// auth_token from the config blob wins over the env var — same
 	// rotation story as hash_salt: config regen, no machine restart.
@@ -607,6 +615,9 @@ func mixString(h uint64, s string) uint64 {
 // Start launches the periodic flush goroutine and the governor's RSS
 // refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
+	applyOverloadConfig(a.Overload)
+	overloadRetain()
+	a.overloadRetained = true
 	a.wg.Add(1)
 	go a.flushLoop()
 	if a.memGov != nil {
@@ -627,6 +638,9 @@ func (a *StatsApp) Stop() error {
 	// already swapped in the replacement app's pointer at its Provision).
 	corazaApp.CompareAndSwap(a, nil)
 	a.stopOnce.Do(func() {
+		if a.overloadRetained {
+			overloadRelease()
+		}
 		close(a.stopCh)
 		// After the old config drains (grace_period is 1s), return the freed
 		// WAF/ruleset pages to the OS instead of waiting for kernel pressure.
@@ -1524,8 +1538,10 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 	var fpIpSnap map[fingerprintIpKey]*fingerprintCounter
 	var corazaSnap []corazaDetection
 	var l4BlockSnap map[l4BlockKey]uint64
+	var nodeStateRows []nodeStateMinute
 	flushTs := uint32(time.Now().Unix() / 60)
 	if !httpOnly {
+		nodeStateRows = drainNodeStateRows()
 		l4SniSnap = a.drainL4SniRows()
 		ipSnap = a.l4IpSnapshot()
 		fpSnap = a.fingerprintSnapshot()
@@ -1567,7 +1583,7 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 		len(ipSnap.topkRows) == 0 && len(ipSnap.sampled) == 0 &&
 		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 {
+		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 {
 		return
 	}
 
@@ -1575,10 +1591,10 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 		len(ipSnap.topkRows) + len(ipSnap.sampled) +
 		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap)
+		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatch(a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1700,6 +1716,17 @@ func isPermanent(err error) bool {
 // emitted sparsely — buckets with zero counts are omitted to keep the
 // wire small.
 func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
+	return encodeBatchWith(batchParts{}, proxyServerID, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, blockSnapshots...)
+}
+
+// batchParts carries batch sections added after encodeBatch's signature
+// grew too long to extend; existing callers keep encodeBatch.
+type batchParts struct {
+	machineID  string
+	nodeStates []nodeStateMinute
+}
+
+func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	for k, c := range snap {
@@ -1788,6 +1815,11 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 			if err := encodeL4BlockRow(gz, proxyServerID, key, count); err != nil {
 				return nil, err
 			}
+		}
+	}
+	for _, m := range parts.nodeStates {
+		if err := encodeNodeStateRow(gz, proxyServerID, parts.machineID, m); err != nil {
+			return nil, err
 		}
 	}
 	if err := gz.Close(); err != nil {
