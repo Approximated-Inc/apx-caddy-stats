@@ -97,8 +97,14 @@ wrapper: `[apx_stats, apx_admission, subroute]`. It reads
 
 - Classes: P0 `/__apx_*`, ACME, `/healthy`, `/apxflyhealthcheck*` (never
   shed); P1 HTML navigations; P3 static assets; P2 everything else.
-  WebSocket upgrades and event streams pass through uncounted.
-- At level 2 the limit is `clamp(ceil(completions/s, 10 s EWMA), 8, hard)`.
+  A WebSocket/CONNECT upgrade or event-stream request is counted and shed
+  like any other (the headers are the client's), and releases its slot once
+  the response streams (101, a 2xx CONNECT, or `text/event-stream`).
+- At level 2 the limit is `clamp(ceil(rate × target), 8, hard)`. `rate` is
+  the admitted completions/s (10 s EWMA), held up by a peak decaying with a
+  60 s time constant so shedding can't ratchet the limit down. `target` is
+  `clamp(2 × normal mean latency, 1 s, 10 s)`, the normal latency learned
+  only at level 0, so a slow origin alone is not overload.
   P3 sheds at in-flight ≥ 0.5 L, P2 at ≥ L, P1 at ≥ 1.5 L.
 - The hard cap applies at any level: P2/P3 at `max(256, 2 × MemTotal MB)`,
   P1 at 1.25 × that.
@@ -106,7 +112,7 @@ wrapper: `[apx_stats, apx_admission, subroute]`. It reads
   `apx-overload: 1` and a short body, on a kept-alive connection. It has no
   vhost, so it records no counter row; `node_state.shed_*` counts it.
 - Observe mode counts `would_shed` and admits. The admit path allocates
-  nothing (≈ 23 ns); a shed takes ≈ 130 ns.
+  nothing (≈ 70 ns with the latency clock); a shed takes ≈ 130 ns.
 
 ## Request correlation
 

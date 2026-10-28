@@ -431,6 +431,7 @@ type samplerState struct {
 	level        levelState
 	busy         float64
 	completions  completionRate
+	latency      latencyTarget
 }
 
 // sampleOnce reads the signals, advances the models and publishes the level.
@@ -501,9 +502,11 @@ func (c *overloadController) sampleOnce(now time.Time, sig overloadSignals) {
 	c.level.Store(int32(s.level.level))
 	metricOverloadLevel.Set(float64(s.level.level))
 
-	rate := s.completions.sample(admissionCompletions.Load(), time.Duration(dt*float64(time.Second)))
+	sdt := time.Duration(dt * float64(time.Second))
+	rate := s.completions.sample(admissionCompletions.Load(), sdt)
+	target := s.latency.sample(admissionCompletions.Load(), admissionLatencyNs.Load(), sdt, s.level.level == 0)
 	if s.level.level >= 2 && rt.admissionLive {
-		admissionLimitNow.Store(int64(adaptiveLimit(rate, rt.minLimit, rt.hardLimit)))
+		admissionLimitNow.Store(int64(adaptiveLimit(rate, target, rt.minLimit, rt.hardLimit)))
 	} else {
 		admissionLimitNow.Store(0)
 	}

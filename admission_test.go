@@ -37,7 +37,7 @@ func serveAdmission(t *testing.T, r *http.Request) *httptest.ResponseRecorder {
 	return w
 }
 
-// C1: classes, and streams pass through uncounted.
+// C1: classes, and streams release their slot once the response streams.
 func TestAdmissionClassify(t *testing.T) {
 	cases := []struct {
 		r    *http.Request
@@ -63,17 +63,55 @@ func TestAdmissionClassify(t *testing.T) {
 
 	resetOverload(t)
 	setOverload(t, &OverloadConfig{Admission: &AdmissionConfig{Mode: "enforce"}}, 2)
-	for _, r := range []*http.Request{
-		admissionReq("GET", "/ws", "Connection", "Upgrade", "Upgrade", "websocket"),
-		admissionReq("GET", "/events", "Accept", "text/event-stream"),
+	admissionLimitNow.Store(100)
+	for _, c := range []struct {
+		r      *http.Request
+		stream func(http.ResponseWriter)
+	}{
+		{admissionReq("GET", "/ws", "Connection", "Upgrade", "Upgrade", "websocket"),
+			func(w http.ResponseWriter) { w.WriteHeader(http.StatusSwitchingProtocols) }},
+		{admissionReq("GET", "/events", "Accept", "text/event-stream"),
+			func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: 1\n\n"))
+			}},
+		{admissionReq("CONNECT", "/ws"), func(w http.ResponseWriter) { w.WriteHeader(http.StatusOK) }},
 	} {
-		var during int64 = -1
-		require.NoError(t, AdmissionHandler{}.ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-			during = admissionInflight.Load()
+		var before, after int64 = -1, -1
+		require.NoError(t, AdmissionHandler{}.ServeHTTP(httptest.NewRecorder(), c.r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			before = admissionInflight.Load()
+			c.stream(w)
+			after = admissionInflight.Load()
 			return nil
 		})))
-		require.Zero(t, during, "streams are not counted")
+		require.EqualValues(t, 1, before, "counted until the response streams: %s", c.r.URL)
+		require.Zero(t, after, "released once it streams: %s", c.r.URL)
+		require.Zero(t, admissionInflight.Load(), "released once: %s", c.r.URL)
 	}
+}
+
+// The stream headers are the client's: claiming one buys no pass. A slow
+// request that only says Accept: text/event-stream is counted until done and
+// shed at the cap like any other.
+func TestAdmissionStreamHeadersAreNoBypass(t *testing.T) {
+	resetOverload(t)
+	setOverload(t, &OverloadConfig{Admission: &AdmissionConfig{Mode: "enforce", HardLimit: 4}}, 0)
+	sse := func() *http.Request { return admissionReq("GET", "/api/slow", "Accept", "text/event-stream;q=0") }
+	var during int64 = -1
+	require.NoError(t, AdmissionHandler{}.ServeHTTP(httptest.NewRecorder(), sse(), caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+		during = admissionInflight.Load()
+		return nil
+	})))
+	require.EqualValues(t, 1, during, "a JSON response keeps its slot")
+	require.Zero(t, admissionInflight.Load())
+
+	admissionInflight.Store(4)
+	require.Equal(t, http.StatusServiceUnavailable, serveAdmission(t, sse()).Code)
+	ws := admissionReq("GET", "/api/slow", "Upgrade", "websocket")
+	require.Equal(t, http.StatusServiceUnavailable, serveAdmission(t, ws).Code)
+	require.EqualValues(t, 2, overloadCounts.shed[admitP2].Load())
 }
 
 // C2: level 2 thresholds against the adaptive limit.
@@ -208,10 +246,11 @@ func TestAdmissionAllocs(t *testing.T) {
 
 // C7: the adaptive limit.
 func TestAdaptiveLimit(t *testing.T) {
-	require.Equal(t, 20, adaptiveLimit(20, 8, 1000))
-	require.Equal(t, 21, adaptiveLimit(20.2, 8, 1000))
-	require.Equal(t, 8, adaptiveLimit(2, 8, 1000))
-	require.Equal(t, 300, adaptiveLimit(5000, 8, 300))
+	require.Equal(t, 20, adaptiveLimit(20, time.Second, 8, 1000))
+	require.Equal(t, 21, adaptiveLimit(20.2, time.Second, 8, 1000))
+	require.Equal(t, 8, adaptiveLimit(2, time.Second, 8, 1000))
+	require.Equal(t, 300, adaptiveLimit(5000, time.Second, 8, 300))
+	require.Equal(t, 480, adaptiveLimit(200, 2400*time.Millisecond, 8, 1000))
 
 	var c completionRate
 	require.Zero(t, c.sample(0, time.Second))
@@ -220,4 +259,59 @@ func TestAdaptiveLimit(t *testing.T) {
 		got = c.sample(uint64(i*20), time.Second)
 	}
 	require.InDelta(t, 20, got, 0.1, "10 s EWMA converges on 20/s")
+}
+
+// The latency target follows the node's normal latency, learned at level 0
+// only: an origin that always takes 1.2 s gets 2.4 s, so at level 2 P2 sheds
+// once latency doubles, not merely because the origin is slow.
+func TestLatencyTargetFollowsNormalLatency(t *testing.T) {
+	var l latencyTarget
+	require.Equal(t, time.Second, l.sample(0, 0, time.Second, true), "unknown is 1 s")
+	n, ns := uint64(0), uint64(0)
+	step := func(rate int, mean time.Duration, normal bool) time.Duration {
+		n += uint64(rate)
+		ns += uint64(rate) * uint64(mean)
+		return l.sample(n, ns, time.Second, normal)
+	}
+	var got time.Duration
+	for i := 0; i < 600; i++ {
+		got = step(200, 1200*time.Millisecond, true)
+	}
+	require.InDelta(t, 2400*time.Millisecond, got, float64(20*time.Millisecond))
+	for i := 0; i < 600; i++ {
+		got = step(200, 5*time.Second, false) // overloaded: not learned
+	}
+	require.InDelta(t, 2400*time.Millisecond, got, float64(20*time.Millisecond))
+	for i := 0; i < 600; i++ {
+		got = step(200, 50*time.Millisecond, true)
+	}
+	require.Equal(t, time.Second, got, "never below 1 s")
+	for i := 0; i < 3000; i++ {
+		got = step(200, time.Minute, true)
+	}
+	require.Equal(t, 10*time.Second, got, "never above 10 s")
+}
+
+// Shed requests never complete. The rate behind the limit must not follow
+// the throughput shedding removed: a drop from 200/s to 20/s admitted keeps
+// the limit near 200 for tens of seconds instead of ratcheting to min_limit.
+func TestCompletionRateHoldsPeakWhileShedding(t *testing.T) {
+	var c completionRate
+	total := uint64(0)
+	var got float64
+	for i := 0; i < 120; i++ {
+		total += 200
+		got = c.sample(total, time.Second)
+	}
+	require.InDelta(t, 200, got, 1)
+	for i := 0; i < 10; i++ {
+		total += 20
+		got = c.sample(total, time.Second)
+	}
+	require.Greater(t, got, 160.0, "decays with a 60 s time constant")
+	for i := 0; i < 600; i++ {
+		total += 20
+		got = c.sample(total, time.Second)
+	}
+	require.InDelta(t, 20, got, 1, "follows a lasting drop")
 }
