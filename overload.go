@@ -406,6 +406,7 @@ type samplerState struct {
 	burst        *burstModel
 	level        levelState
 	busy         float64
+	completions  completionRate
 }
 
 // sampleOnce reads the signals, advances the models and publishes the level.
@@ -475,6 +476,13 @@ func (c *overloadController) sampleOnce(now time.Time, sig overloadSignals) {
 	}, now, rt.thresholds)
 	c.level.Store(int32(s.level.level))
 	metricOverloadLevel.Set(float64(s.level.level))
+
+	rate := s.completions.sample(admissionCompletions.Load(), time.Duration(dt*float64(time.Second)))
+	if s.level.level >= 2 && rt.admissionLive {
+		admissionLimitNow.Store(int64(adaptiveLimit(rate, rt.minLimit, rt.hardLimit)))
+	} else {
+		admissionLimitNow.Store(0)
+	}
 
 	est := int64(-1) // unknown, or not draining
 	if tte >= 0 {

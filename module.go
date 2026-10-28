@@ -20,4 +20,5 @@ func init() {
 	caddy.RegisterModule(&L4Handler{})
 	caddy.RegisterModule(&L4BlockHandler{})
 	caddy.RegisterModule(&FingerprintHandler{})
+	caddy.RegisterModule(AdmissionHandler{})
 }
