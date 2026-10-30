@@ -6,6 +6,81 @@ No permission is granted to use, copy, modify, merge, publish, distribute,
 sublicense, or sell copies of this software or any associated files without
 prior written permission from the copyright holder.
 
+## Versioned domain-health evidence
+
+The existing per-vhost Caddy `vars` handler can set
+`apx_domain_health_key` to the control plane's 64-character lowercase hex
+routing fingerprint. After the matched route handles a request, the stats
+handler reads that server-controlled variable and `vhost_id` from the request
+context. A request header or replacer entry cannot supply the fingerprint.
+Missing or invalid fingerprints produce no health row, preserving old-image
+behavior. Internal `apx-monitor: true` probes are excluded as before.
+
+The track emits unsampled compact counter deltas in the existing compressed
+ingest batch, without another POST or another customer/upstream request:
+
+```json
+{"_type":"domain_health","ts":"2026-10-29T23:15:00Z","proxy_server_id":598,"vhost_id":123,"configuration_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_count":5,"routing_responses":4,"upstream_responses":3,"upstream_successes":2,"upstream_5xx":1,"proxy_errors":1}
+```
+
+Rows are keyed by `(minute, vhost_id, configuration_key)`. `ts` is the source
+completion minute, never the shipping minute. Route generations stay separate
+even within one minute. The configuration key adds no cardinality to the
+normal method/status/country/ASN request counters.
+
+- `request_count` counts every matched, fingerprinted request.
+- `routing_responses` counts matched-route responses, including redirects,
+  blocks and verified upstream responses. Cancelled requests without a final
+  response do not count. A response written before the client cancels, such
+  as an upgraded stream the client later resets, still counts. A terminal
+  response-retry error still proves routing.
+- `upstream_responses` requires a fresh Caddy response-latency placeholder plus
+  a final response write/hijack or explicit terminal response-retry error. A
+  selected upstream or nil handler error alone is insufficient. Ambiguous
+  response evidence remains unknown. 401 and 500 still establish reachability.
+- `upstream_successes` is its original upstream 2xx/3xx subset, and
+  `upstream_5xx` its original 5xx subset. Caddy response rewrites do not change
+  these categories. An upgraded 101 proves reachability without counting as a
+  success.
+- `proxy_errors` counts failed reverse-proxy attempts, not application 5xxs.
+
+The live track shares the existing 16 shard locks. An app's live keys remain
+bounded by `ingest.max_buffer_rows`, and the process admits at most 8192 health
+record credits across all app generations. A credit follows its key through
+detached snapshots, queued gzip bodies and delivery, and releases only on
+delivery or drop. Existing admitted keys keep counting without sampling. Each
+live key also reserves 384 bytes from its app's existing shared memory governor.
+These are cardinality and allocation controls, not a literal process RSS bound.
+
+Drain detaches maps under shard locks and aggregates outside the request
+critical section. At most one health encoder runs process-wide. A busy encoder
+drops health and preserves the other analytics in the same POST. A health
+frame has a hard 4 MiB raw limit and is compressed once, inside the existing
+single gzip stream. The limit covers the health contribution, not the other
+analytics in a mixed POST. No separate POST or disk
+spool is introduced. At the default 30-second cadence, ordinary drains can emit
+up to 16384 health rows per minute per machine, before retries and reloads.
+
+Stopping an app keeps health open, like the other HTTP analytics. Its final
+drain ships buffered health rows, and late retired requests ship theirs through
+the retired HTTP delivery, without extending Stop's wait bound. An app that was
+provisioned but never started (a reload whose Start failed) is never stopped,
+so its `Cleanup` closes health admission and releases its credits. Already
+encoded health credits stay attached to their original delivery job, including
+across retries, and release on queue eviction or final drop.
+
+Overflow increments `apx_stats_domain_health_overflow_total`. Drops also count
+in `apx_stats_domain_health_dropped_total{reason}`, with the fixed reasons
+`capacity`, `pressure`, `retired`, `encode_busy`, `frame_limit`, `encode_error`,
+`queue` and `delivery`. Neither metric has domain or fingerprint labels.
+Missing/dropped telemetry is unknown, not proof that a domain is healthy or down.
+
+Emit the variable only when the receiving app supports this row type and uses
+cluster-scoped authenticated ingest. The app must match the captured key to
+the current route before using it as current health evidence. This protocol
+does not establish that all serving machines applied one generation and does
+not replace public DNS or TLS verification.
+
 ## Shutdown and reload
 
 Caddy builds a new `apx_stats` app on every config load and stops the old
@@ -24,9 +99,9 @@ and encodes, and a separate ship worker POSTs.
 - On process exit (Caddy os.Exits right after stopping apps) Stop waits up to
   the shutdown deadline instead, so the final batch keeps its retries until
   the platform kills the process (Fly: `kill_timeout`, 5 s).
-- All shipping after Stop (the final batch with `shutdown_max_retries`, and
-  each retired-HTTP delivery) is bounded by `ingest.shutdown_deadline_ms`
-  (default 30000), measured from Stop. The deadline cuts a hung POST at once.
+- Final shutdown shipping uses `ingest.shutdown_deadline_ms` (default 30000),
+  starting during Stop's final flush. Each later retired-HTTP delivery has its
+  own deadline of that duration. A deadline cuts its hung POST at once.
 - Stopping and retired generations share two process-wide ship slots. A
   generation that can't get one drops its batch and counts it, so rapid
   reloads against a hung ingest can't pile up goroutines or bodies.

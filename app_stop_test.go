@@ -422,7 +422,8 @@ func TestShipQueueDropsOldest(t *testing.T) {
 	var bodies [][]byte
 	for i := 1; i <= 3; i++ {
 		a.Record(Key{VhostID: uint32(i), Status: 200}, CounterDelta{})
-		body, rows, ok := a.drainAndEncode(false)
+		body, rows, health, ok := a.drainAndEncode(false)
+		defer health.release()
 		require.True(t, ok)
 		require.Equal(t, 1, rows)
 		bodies = append(bodies, body)

@@ -94,24 +94,25 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		defer failureTrace.close()
 	}
 
+	healthResponseBefore := snapshotDomainHealthResponse(r)
 	wrapped := &recorder{ResponseWriter: w, status: 200}
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr)
+	h.record(r, wrapped, dur, servErr, healthResponseBefore)
 	return servErr
 }
 
 // record reads context off the request after next.ServeHTTP returns and
-// feeds the counter map, the challenge-attempt map, the request_events
-// track, and the unique-clients set.
+// feeds the counters, versioned health, challenge attempts, request events
+// and the unique-clients set.
 //
 // In legacy mode (mode_v2 off) request_events logs exactly one row per
 // SERVED request (blocked/challenged requests excluded), preserving the
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot) {
 	// Keep the original generation authoritative, including early terminal rows.
 	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
 	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
@@ -168,6 +169,33 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
+	if healthRecorder, ok := h.app.(interface {
+		RecordDomainHealth(domainHealthKey, domainHealthCounter)
+	}); ok {
+		if configurationKey := domainHealthConfigurationKey(r.Context()); configurationKey != "" {
+			delta := domainHealthCounter{RequestCount: 1}
+			// A written response stays evidence even if the client cancels afterwards.
+			if servErr == nil && origin != OriginClusterProxyError && (w.wrote || origin != OriginUpstream && r.Context().Err() == nil) {
+				delta.RoutingResponses = 1
+			}
+			if status, observed := domainHealthUpstreamStatus(r, w, servErr, origin, healthResponseBefore); observed {
+				delta.RoutingResponses = 1
+				delta.UpstreamResponses = 1
+				if status >= 200 && status < 400 {
+					delta.UpstreamSuccesses = 1
+				}
+				if status >= 500 && status < 600 {
+					delta.Upstream5xx = 1
+				}
+			}
+			if origin == OriginClusterProxyError {
+				delta.ProxyErrors = 1
+			}
+			healthRecorder.RecordDomainHealth(domainHealthKey{
+				TsUnixMin: timeNowUnixMin(), VhostID: vhostID, ConfigurationKey: configurationKey,
+			}, delta)
+		}
+	}
 	country := readCountry(repl)
 	asn := readASN(repl)
 	durationUs := uint64(dur.Microseconds())
@@ -468,12 +496,14 @@ func blockReason(repl *caddy.Replacer, servErr error) string {
 //     on dial failure. Absent ⇒ reverse_proxy never ran.
 //   - servErr — the error returned by next.ServeHTTP. When reverse_proxy
 //     fails, it returns a caddyhttp.HandlerError (502 by default, 504
-//     for timeouts, 499 for client cancel) which bubbles up the
-//     middleware chain to us. A `nil` error past the upstream-selection
-//     point means upstream actually responded.
+//     for timeouts) which bubbles up the middleware chain to us. This
+//     legacy classifier treats a selected upstream with nil error as
+//     upstream traffic. Caddy can also swallow a client cancellation
+//     before receiving any response, so this alone is not health proof.
 //
-// We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
-// it inside `handle_response` blocks, never for normal pass-through.
+// Compact domain-health counters separately require fresh response evidence
+// and the original upstream status (see domainHealthUpstreamStatus). Keep the
+// established analytics origin buckets independent of that stricter proof.
 //
 // blockReason (computed once by the caller) decides cluster_blocked; an
 // empty reason falls through to the upstream/cluster classification below.
