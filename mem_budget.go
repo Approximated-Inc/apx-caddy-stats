@@ -11,8 +11,8 @@ import (
 )
 
 // The analytics buffers must never OOM the machine: on a 256MB Fly
-// machine the drainable byte-heavy buffers (request_events rows + coraza
-// detection events) could otherwise sum past available RAM and the OOM
+// machine the drainable buffers (request events, Coraza detections and
+// domain-health counters) could otherwise sum past available RAM and the OOM
 // killer would take down the Caddy process — and every co-tenant vhost
 // on it. The memGovernor bounds those buffers by BYTES (row counts don't
 // bound RAM — rows vary ~5x in width), self-sized to the machine's
@@ -81,7 +81,7 @@ func pressureSampleFloor(p float64) int {
 //     can't see the off-heap growth a flood produces, so we don't use it.
 //
 // One instance per StatsApp, built at Provision and shared by the
-// request_events recorder and the coraza detection slice.
+// request_events recorder, Coraza detections and domain-health counters.
 type memGovernor struct {
 	totalRAM    uint64
 	shareBudget uint64 // bufferShareFraction * totalRAM

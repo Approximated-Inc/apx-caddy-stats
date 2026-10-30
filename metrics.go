@@ -35,6 +35,13 @@ var metricBufferOverflow = promauto.NewCounter(
 	},
 )
 
+var metricDomainHealthOverflow = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "apx_stats_domain_health_overflow_total",
+		Help: "Domain health keys dropped by the key or memory budget",
+	},
+)
+
 // metricUniquesOverflow counts unique-hash inserts dropped because
 // MaxUniqueHashes was hit. Existing per-(vhost,minute) sets keep their
 // already-recorded distinct clients; this only fires when total unique

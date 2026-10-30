@@ -103,8 +103,8 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 }
 
 // record reads context off the request after next.ServeHTTP returns and
-// feeds the counter map, the challenge-attempt map, the request_events
-// track, and the unique-clients set.
+// feeds the counters, versioned health, challenge attempts, request events
+// and the unique-clients set.
 //
 // In legacy mode (mode_v2 off) request_events logs exactly one row per
 // SERVED request (blocked/challenged requests excluded), preserving the
@@ -168,6 +168,32 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
+	if recorder, ok := h.app.(interface {
+		RecordDomainHealth(domainHealthKey, domainHealthCounter)
+	}); ok {
+		if configurationKey := domainHealthConfigurationKey(r.Context()); configurationKey != "" {
+			delta := domainHealthCounter{RequestCount: 1}
+			if servErr == nil && origin != OriginClusterProxyError {
+				delta.RoutingResponses = 1
+			}
+			if origin == OriginUpstream {
+				delta.UpstreamResponses = 1
+				status := finalStatus(w, servErr)
+				if status >= 200 && status < 400 {
+					delta.UpstreamSuccesses = 1
+				}
+				if status >= 500 && status < 600 {
+					delta.Upstream5xx = 1
+				}
+			}
+			if origin == OriginClusterProxyError {
+				delta.ProxyErrors = 1
+			}
+			recorder.RecordDomainHealth(domainHealthKey{
+				TsUnixMin: timeNowUnixMin(), VhostID: vhostID, ConfigurationKey: configurationKey,
+			}, delta)
+		}
+	}
 	country := readCountry(repl)
 	asn := readASN(repl)
 	durationUs := uint64(dur.Microseconds())

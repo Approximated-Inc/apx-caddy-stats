@@ -243,7 +243,8 @@ type StatsApp struct {
 	// for our typical cluster easily fits within one shard, but the
 	// hot path (incrementing an existing counter) now contends with
 	// 1/shardCount of the other goroutines on average.
-	shards [shardCount]*counterShard
+	shards           [shardCount]*counterShard
+	domainHealthKeys atomic.Int64
 
 	overflow         uint64     // count of distinct new keys dropped due to MaxBufferRows
 	overflowLogMu    sync.Mutex // guards overflowLoggedAt (cross-shard)
@@ -331,8 +332,8 @@ type StatsApp struct {
 	corazaOverflow      uint64 // dropped events (slice at cap, or governor reject)
 	corazaReservedBytes int    // governor bytes reserved by corazaEvents; released at snapshot
 
-	// memGov byte-bounds the two byte-heavy drainable buffers
-	// (request_events + corazaEvents) to fit the machine's detected RAM.
+	// memGov byte-bounds drainable request events, Coraza detections and
+	// domain-health counters to fit the machine's detected RAM.
 	// Built once at Provision; its RSS cache refreshes on a goroutine
 	// started by Start. nil only in tests that bypass Provision.
 	memGov *memGovernor
@@ -388,6 +389,7 @@ const shardMask = shardCount - 1
 type counterShard struct {
 	mu              sync.Mutex
 	counters        map[Key]*Counter
+	domainHealth    map[domainHealthKey]*domainHealthCounter
 	uniques         map[uniqueKey]map[uint64]struct{}
 	uniqueHashCount uint64
 }
@@ -1637,6 +1639,7 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 	}
 	challengeSnap := a.challengeSnapshot()
 	edgeVerifySnap := a.edgeVerifySnapshot()
+	domainHealthSnap := a.drainDomainHealth()
 
 	// request_events: flat drain. reqEventOverflow is observability-only here
 	// (no breaker — the recorder samples under load on its own).
@@ -1661,6 +1664,7 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
 			zap.Int("challenge_attempt_rows", len(challengeSnap)),
 			zap.Int("edge_verify_attempt_rows", len(edgeVerifySnap)),
+			zap.Int("domain_health_rows", len(domainHealthSnap)),
 			zap.Int("request_event_rows", len(reqEventRows)),
 			zap.Uint64("request_event_overflow", reqEventOverflow))
 	}
@@ -1669,7 +1673,7 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 		len(ipSnap.topkRows) == 0 && len(ipSnap.sampled) == 0 &&
 		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 {
+		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 && len(domainHealthSnap) == 0 {
 		return nil, 0, false
 	}
 
@@ -1677,10 +1681,10 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 		len(ipSnap.topkRows) + len(ipSnap.sampled) +
 		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows)
+		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + len(domainHealthSnap)
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: domainHealthSnap}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
@@ -1836,8 +1840,9 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 // batchParts carries batch sections added after encodeBatch's signature
 // grew too long to extend; existing callers keep encodeBatch.
 type batchParts struct {
-	machineID  string
-	nodeStates []nodeStateMinute
+	machineID    string
+	nodeStates   []nodeStateMinute
+	domainHealth map[domainHealthKey]*domainHealthCounter
 }
 
 func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
@@ -1933,6 +1938,11 @@ func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, sna
 	}
 	for _, m := range parts.nodeStates {
 		if err := encodeNodeStateRow(gz, proxyServerID, parts.machineID, m); err != nil {
+			return nil, err
+		}
+	}
+	for key, counter := range parts.domainHealth {
+		if err := encodeDomainHealthRow(gz, proxyServerID, key, counter); err != nil {
 			return nil, err
 		}
 	}

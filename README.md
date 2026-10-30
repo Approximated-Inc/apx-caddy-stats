@@ -6,6 +6,50 @@ No permission is granted to use, copy, modify, merge, publish, distribute,
 sublicense, or sell copies of this software or any associated files without
 prior written permission from the copyright holder.
 
+## Versioned domain-health evidence
+
+The existing per-vhost Caddy `vars` handler can set
+`apx_domain_health_key` to the control plane's 64-character lowercase hex
+routing fingerprint. After the matched route handles a request, the stats
+handler reads that server-controlled variable and `vhost_id` from the request
+context. A request header or replacer entry cannot supply the fingerprint.
+Missing or invalid fingerprints produce no health row, preserving old-image
+behavior. Internal `apx-monitor: true` probes are excluded as before.
+
+The track emits unsampled compact counter deltas in the existing compressed
+ingest batch, without another POST or another customer/upstream request:
+
+```json
+{"_type":"domain_health","ts":"2026-10-29T23:15:00Z","proxy_server_id":598,"vhost_id":123,"configuration_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_count":5,"routing_responses":4,"upstream_responses":3,"upstream_successes":2,"upstream_5xx":1,"proxy_errors":1}
+```
+
+Rows are keyed by `(minute, vhost_id, configuration_key)`. `ts` is the source
+completion minute, never the shipping minute. Route generations stay separate
+even within one minute. The configuration key adds no cardinality to the
+normal method/status/country/ASN request counters.
+
+- `request_count` counts every matched, fingerprinted request.
+- `routing_responses` counts matched-route completions without a handler error,
+  including redirects, blocks and upstream responses.
+- `upstream_responses` requires the existing reverse-proxy origin classifier to
+  observe an actual upstream response. 401 and 500 still establish reachability.
+- `upstream_successes` is its 2xx/3xx subset, and `upstream_5xx` its 5xx subset.
+- `proxy_errors` counts failed reverse-proxy attempts, not application 5xxs.
+
+The live track shares the existing 16 shard locks. It caps total keys at
+`ingest.max_buffer_rows` and reserves 384 bytes per new key from the existing
+shared memory governor. Existing admitted keys keep counting without sampling.
+Drain releases slots and reservations, including for retired HTTP generations.
+Overflow increments `apx_stats_domain_health_overflow_total`, without a
+domain- or fingerprint-labeled metric. Missing/dropped telemetry is unknown,
+not proof that a domain is healthy or down.
+
+Emit the variable only when the receiving app supports this row type and uses
+cluster-scoped authenticated ingest. The app must match the captured key to
+the current route before using it as current health evidence. This protocol
+does not establish that all serving machines applied one generation and does
+not replace public DNS or TLS verification.
+
 ## Shutdown and reload
 
 Caddy builds a new `apx_stats` app on every config load and stops the old
