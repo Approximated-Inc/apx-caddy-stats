@@ -19,6 +19,8 @@ func TestDeriveDisposition(t *testing.T) {
 		{"challenge_issued", "", "issued", dispChallengeIssued},
 		{"challenge_passed", "", "passed", dispChallengePassed},
 		{"challenge_failed", "", "failed", dispChallengeFailed},
+		{"challenge_passed_fallback", "", "passed_fallback", dispChallengePassed},
+		{"waf_beats_passed_fallback", "waf", "passed_fallback", dispWafBlocked},
 		{"challenge_passed_prior", "", "passed_recently", dispChallengePassedPrior},
 		// Block reasons take precedence over challenge outcomes.
 		{"waf_beats_challenge", "waf", "passed", dispWafBlocked},
