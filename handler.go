@@ -360,7 +360,7 @@ func readVhostID(r *http.Request) (uint32, bool) {
 
 // readChallengeOutcome reads the `apx_challenge_outcome` request var set
 // by the apx_challenge handler — one of "issued" | "passed" |
-// "passed_recently" | "failed", or "" when no challenge handler ran.
+// "passed_fallback" | "passed_recently" | "failed", or "" when no challenge handler ran.
 // Readable here because apx_stats is the OUTERMOST handler wrapping the
 // subroute: the challenge handler mutates the shared vars map via
 // caddyhttp.SetVar before returning, and our deferred record() runs after

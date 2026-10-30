@@ -17,7 +17,7 @@ import (
 type challengeAttemptKey struct {
 	vhost   string // lowercased Host header, port stripped
 	ip      string // security client IP (PROXY-decoded RemoteAddr)
-	outcome string // issued | passed | passed_recently | failed
+	outcome string // issued | passed | passed_fallback | passed_recently | failed
 }
 
 // challengeMaxKeys caps distinct (vhost, ip, outcome) keys per flush

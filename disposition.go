@@ -16,7 +16,7 @@ const (
 
 // deriveDisposition maps the block-reason (from blockReason: "waf" |
 // "rate_limit" | "") and the challenge outcome var (from
-// readChallengeOutcome: "issued" | "passed" | "passed_recently" | "failed"
+// readChallengeOutcome: "issued" | "passed" | "passed_fallback" | "passed_recently" | "failed"
 // | "") to exactly one disposition. Block reasons win over challenge
 // outcomes; an empty/unknown pair is "served".
 func deriveDisposition(blockReason, challengeOutcome string) string {
@@ -29,7 +29,7 @@ func deriveDisposition(blockReason, challengeOutcome string) string {
 	switch challengeOutcome {
 	case "issued":
 		return dispChallengeIssued
-	case "passed":
+	case "passed", "passed_fallback":
 		return dispChallengePassed
 	case "failed":
 		return dispChallengeFailed
