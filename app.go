@@ -245,6 +245,7 @@ type StatsApp struct {
 	// 1/shardCount of the other goroutines on average.
 	shards           [shardCount]*counterShard
 	domainHealthKeys atomic.Int64
+	domainHealthRetired atomic.Bool
 
 	overflow         uint64     // count of distinct new keys dropped due to MaxBufferRows
 	overflowLogMu    sync.Mutex // guards overflowLoggedAt (cross-shard)
@@ -662,6 +663,10 @@ func (a *StatsApp) Start() error {
 
 // Stop signals the flush goroutine to drain once more and exit.
 func (a *StatsApp) Stop() error {
+	// Admission and in-progress health encoding stop immediately. The existing
+	// asynchronous final/retired drain frees live health maps, so a blocked
+	// analytics shard cannot extend Stop's established wait bound.
+	a.domainHealthRetired.Store(true)
 	// Detach from the Coraza audit-log writer first so in-flight Write
 	// calls no-op rather than record into an app that's draining. Only
 	// clear if we're still the published app (a hot-reload may have
@@ -731,11 +736,12 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		// Always drain (frees the buffers); ship only with a process-wide
 		// retired slot and under a deadline, so a hung ingest can't pile up
 		// goroutines and bodies across rapid reloads.
-		body, rows, ok := a.drainAndEncode(true)
+		body, rows, health, ok := a.drainAndEncode(true)
 		if !ok {
 			continue
 		}
 		if !acquireRetiredSlot() {
+			health.drop(domainHealthDropDelivery)
 			a.dropRows(rows, "busy", nil)
 			continue
 		}
@@ -749,8 +755,10 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		cancel()
 		releaseRetiredSlot()
 		if err != nil {
+			health.drop(domainHealthDropDelivery)
 			a.dropRows(rows, result, err)
 		} else {
+			health.release()
 			metricRetiredShip.WithLabelValues("ok").Inc()
 		}
 	}
@@ -1536,8 +1544,8 @@ func (a *StatsApp) flushLoop() {
 	for {
 		select {
 		case <-t.C:
-			if body, rows, ok := a.drainAndEncode(false); ok {
-				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.maxRetries})
+			if body, rows, health, ok := a.drainAndEncode(false); ok {
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.maxRetries, health: health})
 			}
 		case <-a.stopCh:
 			a.tickCancel()
@@ -1552,9 +1560,9 @@ func (a *StatsApp) flushLoop() {
 			// bounded by shutdownDeadline; on process exit Stop waits for
 			// it (Fly's kill_timeout, 5 s, may cut it shorter).
 			a.beginShutdownShipping()
-			body, rows, ok := a.drainAndEncode(false)
+			body, rows, health, ok := a.drainAndEncode(false)
 			if ok {
-				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true})
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true, health: health})
 			}
 			a.shipQ.close()
 			return
@@ -1581,19 +1589,23 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 // flushBatch is the synchronous drain + encode + ship, used by tests and
 // anything that must see the POST complete before returning.
 func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
-	body, rows, ok := a.drainAndEncode(httpOnly)
+	body, rows, health, ok := a.drainAndEncode(httpOnly)
 	if !ok {
 		return
 	}
 	if err := a.shipWithRetryN(context.Background(), body, maxRetries); err != nil {
+		health.drop(domainHealthDropDelivery)
 		a.dropRows(rows, "", err)
+	} else {
+		health.release()
 	}
 }
 
 // drainAndEncode drains the buffers (HTTP tracks only when httpOnly) and
 // encodes them. ok is false when there is nothing to ship or encoding
-// failed (the rows are then counted dropped here).
-func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok bool) {
+// failed (the rows are then counted dropped here). A successful caller owns
+// the returned health lease until delivery or drop, including queue eviction.
+func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, health *domainHealthLease, ok bool) {
 	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
 	if perShardInitialCap < 8 {
 		perShardInitialCap = 8
@@ -1639,7 +1651,17 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 	}
 	challengeSnap := a.challengeSnapshot()
 	edgeVerifySnap := a.edgeVerifySnapshot()
-	domainHealthSnap := a.drainDomainHealth()
+	var healthFrame *domainHealthFrame
+	if httpOnly || a.domainHealthRetired.Load() {
+		a.discardDomainHealth(domainHealthDropRetired)
+	} else {
+		healthFrame = a.prepareDomainHealth(a.drainDomainHealth(), domainHealthRawFrameBytes, domainHealthGzipFrameBytes)
+	}
+	defer healthFrame.finishEncoding()
+	healthRows := 0
+	if healthFrame != nil {
+		healthRows = int(healthFrame.lease.records)
+	}
 
 	// request_events: flat drain. reqEventOverflow is observability-only here
 	// (no breaker — the recorder samples under load on its own).
@@ -1664,7 +1686,7 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 			zap.Int("coraza_detection_rows", len(corazaSnap)),
 			zap.Int("challenge_attempt_rows", len(challengeSnap)),
 			zap.Int("edge_verify_attempt_rows", len(edgeVerifySnap)),
-			zap.Int("domain_health_rows", len(domainHealthSnap)),
+			zap.Int("domain_health_rows", healthRows),
 			zap.Int("request_event_rows", len(reqEventRows)),
 			zap.Uint64("request_event_overflow", reqEventOverflow))
 	}
@@ -1673,27 +1695,40 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, ok 
 		len(ipSnap.topkRows) == 0 && len(ipSnap.sampled) == 0 &&
 		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 && len(domainHealthSnap) == 0 {
-		return nil, 0, false
+		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 && healthRows == 0 {
+		return nil, 0, nil, false
 	}
 
 	rowCount = len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(ipSnap.topkRows) + len(ipSnap.sampled) +
 		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + len(domainHealthSnap)
+		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + healthRows
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: domainHealthSnap}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: healthFrame}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
+		if healthFrame != nil {
+			healthFrame.lease.drop(domainHealthDropEncodeError)
+		}
 		atomic.AddUint64(&a.dropped, uint64(rowCount))
 		metricDroppedRows.Add(float64(rowCount))
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: encode batch failed", zap.Error(err))
 		}
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
-	return body, rowCount, true
+	if healthFrame != nil {
+		rowCount += healthFrame.encodedRows - healthRows
+		metricBufferSize.Set(float64(rowCount))
+		if healthFrame.encodedRows > 0 {
+			health = healthFrame.lease
+		}
+	}
+	if rowCount == 0 {
+		return nil, 0, nil, false
+	}
+	return body, rowCount, health, true
 }
 
 // dropRows counts a batch that will not ship. result, when set, labels the
@@ -1842,7 +1877,7 @@ func encodeBatch(proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, un
 type batchParts struct {
 	machineID    string
 	nodeStates   []nodeStateMinute
-	domainHealth map[domainHealthKey]*domainHealthCounter
+	domainHealth *domainHealthFrame
 }
 
 func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
@@ -1941,10 +1976,8 @@ func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, sna
 			return nil, err
 		}
 	}
-	for key, counter := range parts.domainHealth {
-		if err := encodeDomainHealthRow(gz, proxyServerID, key, counter); err != nil {
-			return nil, err
-		}
+	if err := parts.domainHealth.writeTo(gz); err != nil {
+		return nil, err
 	}
 	if err := gz.Close(); err != nil {
 		return nil, err

@@ -42,13 +42,34 @@ normal method/status/country/ASN request counters.
   success.
 - `proxy_errors` counts failed reverse-proxy attempts, not application 5xxs.
 
-The live track shares the existing 16 shard locks. It caps total keys at
-`ingest.max_buffer_rows` and reserves 384 bytes per new key from the existing
-shared memory governor. Existing admitted keys keep counting without sampling.
-Drain releases slots and reservations, including for retired HTTP generations.
-Overflow increments `apx_stats_domain_health_overflow_total`, without a
-domain- or fingerprint-labeled metric. Missing/dropped telemetry is unknown,
-not proof that a domain is healthy or down.
+The live track shares the existing 16 shard locks. An app's live keys remain
+bounded by `ingest.max_buffer_rows`, and the process admits at most 8192 health
+record credits across all app generations. A credit follows its key through
+detached snapshots, queued gzip bodies and delivery, and releases only on
+delivery or drop. Existing admitted keys keep counting without sampling. Each
+live key also reserves 384 bytes from its app's existing shared memory governor.
+These are cardinality and allocation controls, not a literal process RSS bound.
+
+Drain detaches maps under shard locks and aggregates outside the request
+critical section. At most one health encoder runs process-wide. A busy encoder
+drops health and preserves the other analytics in the same POST. Health-only
+preflight frames have hard 4 MiB raw and 2 MiB gzip limits, then their validated
+rows join the existing single gzip stream. These limits cover the health
+contribution, not the other analytics in a mixed POST. No separate POST or disk
+spool is introduced. At the default 30-second cadence, ordinary drains can emit
+up to 16384 health rows per minute per machine, before retries and reloads.
+
+Stopping an app closes health admission. Its existing asynchronous final or
+retired drain drops unencoded health rows without extending Stop's wait bound.
+Late retired requests keep their existing analytics behavior and add no health
+rows. Already encoded health credits stay attached to their original delivery
+job, including across retries, and release on queue eviction or final drop.
+
+Overflow increments `apx_stats_domain_health_overflow_total`. Drops also count
+in `apx_stats_domain_health_dropped_total{reason}`, with the fixed reasons
+`capacity`, `pressure`, `retired`, `encode_busy`, `frame_limit`, `encode_error`,
+`queue` and `delivery`. Neither metric has domain or fingerprint labels.
+Missing/dropped telemetry is unknown, not proof that a domain is healthy or down.
 
 Emit the variable only when the receiving app supports this row type and uses
 cluster-scoped authenticated ingest. The app must match the captured key to
@@ -74,9 +95,9 @@ and encodes, and a separate ship worker POSTs.
 - On process exit (Caddy os.Exits right after stopping apps) Stop waits up to
   the shutdown deadline instead, so the final batch keeps its retries until
   the platform kills the process (Fly: `kill_timeout`, 5 s).
-- All shipping after Stop (the final batch with `shutdown_max_retries`, and
-  each retired-HTTP delivery) is bounded by `ingest.shutdown_deadline_ms`
-  (default 30000), measured from Stop. The deadline cuts a hung POST at once.
+- Final shutdown shipping uses `ingest.shutdown_deadline_ms` (default 30000),
+  starting during Stop's final flush. Each later retired-HTTP delivery has its
+  own deadline of that duration. A deadline cuts its hung POST at once.
 - Stopping and retired generations share two process-wide ship slots. A
   generation that can't get one drops its batch and counts it, so rapid
   reloads against a hung ingest can't pile up goroutines or bodies.

@@ -42,6 +42,25 @@ var metricDomainHealthOverflow = promauto.NewCounter(
 	},
 )
 
+var metricDomainHealthDrops = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "apx_stats_domain_health_dropped_total",
+		Help: "Domain-health records or observations dropped by bounded admission and delivery guards.",
+	},
+	[]string{"reason"},
+)
+
+var metricDomainHealthDropCounters = [...]prometheus.Counter{
+	metricDomainHealthDrops.WithLabelValues("capacity"),
+	metricDomainHealthDrops.WithLabelValues("pressure"),
+	metricDomainHealthDrops.WithLabelValues("retired"),
+	metricDomainHealthDrops.WithLabelValues("encode_busy"),
+	metricDomainHealthDrops.WithLabelValues("frame_limit"),
+	metricDomainHealthDrops.WithLabelValues("encode_error"),
+	metricDomainHealthDrops.WithLabelValues("queue"),
+	metricDomainHealthDrops.WithLabelValues("delivery"),
+}
+
 // metricUniquesOverflow counts unique-hash inserts dropped because
 // MaxUniqueHashes was hit. Existing per-(vhost,minute) sets keep their
 // already-recorded distinct clients; this only fires when total unique

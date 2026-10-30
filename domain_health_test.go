@@ -139,8 +139,9 @@ func TestDomainHealthDrainPreservesGenerationAndSourceMinute(t *testing.T) {
 	for _, key := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
 		app.RecordDomainHealth(domainHealthKey{minute, 12, key}, domainHealthCounter{RequestCount: 2, RoutingResponses: 2, UpstreamResponses: 2, UpstreamSuccesses: 1, Upstream5xx: 1})
 	}
-	body, rows, ok := app.drainAndEncode(true)
-	require.True(t, ok, "health-only retired HTTP drain must ship")
+	body, rows, lease, ok := app.drainAndEncode(false)
+	require.True(t, ok, "active health-only drain must ship")
+	defer lease.release()
 	require.Equal(t, 2, rows)
 	gz, err := gzip.NewReader(strings.NewReader(string(body)))
 	require.NoError(t, err)
@@ -169,7 +170,7 @@ func TestDomainHealthDrainPreservesGenerationAndSourceMinute(t *testing.T) {
 	require.Len(t, keys, 2)
 	require.Zero(t, app.domainHealthKeys.Load())
 	require.Zero(t, app.memGov.bufferBytes.Load())
-	_, _, ok = app.drainAndEncode(false)
+	_, _, _, ok = app.drainAndEncode(false)
 	require.False(t, ok)
 }
 
@@ -217,17 +218,20 @@ func TestDomainHealthKeyAndMemoryCaps(t *testing.T) {
 		app.RecordDomainHealth(domainHealthKey{1, 14, key.ConfigurationKey}, domainHealthCounter{RequestCount: 1})
 		app.RecordDomainHealth(key, domainHealthCounter{RequestCount: 1})
 		snapshot := app.drainDomainHealth()
-		require.Len(t, snapshot, 2)
-		require.Equal(t, uint64(2), snapshot[key].RequestCount, "existing admitted keys remain unsampled")
+		defer snapshot.lease.release()
+		require.Len(t, snapshot.rows, 2)
+		require.Equal(t, uint64(2), snapshot.rows[key].RequestCount, "existing admitted keys remain unsampled")
 		require.Zero(t, app.memGov.bufferBytes.Load())
 		app.RecordDomainHealth(domainHealthKey{2, 14, key.ConfigurationKey}, domainHealthCounter{RequestCount: 1})
-		require.Len(t, app.drainDomainHealth(), 1, "drain releases retired keys and slots")
+		next := app.drainDomainHealth()
+		defer next.lease.release()
+		require.Len(t, next.rows, 1, "drain releases local keys while snapshots retain process credits")
 	})
 	t.Run("memory", func(t *testing.T) {
 		app := newTestApp(t, "http://not-used.invalid", "k")
 		app.memGov.shareBudget = domainHealthEntryBytes - 1
 		app.RecordDomainHealth(domainHealthKey{1, 12, strings.Repeat("a", 64)}, domainHealthCounter{RequestCount: 1})
-		require.Empty(t, app.drainDomainHealth())
+		require.Nil(t, app.drainDomainHealth())
 		require.Zero(t, app.domainHealthKeys.Load())
 		require.Zero(t, app.memGov.bufferBytes.Load())
 	})
@@ -252,13 +256,19 @@ func TestDomainHealthConcurrentRecordsAndDrains(t *testing.T) {
 	go func() {
 		var count uint64
 		for ctx.Err() == nil {
-			for _, counter := range app.drainDomainHealth() {
-				count += counter.RequestCount
+			if snapshot := app.drainDomainHealth(); snapshot != nil {
+				for _, counter := range snapshot.rows {
+					count += counter.RequestCount
+				}
+				snapshot.lease.release()
 			}
 			time.Sleep(time.Microsecond)
 		}
-		for _, counter := range app.drainDomainHealth() {
-			count += counter.RequestCount
+		if snapshot := app.drainDomainHealth(); snapshot != nil {
+			for _, counter := range snapshot.rows {
+				count += counter.RequestCount
+			}
+			snapshot.lease.release()
 		}
 		drained <- count
 	}()
@@ -271,6 +281,7 @@ func TestDomainHealthConcurrentRecordsAndDrains(t *testing.T) {
 
 func BenchmarkDomainHealthRecord(b *testing.B) {
 	app := &StatsApp{cfg: ingestRuntime{maxBuffer: 1_000}}
+	b.Cleanup(app.retireDomainHealth)
 	for i := range app.shards {
 		app.shards[i] = &counterShard{}
 	}

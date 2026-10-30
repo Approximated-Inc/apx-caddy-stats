@@ -1,8 +1,8 @@
 package apxstats
 
 import (
-	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -34,7 +34,7 @@ func snapshotDomainHealthResponse(r *http.Request) domainHealthResponseSnapshot 
 	return domainHealthResponseSnapshot{latency, known}
 }
 
-func domainHealthUpstreamStatus(r *http.Request, w *recorder, servErr error, origin string) (int, bool) {
+func domainHealthUpstreamStatus(r *http.Request, w *recorder, servErr error, origin string, before domainHealthResponseSnapshot) (int, bool) {
 	if r.Context().Err() != nil || origin != OriginUpstream {
 		return 0, false
 	}
@@ -48,7 +48,7 @@ func domainHealthUpstreamStatus(r *http.Request, w *recorder, servErr error, ori
 		return 0, false
 	}
 	response := snapshotDomainHealthResponse(r)
-	if !response.known || response.latency <= 0 || (w.healthResponseBefore.known && response.latency == w.healthResponseBefore.latency) {
+	if !response.known || response.latency <= 0 || (before.known && response.latency == before.latency) {
 		return 0, false
 	}
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -101,22 +101,39 @@ func (a *StatsApp) RecordDomainHealth(key domainHealthKey, delta domainHealthCou
 	if key.VhostID == 0 || !validDomainHealthKey(key.ConfigurationKey) || a.cfg.maxBuffer <= 0 {
 		return
 	}
+	if a.domainHealthRetired.Load() {
+		countDomainHealthDrop(domainHealthDropRetired, 1)
+		return
+	}
 	shard := a.shards[key.VhostID&shardMask]
 	if shard == nil {
 		return
 	}
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	if a.domainHealthRetired.Load() {
+		countDomainHealthDrop(domainHealthDropRetired, 1)
+		return
+	}
 
 	counter := shard.domainHealth[key]
 	if counter == nil {
 		if !a.reserveDomainHealthKey() {
 			metricDomainHealthOverflow.Inc()
+			countDomainHealthDrop(domainHealthDropCapacity, 1)
+			return
+		}
+		if !reserveDomainHealthCredit() {
+			a.domainHealthKeys.Add(-1)
+			metricDomainHealthOverflow.Inc()
+			countDomainHealthDrop(domainHealthDropCapacity, 1)
 			return
 		}
 		if a.memGov != nil && !a.memGov.tryReserve(domainHealthEntryBytes) {
 			a.domainHealthKeys.Add(-1)
+			domainHealthCredits.Add(-1)
 			metricDomainHealthOverflow.Inc()
+			countDomainHealthDrop(domainHealthDropPressure, 1)
 			return
 		}
 		if shard.domainHealth == nil {
@@ -146,21 +163,18 @@ func (a *StatsApp) reserveDomainHealthKey() bool {
 	}
 }
 
-func (a *StatsApp) drainDomainHealth() map[domainHealthKey]*domainHealthCounter {
-	var snapshot map[domainHealthKey]*domainHealthCounter
-	for _, shard := range a.shards {
+func (a *StatsApp) detachDomainHealth() ([shardCount]map[domainHealthKey]*domainHealthCounter, int) {
+	var detached [shardCount]map[domainHealthKey]*domainHealthCounter
+	total := 0
+	for i, shard := range a.shards {
 		if shard == nil {
 			continue
 		}
 		shard.mu.Lock()
 		count := len(shard.domainHealth)
 		if count > 0 {
-			if snapshot == nil {
-				snapshot = make(map[domainHealthKey]*domainHealthCounter)
-			}
-			for key, counter := range shard.domainHealth {
-				snapshot[key] = counter
-			}
+			detached[i] = shard.domainHealth
+			total += count
 			shard.domainHealth = nil
 			a.domainHealthKeys.Add(-int64(count))
 			if a.memGov != nil {
@@ -169,10 +183,24 @@ func (a *StatsApp) drainDomainHealth() map[domainHealthKey]*domainHealthCounter 
 		}
 		shard.mu.Unlock()
 	}
-	return snapshot
+	return detached, total
 }
 
-func encodeDomainHealthRow(w *gzip.Writer, ps uint32, key domainHealthKey, counter *domainHealthCounter) error {
+func (a *StatsApp) drainDomainHealth() *domainHealthSnapshot {
+	detached, total := a.detachDomainHealth()
+	if total == 0 {
+		return nil
+	}
+	snapshot := make(map[domainHealthKey]*domainHealthCounter, total)
+	for _, rows := range detached {
+		for key, counter := range rows {
+			snapshot[key] = counter
+		}
+	}
+	return &domainHealthSnapshot{rows: snapshot, lease: &domainHealthLease{records: int64(total)}}
+}
+
+func encodeDomainHealthRow(w io.Writer, ps uint32, key domainHealthKey, counter *domainHealthCounter) error {
 	var b strings.Builder
 	b.Grow(360)
 	b.WriteByte('{')
@@ -198,6 +226,6 @@ func encodeDomainHealthRow(w *gzip.Writer, ps uint32, key domainHealthKey, count
 	b.WriteByte(',')
 	writeUint64(&b, "proxy_errors", counter.ProxyErrors)
 	b.WriteString("}\n")
-	_, err := w.Write([]byte(b.String()))
+	_, err := io.WriteString(w, b.String())
 	return err
 }

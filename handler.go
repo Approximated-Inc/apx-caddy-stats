@@ -94,11 +94,12 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		defer failureTrace.close()
 	}
 
-	wrapped := &recorder{ResponseWriter: w, status: 200, healthResponseBefore: snapshotDomainHealthResponse(r)}
+	healthResponseBefore := snapshotDomainHealthResponse(r)
+	wrapped := &recorder{ResponseWriter: w, status: 200}
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr)
+	h.record(r, wrapped, dur, servErr, healthResponseBefore)
 	return servErr
 }
 
@@ -111,7 +112,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error) {
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot) {
 	// Keep the original generation authoritative, including early terminal rows.
 	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
 	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
@@ -176,7 +177,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 			if servErr == nil && origin != OriginClusterProxyError && r.Context().Err() == nil && (w.wrote || origin != OriginUpstream) {
 				delta.RoutingResponses = 1
 			}
-			if status, observed := domainHealthUpstreamStatus(r, w, servErr, origin); observed {
+			if status, observed := domainHealthUpstreamStatus(r, w, servErr, origin, healthResponseBefore); observed {
 				delta.RoutingResponses = 1
 				delta.UpstreamResponses = 1
 				if status >= 200 && status < 400 {
@@ -700,11 +701,10 @@ func responseBytes(w *recorder) uint64 {
 // writer: Caddy 2.11.6+'s IdleTimeoutWriter has neither Flush nor Hijack.
 type recorder struct {
 	http.ResponseWriter
-	healthResponseBefore domainHealthResponseSnapshot
-	status               int
-	bytes                int
-	wrote                bool
-	hijacked             bool
+	status   int
+	bytes    int
+	wrote    bool
+	hijacked bool
 }
 
 func (r *recorder) WriteHeader(code int) {

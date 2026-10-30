@@ -77,6 +77,7 @@ func newTestApp(t *testing.T, ingestURL, secret string, opts ...func(*StatsApp))
 	}
 	a.initL4IpState()
 	a.stopCh = make(chan struct{})
+	t.Cleanup(a.retireDomainHealth)
 	return a
 }
 
