@@ -202,12 +202,11 @@ func TestDomainHealthEncoderPermitAndMixedFallback(t *testing.T) {
 	first, second := domainHealthBudgetApp(t), domainHealthBudgetApp(t)
 	recordHealthKeys(first, 0, 1)
 	snapshot := first.drainDomainHealth()
-	frame := first.prepareDomainHealth(snapshot, domainHealthRawFrameBytes, domainHealthGzipFrameBytes)
+	frame := first.prepareDomainHealth(snapshot, domainHealthRawFrameBytes)
 	require.NotNil(t, frame)
 	t.Cleanup(frame.finishEncoding)
 	t.Cleanup(func() { frame.lease.release() })
 	require.LessOrEqual(t, len(frame.raw), domainHealthRawFrameBytes)
-	require.LessOrEqual(t, frame.gzipBytes, domainHealthGzipFrameBytes)
 	recordHealthKeys(second, 1, 1)
 	second.Record(Key{VhostID: 2, Status: 200}, CounterDelta{})
 	body, rows, lease, ok := second.drainAndEncode(false)
@@ -223,7 +222,7 @@ func TestDomainHealthEncoderPermitAndMixedFallback(t *testing.T) {
 	require.EqualValues(t, 1, domainHealthCredits.Load())
 	frame.finishEncoding()
 	recordHealthKeys(second, 2, 1)
-	next := second.prepareDomainHealth(second.drainDomainHealth(), domainHealthRawFrameBytes, domainHealthGzipFrameBytes)
+	next := second.prepareDomainHealth(second.drainDomainHealth(), domainHealthRawFrameBytes)
 	require.NotNil(t, next)
 	t.Cleanup(next.finishEncoding)
 	t.Cleanup(func() { next.lease.release() })
@@ -232,19 +231,12 @@ func TestDomainHealthEncoderPermitAndMixedFallback(t *testing.T) {
 }
 
 func TestDomainHealthFrameLimitFailureReturnsCredits(t *testing.T) {
-	for _, limits := range []struct {
-		name string
-		raw, gzip int
-	}{{"raw", 1, domainHealthGzipFrameBytes}, {"gzip", domainHealthRawFrameBytes, 1}} {
-		t.Run(limits.name, func(t *testing.T) {
-			domainHealthBudgetGuard(t)
-			a := domainHealthBudgetApp(t)
-			recordHealthKeys(a, 0, 1)
-			require.Nil(t, a.prepareDomainHealth(a.drainDomainHealth(), limits.raw, limits.gzip))
-			require.Zero(t, domainHealthCredits.Load())
-			require.False(t, domainHealthEncoding.Load())
-		})
-	}
+	domainHealthBudgetGuard(t)
+	a := domainHealthBudgetApp(t)
+	recordHealthKeys(a, 0, 1)
+	require.Nil(t, a.prepareDomainHealth(a.drainDomainHealth(), 1))
+	require.Zero(t, domainHealthCredits.Load())
+	require.False(t, domainHealthEncoding.Load())
 }
 
 func TestDomainHealthEncodingDoesNotHoldRequestShard(t *testing.T) {
@@ -255,7 +247,7 @@ func TestDomainHealthEncodingDoesNotHoldRequestShard(t *testing.T) {
 	shard := a.shards[1&shardMask]
 	shard.mu.Lock()
 	done := make(chan *domainHealthFrame, 1)
-	go func() { done <- a.prepareDomainHealth(snapshot, domainHealthRawFrameBytes, domainHealthGzipFrameBytes) }()
+	go func() { done <- a.prepareDomainHealth(snapshot, domainHealthRawFrameBytes) }()
 	select {
 	case frame := <-done:
 		shard.mu.Unlock()
@@ -277,11 +269,10 @@ func TestDomainHealthRetirementCancelsPreparedAndNewHealth(t *testing.T) {
 	domainHealthBudgetGuard(t)
 	a := domainHealthBudgetApp(t)
 	recordHealthKeys(a, 0, 1)
-	frame := a.prepareDomainHealth(a.drainDomainHealth(), domainHealthRawFrameBytes, domainHealthGzipFrameBytes)
+	frame := a.prepareDomainHealth(a.drainDomainHealth(), domainHealthRawFrameBytes)
 	require.NotNil(t, frame)
 	defer frame.finishEncoding()
-	require.NoError(t, a.Stop())
-	require.NoError(t, a.Stop())
+	require.NoError(t, a.Cleanup()) // never started: Cleanup retires
 	var output bytes.Buffer
 	require.NoError(t, frame.writeTo(&output))
 	require.Empty(t, output.Bytes())
@@ -289,11 +280,6 @@ func TestDomainHealthRetirementCancelsPreparedAndNewHealth(t *testing.T) {
 	recordHealthKeys(a, 1, 10)
 	require.Zero(t, a.domainHealthKeys.Load())
 	require.Zero(t, a.memGov.bufferBytes.Load())
-	select {
-	case <-a.httpDeliveryDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("retired delivery did not finish")
-	}
 }
 
 func TestDomainHealthStopKeepsExistingWaitBound(t *testing.T) {
@@ -319,20 +305,22 @@ func TestDomainHealthStopKeepsExistingWaitBound(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("health cleanup blocked Stop behind an analytics shard")
 	}
-	require.True(t, a.domainHealthRetired.Load())
+	require.False(t, a.domainHealthRetired.Load(), "Stop keeps health open for its final drain")
 	require.EqualValues(t, 1, domainHealthCredits.Load(), "blocked drain retains its bounded credit")
 	shard.mu.Unlock()
 	locked = false
-	select {
-	case <-a.httpDeliveryDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("health cleanup did not finish after shard release")
+	for _, done := range []chan struct{}{a.httpDeliveryDone, a.shipDone} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("health drain did not finish after shard release")
+		}
 	}
 	require.Zero(t, domainHealthCredits.Load())
 }
 
 func TestDomainHealthBoundedBufferHardLimits(t *testing.T) {
-	for _, limit := range []int{domainHealthRawFrameBytes, domainHealthGzipFrameBytes} {
+	for _, limit := range []int{domainHealthRawFrameBytes, 512} {
 		buffer := &domainHealthBuffer{limit: limit}
 		_, err := io.Copy(buffer, strings.NewReader(strings.Repeat("x", limit)))
 		require.NoError(t, err)

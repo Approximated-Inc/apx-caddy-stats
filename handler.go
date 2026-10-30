@@ -169,12 +169,13 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
-	if recorder, ok := h.app.(interface {
+	if healthRecorder, ok := h.app.(interface {
 		RecordDomainHealth(domainHealthKey, domainHealthCounter)
 	}); ok {
 		if configurationKey := domainHealthConfigurationKey(r.Context()); configurationKey != "" {
 			delta := domainHealthCounter{RequestCount: 1}
-			if servErr == nil && origin != OriginClusterProxyError && r.Context().Err() == nil && (w.wrote || origin != OriginUpstream) {
+			// A written response stays evidence even if the client cancels afterwards.
+			if servErr == nil && origin != OriginClusterProxyError && (w.wrote || origin != OriginUpstream && r.Context().Err() == nil) {
 				delta.RoutingResponses = 1
 			}
 			if status, observed := domainHealthUpstreamStatus(r, w, servErr, origin, healthResponseBefore); observed {
@@ -190,7 +191,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 			if origin == OriginClusterProxyError {
 				delta.ProxyErrors = 1
 			}
-			recorder.RecordDomainHealth(domainHealthKey{
+			healthRecorder.RecordDomainHealth(domainHealthKey{
 				TsUnixMin: timeNowUnixMin(), VhostID: vhostID, ConfigurationKey: configurationKey,
 			}, delta)
 		}

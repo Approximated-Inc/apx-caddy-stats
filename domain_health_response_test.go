@@ -31,6 +31,7 @@ func TestDomainHealthCaddyResponseEvidence(t *testing.T) {
 		cancelParent bool
 		failed       bool
 		preexisting  bool
+		cancelAfter  bool
 		want         domainHealthCounter
 		wantError    bool
 	}{
@@ -42,6 +43,8 @@ func TestDomainHealthCaddyResponseEvidence(t *testing.T) {
 		{name: "503 rewritten to 200", status: 503, rewrite: "200", want: domainHealthCounter{1, 1, 1, 0, 1, 0}},
 		{name: "200 rewritten to 503", status: 200, rewrite: "503", want: domainHealthCounter{1, 1, 1, 1, 0, 0}},
 		{name: "503 replaced by response route", status: 503, replace: true, want: domainHealthCounter{1, 1, 1, 0, 1, 0}},
+		{name: "client cancel after written 200", status: 200, cancelAfter: true, want: domainHealthCounter{1, 1, 1, 1, 0, 0}},
+		{name: "client cancel after written 503", status: 503, cancelAfter: true, want: domainHealthCounter{1, 1, 1, 0, 1, 0}},
 		{name: "cancel before any response nil return", cancel: true, cancelParent: true, want: domainHealthCounter{RequestCount: 1}},
 		{name: "transport cancellation with live parent", cancel: true, want: domainHealthCounter{RequestCount: 1}},
 		{name: "early hints then cancellation", earlyHints: true, cancel: true, want: domainHealthCounter{RequestCount: 1}},
@@ -96,7 +99,11 @@ func TestDomainHealthCaddyResponseEvidence(t *testing.T) {
 				setDomainHealthUpstreamResponse(r, 200)
 			}
 			err := (&StatsHandler{app: app}).ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-				return proxy.ServeHTTP(w, r, nextHandler(404))
+				err := proxy.ServeHTTP(w, r, nextHandler(404))
+				if tc.cancelAfter {
+					cancel()
+				}
+				return err
 			}))
 			if tc.wantError {
 				require.Error(t, err)
@@ -134,16 +141,30 @@ func TestDomainHealthRejectsUnprovenResponsePlaceholders(t *testing.T) {
 }
 
 func TestDomainHealthCaddyHijackRetainsOriginal101(t *testing.T) {
+	for _, cancelAfter := range []bool{false, true} {
+		t.Run(map[bool]string{false: "open", true: "client cancel after upgrade"}[cancelAfter], func(t *testing.T) {
+			testDomainHealthCaddyHijack(t, cancelAfter)
+		})
+	}
+}
+
+func testDomainHealthCaddyHijack(t *testing.T, cancelAfter bool) {
 	app := &fakeDomainHealthApp{}
 	stats := &StatsHandler{app: app}
 	proxy := caddyProxy(t, upgradeEchoUpstream(t))
 	done := make(chan error, 1)
 	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), w, &caddyhttp.Server{})
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		r = caddyhttp.PrepareRequest(r.WithContext(ctx), caddy.NewReplacer(), w, &caddyhttp.Server{})
 		caddyhttp.SetVar(r.Context(), "vhost_id", "12")
 		caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
 		done <- stats.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-			return proxy.ServeHTTP(w, r, nextHandler(404))
+			err := proxy.ServeHTTP(w, r, nextHandler(404))
+			if cancelAfter {
+				cancel() // the client resets the upgraded stream
+			}
+			return err
 		}))
 	}))
 	t.Cleanup(edge.Close)

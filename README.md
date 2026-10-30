@@ -31,7 +31,9 @@ normal method/status/country/ASN request counters.
 - `request_count` counts every matched, fingerprinted request.
 - `routing_responses` counts matched-route responses, including redirects,
   blocks and verified upstream responses. Cancelled requests without a final
-  response do not count. A terminal response-retry error still proves routing.
+  response do not count. A response written before the client cancels, such
+  as an upgraded stream the client later resets, still counts. A terminal
+  response-retry error still proves routing.
 - `upstream_responses` requires a fresh Caddy response-latency placeholder plus
   a final response write/hijack or explicit terminal response-retry error. A
   selected upstream or nil handler error alone is insufficient. Ambiguous
@@ -52,18 +54,20 @@ These are cardinality and allocation controls, not a literal process RSS bound.
 
 Drain detaches maps under shard locks and aggregates outside the request
 critical section. At most one health encoder runs process-wide. A busy encoder
-drops health and preserves the other analytics in the same POST. Health-only
-preflight frames have hard 4 MiB raw and 2 MiB gzip limits, then their validated
-rows join the existing single gzip stream. These limits cover the health
-contribution, not the other analytics in a mixed POST. No separate POST or disk
+drops health and preserves the other analytics in the same POST. A health
+frame has a hard 4 MiB raw limit and is compressed once, inside the existing
+single gzip stream. The limit covers the health contribution, not the other
+analytics in a mixed POST. No separate POST or disk
 spool is introduced. At the default 30-second cadence, ordinary drains can emit
 up to 16384 health rows per minute per machine, before retries and reloads.
 
-Stopping an app closes health admission. Its existing asynchronous final or
-retired drain drops unencoded health rows without extending Stop's wait bound.
-Late retired requests keep their existing analytics behavior and add no health
-rows. Already encoded health credits stay attached to their original delivery
-job, including across retries, and release on queue eviction or final drop.
+Stopping an app keeps health open, like the other HTTP analytics. Its final
+drain ships buffered health rows, and late retired requests ship theirs through
+the retired HTTP delivery, without extending Stop's wait bound. An app that was
+provisioned but never started (a reload whose Start failed) is never stopped,
+so its `Cleanup` closes health admission and releases its credits. Already
+encoded health credits stay attached to their original delivery job, including
+across retries, and release on queue eviction or final drop.
 
 Overflow increments `apx_stats_domain_health_overflow_total`. Drops also count
 in `apx_stats_domain_health_dropped_total{reason}`, with the fixed reasons

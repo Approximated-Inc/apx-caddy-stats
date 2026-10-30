@@ -35,10 +35,11 @@ func snapshotDomainHealthResponse(r *http.Request) domainHealthResponseSnapshot 
 }
 
 func domainHealthUpstreamStatus(r *http.Request, w *recorder, servErr error, origin string, before domainHealthResponseSnapshot) (int, bool) {
-	if r.Context().Err() != nil || origin != OriginUpstream {
+	if origin != OriginUpstream {
 		return 0, false
 	}
-	// Caddy swallows context.Canceled while waiting for headers, leaving a
+	// A client cancel after the final response was written (a reset upgraded
+	// stream, say) does not erase it. Caddy swallows context.Canceled while waiting for headers, leaving a
 	// selected upstream and nil handler error without writing any response.
 	// Earlier retry responses also leave placeholders behind. Neither case
 	// proves completion of the final attempt. A terminal response-retry error

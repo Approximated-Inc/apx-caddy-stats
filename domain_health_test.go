@@ -113,23 +113,31 @@ func TestDomainHealthOriginClasses(t *testing.T) {
 		{"edge block", 403, map[string]any{"http.vars.apx_block_reason": "waf"}, nil, domainHealthCounter{1, 1, 0, 0, 0, 0}},
 		{"proxy failure", 0, upstreamSelected("origin:443"), caddyhttp.Error(502, fmt.Errorf("dial failed")), domainHealthCounter{1, 0, 0, 0, 0, 1}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			app := &fakeDomainHealthApp{}
-			r := newRequestWithReplacer("GET", "https://site.example/", "12", tc.repl)
-			caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
-			_ = (&StatsHandler{app: app}).ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
-				if tc.err == nil && tc.repl != nil && tc.repl["http.reverse_proxy.upstream.address"] != nil {
-					setDomainHealthUpstreamResponse(r, tc.status)
-				}
-				if tc.status != 0 {
-					w.WriteHeader(tc.status)
-				}
-				return tc.err
-			}))
-			require.Len(t, app.health, 1)
-			require.Equal(t, tc.want, app.health[0].counter)
-			assertDomainHealthVector(t, app.health[0].counter)
-		})
+		for _, cancelAfter := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel_after_write=%t", tc.name, cancelAfter), func(t *testing.T) {
+				app := &fakeDomainHealthApp{}
+				r := newRequestWithReplacer("GET", "https://site.example/", "12", tc.repl)
+				ctx, cancel := context.WithCancel(r.Context())
+				defer cancel()
+				r = r.WithContext(ctx)
+				caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
+				_ = (&StatsHandler{app: app}).ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+					if tc.err == nil && tc.repl != nil && tc.repl["http.reverse_proxy.upstream.address"] != nil {
+						setDomainHealthUpstreamResponse(r, tc.status)
+					}
+					if tc.status != 0 {
+						w.WriteHeader(tc.status)
+					}
+					if cancelAfter {
+						cancel() // a written response stays evidence
+					}
+					return tc.err
+				}))
+				require.Len(t, app.health, 1)
+				require.Equal(t, tc.want, app.health[0].counter)
+				assertDomainHealthVector(t, app.health[0].counter)
+			})
+		}
 	}
 }
 

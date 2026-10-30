@@ -243,9 +243,10 @@ type StatsApp struct {
 	// for our typical cluster easily fits within one shard, but the
 	// hot path (incrementing an existing counter) now contends with
 	// 1/shardCount of the other goroutines on average.
-	shards           [shardCount]*counterShard
-	domainHealthKeys atomic.Int64
+	shards              [shardCount]*counterShard
+	domainHealthKeys    atomic.Int64
 	domainHealthRetired atomic.Bool
+	started             atomic.Bool // Start ran; Cleanup retires health otherwise
 
 	overflow         uint64     // count of distinct new keys dropped due to MaxBufferRows
 	overflowLogMu    sync.Mutex // guards overflowLoggedAt (cross-shard)
@@ -647,6 +648,7 @@ func mixString(h uint64, s string) uint64 {
 // Start launches the periodic flush goroutine and the governor's RSS
 // refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
+	a.started.Store(true)
 	a.overloadOwner = overloadRetain(a.Overload)
 	a.startShipper()
 	a.wg.Add(1)
@@ -663,10 +665,6 @@ func (a *StatsApp) Start() error {
 
 // Stop signals the flush goroutine to drain once more and exit.
 func (a *StatsApp) Stop() error {
-	// Admission and in-progress health encoding stop immediately. The existing
-	// asynchronous final/retired drain frees live health maps, so a blocked
-	// analytics shard cannot extend Stop's established wait bound.
-	a.domainHealthRetired.Store(true)
 	// Detach from the Coraza audit-log writer first so in-flight Write
 	// calls no-op rather than record into an app that's draining. Only
 	// clear if we're still the published app (a hot-reload may have
@@ -694,6 +692,18 @@ func (a *StatsApp) Stop() error {
 	a.httpRetired.Store(true)
 	a.scheduleHTTPDeliveryLocked()
 	a.httpDeliveryMu.Unlock()
+	return nil
+}
+
+// Cleanup runs when this app's config unloads. Caddy stops only apps that
+// started, so a reload whose Start failed earlier (http may already be
+// serving into this generation) never drains its health. Retire it here so
+// its process-wide credits are released. A started app keeps health open:
+// its final and retired HTTP drains ship it, as for the other HTTP analytics.
+func (a *StatsApp) Cleanup() error {
+	if !a.started.Load() {
+		a.retireDomainHealth()
+	}
 	return nil
 }
 
@@ -1652,10 +1662,11 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 	challengeSnap := a.challengeSnapshot()
 	edgeVerifySnap := a.edgeVerifySnapshot()
 	var healthFrame *domainHealthFrame
-	if httpOnly || a.domainHealthRetired.Load() {
+	if a.domainHealthRetired.Load() {
 		a.discardDomainHealth(domainHealthDropRetired)
 	} else {
-		healthFrame = a.prepareDomainHealth(a.drainDomainHealth(), domainHealthRawFrameBytes, domainHealthGzipFrameBytes)
+		// Health is HTTP data: retired HTTP drains ship it too.
+		healthFrame = a.prepareDomainHealth(a.drainDomainHealth(), domainHealthRawFrameBytes)
 	}
 	defer healthFrame.finishEncoding()
 	healthRows := 0
@@ -1706,7 +1717,7 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + healthRows
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatchWith(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: healthFrame}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatchFn(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: healthFrame}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		if healthFrame != nil {
 			healthFrame.lease.drop(domainHealthDropEncodeError)
@@ -1879,6 +1890,9 @@ type batchParts struct {
 	nodeStates   []nodeStateMinute
 	domainHealth *domainHealthFrame
 }
+
+// encodeBatchFn is a test seam for encode failures.
+var encodeBatchFn = encodeBatchWith
 
 func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, snap map[Key]*Counter, uniqSnap map[uniqueKey]map[uint64]struct{}, l4SniSnap map[L4SniKey]*l4SniCounter, ipSnap l4IpSnap, fpSnap map[fingerprintKey]*fingerprintCounter, fpIpSnap map[fingerprintIpKey]*fingerprintCounter, corazaSnap []corazaDetection, challengeSnap map[challengeAttemptKey]uint64, edgeVerifySnap map[edgeVerifyAttemptKey]uint64, reqEventRows []requestEventRow, blockSnapshots ...map[l4BlockKey]uint64) ([]byte, error) {
 	var buf bytes.Buffer
@@ -2322,7 +2336,8 @@ func (a *StatsApp) Overflow() uint64 { return atomic.LoadUint64(&a.overflow) }
 func (a *StatsApp) Dropped() uint64 { return atomic.LoadUint64(&a.dropped) }
 
 var (
-	_ caddy.App         = (*StatsApp)(nil)
-	_ caddy.Provisioner = (*StatsApp)(nil)
-	_ AppRef            = (*StatsApp)(nil)
+	_ caddy.App          = (*StatsApp)(nil)
+	_ caddy.Provisioner  = (*StatsApp)(nil)
+	_ caddy.CleanerUpper = (*StatsApp)(nil)
+	_ AppRef             = (*StatsApp)(nil)
 )

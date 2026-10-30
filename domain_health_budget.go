@@ -1,7 +1,6 @@
 package apxstats
 
 import (
-	"compress/gzip"
 	"errors"
 	"io"
 	"sync/atomic"
@@ -10,7 +9,6 @@ import (
 const (
 	domainHealthResidentRecords = 8192
 	domainHealthRawFrameBytes   = 4 << 20
-	domainHealthGzipFrameBytes  = 2 << 20
 )
 
 // Credits cover live keys, detached snapshots and health rows in queued or
@@ -98,7 +96,7 @@ type domainHealthBuffer struct {
 	limit int
 }
 
-func (b *domainHealthBuffer) Len() int { return len(b.data) }
+func (b *domainHealthBuffer) Len() int      { return len(b.data) }
 func (b *domainHealthBuffer) Bytes() []byte { return b.data }
 
 func (b *domainHealthBuffer) reserve(n int) error {
@@ -131,18 +129,18 @@ func (b *domainHealthBuffer) WriteString(s string) (int, error) {
 	return len(s), nil
 }
 
-// One permit covers preflight and the final health contribution to the
-// existing single gzip stream. Busy encoders drop health rather than wait.
+// One permit covers the bounded raw frame and its contribution to the
+// existing single gzip stream, which compresses it once. Busy encoders drop
+// health rather than wait.
 type domainHealthFrame struct {
 	app         *StatsApp
 	raw         []byte
 	lease       *domainHealthLease
 	encodedRows int
-	gzipBytes   int
 	finished    atomic.Bool
 }
 
-func (a *StatsApp) prepareDomainHealth(snapshot *domainHealthSnapshot, rawLimit, gzipLimit int) *domainHealthFrame {
+func (a *StatsApp) prepareDomainHealth(snapshot *domainHealthSnapshot, rawLimit int) *domainHealthFrame {
 	if snapshot == nil {
 		return nil
 	}
@@ -161,7 +159,7 @@ func (a *StatsApp) prepareDomainHealth(snapshot *domainHealthSnapshot, rawLimit,
 			frame.finishEncoding()
 		}
 	}()
-	if rawLimit <= 0 || gzipLimit <= 0 {
+	if rawLimit <= 0 {
 		frame.lease.drop(domainHealthDropFrameLimit)
 		return nil
 	}
@@ -176,26 +174,7 @@ func (a *StatsApp) prepareDomainHealth(snapshot *domainHealthSnapshot, rawLimit,
 			return nil
 		}
 	}
-	compressed := &domainHealthBuffer{data: make([]byte, 0, min(gzipLimit, int(snapshot.lease.records)*96)), limit: gzipLimit}
-	gz := gzip.NewWriter(compressed)
-	for offset := 0; offset < raw.Len(); {
-		if a.domainHealthRetired.Load() {
-			frame.lease.drop(domainHealthDropRetired)
-			return nil
-		}
-		end := min(offset+32*1024, raw.Len())
-		if _, err := gz.Write(raw.Bytes()[offset:end]); err != nil {
-			frame.lease.drop(domainHealthDropFrameLimit)
-			return nil
-		}
-		offset = end
-	}
-	if err := gz.Close(); err != nil {
-		frame.lease.drop(domainHealthDropFrameLimit)
-		return nil
-	}
 	frame.raw = raw.Bytes()
-	frame.gzipBytes = compressed.Len()
 	failed = false
 	return frame
 }
