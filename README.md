@@ -29,11 +29,17 @@ even within one minute. The configuration key adds no cardinality to the
 normal method/status/country/ASN request counters.
 
 - `request_count` counts every matched, fingerprinted request.
-- `routing_responses` counts matched-route completions without a handler error,
-  including redirects, blocks and upstream responses.
-- `upstream_responses` requires the existing reverse-proxy origin classifier to
-  observe an actual upstream response. 401 and 500 still establish reachability.
-- `upstream_successes` is its 2xx/3xx subset, and `upstream_5xx` its 5xx subset.
+- `routing_responses` counts matched-route responses, including redirects,
+  blocks and verified upstream responses. Cancelled requests without a final
+  response do not count. A terminal response-retry error still proves routing.
+- `upstream_responses` requires a fresh Caddy response-latency placeholder plus
+  a final response write/hijack or explicit terminal response-retry error. A
+  selected upstream or nil handler error alone is insufficient. Ambiguous
+  response evidence remains unknown. 401 and 500 still establish reachability.
+- `upstream_successes` is its original upstream 2xx/3xx subset, and
+  `upstream_5xx` its original 5xx subset. Caddy response rewrites do not change
+  these categories. An upgraded 101 proves reachability without counting as a
+  success.
 - `proxy_errors` counts failed reverse-proxy attempts, not application 5xxs.
 
 The live track shares the existing 16 shard locks. It caps total keys at

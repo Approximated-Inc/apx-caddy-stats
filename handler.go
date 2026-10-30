@@ -94,7 +94,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		defer failureTrace.close()
 	}
 
-	wrapped := &recorder{ResponseWriter: w, status: 200}
+	wrapped := &recorder{ResponseWriter: w, status: 200, healthResponseBefore: snapshotDomainHealthResponse(r)}
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
@@ -173,12 +173,12 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	}); ok {
 		if configurationKey := domainHealthConfigurationKey(r.Context()); configurationKey != "" {
 			delta := domainHealthCounter{RequestCount: 1}
-			if servErr == nil && origin != OriginClusterProxyError {
+			if servErr == nil && origin != OriginClusterProxyError && r.Context().Err() == nil && (w.wrote || origin != OriginUpstream) {
 				delta.RoutingResponses = 1
 			}
-			if origin == OriginUpstream {
+			if status, observed := domainHealthUpstreamStatus(r, w, servErr, origin); observed {
+				delta.RoutingResponses = 1
 				delta.UpstreamResponses = 1
-				status := finalStatus(w, servErr)
 				if status >= 200 && status < 400 {
 					delta.UpstreamSuccesses = 1
 				}
@@ -494,12 +494,14 @@ func blockReason(repl *caddy.Replacer, servErr error) string {
 //     on dial failure. Absent ⇒ reverse_proxy never ran.
 //   - servErr — the error returned by next.ServeHTTP. When reverse_proxy
 //     fails, it returns a caddyhttp.HandlerError (502 by default, 504
-//     for timeouts, 499 for client cancel) which bubbles up the
-//     middleware chain to us. A `nil` error past the upstream-selection
-//     point means upstream actually responded.
+//     for timeouts) which bubbles up the middleware chain to us. This
+//     legacy classifier treats a selected upstream with nil error as
+//     upstream traffic. Caddy can also swallow a client cancellation
+//     before receiving any response, so this alone is not health proof.
 //
-// We can't use `{http.reverse_proxy.status_code}` here — Caddy only sets
-// it inside `handle_response` blocks, never for normal pass-through.
+// Compact domain-health counters separately require fresh response evidence
+// and the original upstream status (see domainHealthUpstreamStatus). Keep the
+// established analytics origin buckets independent of that stricter proof.
 //
 // blockReason (computed once by the caller) decides cluster_blocked; an
 // empty reason falls through to the upstream/cluster classification below.
@@ -698,10 +700,11 @@ func responseBytes(w *recorder) uint64 {
 // writer: Caddy 2.11.6+'s IdleTimeoutWriter has neither Flush nor Hijack.
 type recorder struct {
 	http.ResponseWriter
-	status   int
-	bytes    int
-	wrote    bool
-	hijacked bool
+	healthResponseBefore domainHealthResponseSnapshot
+	status               int
+	bytes                int
+	wrote                bool
+	hijacked             bool
 }
 
 func (r *recorder) WriteHeader(code int) {

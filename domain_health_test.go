@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/stretchr/testify/require"
 )
@@ -42,6 +43,7 @@ func TestDomainHealthHandlerReadsServerVariableAfterRoute(t *testing.T) {
 	before := timeNowUnixMin()
 	err := handler.ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
+		setDomainHealthUpstreamResponse(r, 200)
 		w.WriteHeader(200)
 		return nil
 	}))
@@ -116,6 +118,9 @@ func TestDomainHealthOriginClasses(t *testing.T) {
 			r := newRequestWithReplacer("GET", "https://site.example/", "12", tc.repl)
 			caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
 			_ = (&StatsHandler{app: app}).ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+				if tc.err == nil && tc.repl != nil && tc.repl["http.reverse_proxy.upstream.address"] != nil {
+					setDomainHealthUpstreamResponse(r, tc.status)
+				}
 				if tc.status != 0 {
 					w.WriteHeader(tc.status)
 				}
@@ -123,6 +128,7 @@ func TestDomainHealthOriginClasses(t *testing.T) {
 			}))
 			require.Len(t, app.health, 1)
 			require.Equal(t, tc.want, app.health[0].counter)
+			assertDomainHealthVector(t, app.health[0].counter)
 		})
 	}
 }
@@ -174,6 +180,7 @@ func TestDomainHealthPiggybacksExistingIngestPost(t *testing.T) {
 	r := newRequestWithReplacer("GET", "https://site.example/", "12", upstreamSelected("origin:443"))
 	caddyhttp.SetVar(r.Context(), domainHealthVar, strings.Repeat("a", 64))
 	require.NoError(t, (&StatsHandler{app: app}).ServeHTTP(httptest.NewRecorder(), r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		setDomainHealthUpstreamResponse(r, 200)
 		w.WriteHeader(200)
 		return nil
 	})))
@@ -193,6 +200,12 @@ func TestDomainHealthPiggybacksExistingIngestPost(t *testing.T) {
 	require.NotNil(t, counter)
 	require.Equal(t, strings.Repeat("a", 64), health["configuration_key"])
 	require.NotContains(t, counter, "configuration_key", "normal request-counter cardinality must remain unchanged")
+}
+
+func setDomainHealthUpstreamResponse(r *http.Request, status int) {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.reverse_proxy.upstream.latency", time.Nanosecond)
+	repl.Set("http.reverse_proxy.status_code", status)
 }
 
 func TestDomainHealthKeyAndMemoryCaps(t *testing.T) {

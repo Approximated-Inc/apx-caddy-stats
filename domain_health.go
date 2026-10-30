@@ -3,8 +3,11 @@ package apxstats
 import (
 	"compress/gzip"
 	"context"
+	"net/http"
 	"strings"
+	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -12,6 +15,49 @@ const domainHealthVar = "apx_domain_health_key"
 
 // Covers the fixed-width key, counter, map slot and owned fingerprint.
 const domainHealthEntryBytes = 384
+
+// Caddy sets this duration only after RoundTrip returns an actual response.
+// Snapshot it before the route so preexisting response placeholders are not
+// evidence that this request obtained another upstream response.
+type domainHealthResponseSnapshot struct {
+	latency time.Duration
+	known   bool
+}
+
+func snapshotDomainHealthResponse(r *http.Request) domainHealthResponseSnapshot {
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if repl == nil {
+		return domainHealthResponseSnapshot{}
+	}
+	value, _ := repl.Get("http.reverse_proxy.upstream.latency")
+	latency, known := value.(time.Duration)
+	return domainHealthResponseSnapshot{latency, known}
+}
+
+func domainHealthUpstreamStatus(r *http.Request, w *recorder, servErr error, origin string) (int, bool) {
+	if r.Context().Err() != nil || origin != OriginUpstream {
+		return 0, false
+	}
+	// Caddy swallows context.Canceled while waiting for headers, leaving a
+	// selected upstream and nil handler error without writing any response.
+	// Earlier retry responses also leave placeholders behind. Neither case
+	// proves completion of the final attempt. A terminal response-retry error
+	// is the explicit exception: Caddy received the final response but chose
+	// not to copy it to the client.
+	if !w.wrote && !retriedUpstreamResponse(servErr) {
+		return 0, false
+	}
+	response := snapshotDomainHealthResponse(r)
+	if !response.known || response.latency <= 0 || (w.healthResponseBefore.known && response.latency == w.healthResponseBefore.latency) {
+		return 0, false
+	}
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	value, _ := repl.Get("http.reverse_proxy.status_code")
+	status, ok := value.(int)
+	// This is the original upstream status, set before handle_response can
+	// rewrite it. A hijacked 101 must not inherit the recorder's default 200.
+	return status, ok && (status == http.StatusSwitchingProtocols || status >= 200 && status <= 599)
+}
 
 type domainHealthKey struct {
 	TsUnixMin        uint32
