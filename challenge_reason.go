@@ -14,19 +14,25 @@ import (
 // The Phoenix ingest whitelist (`Approximated.Analytics.ChallengeOutcomes`)
 // must accept every value here before an image carrying it rolls out.
 //
-// The request_event disposition still reads the bare outcome.
+// The request_event disposition still reads the bare outcome, so a
+// passed_recently_fallback request stays challenge_passed_prior there.
 var challengeReasonOutcomes = map[[2]string]string{
-	{"issued", "document"}:       "issued_document",
-	{"issued", "other"}:          "issued_other",
-	{"failed", "api"}:            "not_shown_api",
-	{"failed", "stream"}:         "not_shown_stream",
-	{"failed", "token"}:          "failed_token",
-	{"failed", "expired"}:        "failed_expired",
-	{"failed", "binding"}:        "failed_binding",
-	{"failed", "proof"}:          "failed_proof",
-	{"failed", "replay"}:         "failed_replay",
-	{"failed", "render"}:         "failed_render",
-	{"failed", "fallback_limit"}: "failed_fallback_limit",
+	{"issued", "document"}:          "issued_document",
+	{"issued", "other"}:             "issued_other",
+	{"failed", "api"}:               "not_shown_api",
+	{"failed", "stream"}:            "not_shown_stream",
+	{"failed", "token"}:             "failed_token",
+	{"failed", "expired"}:           "failed_expired",
+	{"failed", "binding"}:           "failed_binding",
+	{"failed", "proof"}:             "failed_proof",
+	{"failed", "stale_difficulty"}:  "failed_stale_difficulty",
+	{"failed", "replay"}:            "failed_replay",
+	{"failed", "render_cookie"}:     "failed_render_cookie",
+	{"failed", "render_pixel"}:      "failed_render_pixel",
+	{"failed", "render_dwell"}:      "failed_render_dwell",
+	{"failed", "fallback_replay"}:   "failed_fallback_replay",
+	{"failed", "fallback_limit"}:    "failed_fallback_limit",
+	{"passed_recently", "fallback"}: "passed_recently_fallback",
 }
 
 // challengeAttemptOutcome is the stored outcome for a bare outcome and reason.

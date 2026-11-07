@@ -18,9 +18,14 @@ func TestChallengeAttemptOutcomeComposesKnownPairs(t *testing.T) {
 		{"failed", "expired", "failed_expired"},
 		{"failed", "binding", "failed_binding"},
 		{"failed", "proof", "failed_proof"},
+		{"failed", "stale_difficulty", "failed_stale_difficulty"},
 		{"failed", "replay", "failed_replay"},
-		{"failed", "render", "failed_render"},
+		{"failed", "render_cookie", "failed_render_cookie"},
+		{"failed", "render_pixel", "failed_render_pixel"},
+		{"failed", "render_dwell", "failed_render_dwell"},
+		{"failed", "fallback_replay", "failed_fallback_replay"},
 		{"failed", "fallback_limit", "failed_fallback_limit"},
+		{"passed_recently", "fallback", "passed_recently_fallback"},
 		// No reason (an older challenge plugin): the bare outcome, as before.
 		{"issued", "", "issued"},
 		{"failed", "", "failed"},
@@ -31,11 +36,13 @@ func TestChallengeAttemptOutcomeComposesKnownPairs(t *testing.T) {
 		{"failed", "something_new", "failed"},
 		{"issued", "proof", "issued"},
 		{"passed", "document", "passed"},
+		{"failed", "render", "failed"},
+		{"passed", "fallback", "passed"},
 	}
 	for _, tc := range cases {
 		require.Equal(t, tc.want, challengeAttemptOutcome(tc.outcome, tc.reason), "%s + %q", tc.outcome, tc.reason)
 	}
-	require.Len(t, challengeReasonOutcomes, 11)
+	require.Len(t, challengeReasonOutcomes, 16)
 }
 
 func TestServeHTTP_ChallengeReasonComposesStoredOutcomeOnly(t *testing.T) {
@@ -76,4 +83,20 @@ func TestServeHTTP_NoChallengeReasonKeepsBareOutcome(t *testing.T) {
 	ch := app.challengeSnapshot()
 	require.Len(t, ch, 1)
 	require.Equal(t, "failed", ch[0].outcome)
+}
+
+func TestServeHTTP_FallbackCookiePassKeepsPriorDisposition(t *testing.T) {
+	app := &fakeApp{modeV2: true}
+	h := &StatsHandler{app: app}
+	r := newRequestWithChallengeOutcome("GET", "/", "example.com", "passed_recently")
+	caddyhttp.SetVar(r.Context(), "apx_challenge_reason", "fallback")
+	r.RemoteAddr = "203.0.113.7:54321"
+	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), r, nextHandler(200)))
+
+	ch := app.challengeSnapshot()
+	require.Len(t, ch, 1)
+	require.Equal(t, "passed_recently_fallback", ch[0].outcome)
+	evs := app.reqEventSnapshot()
+	require.Len(t, evs, 1)
+	require.Equal(t, dispChallengePassedPrior, evs[0].Disposition)
 }
