@@ -36,6 +36,8 @@ func TestLookupFoldHost(t *testing.T) {
 		"a.fold.test:443":         42,
 		"a.fold.test.:8443":       42,
 		"a.fold.test:":            42,
+		// Caddy's host matcher strips any port, so these reach the same routes.
+		"a.fold.test:999999999":   42,
 		"xn--bcher-kva.fold.test": 43,
 		"XN--BCHER-KVA.FOLD.TEST": 43,
 		"under_score.test":        44,
@@ -205,7 +207,6 @@ const foldHostsField = "fold_hosts"
 
 type foldHarness struct {
 	addr, logPath string
-	posts         func() []capturedPost
 }
 
 // customerHandlers are rules a customer could have, placed ahead of the
