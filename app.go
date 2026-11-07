@@ -579,6 +579,11 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 		a.fpIpMap = make(map[fingerprintIpKey]*fingerprintCounter)
 	}
 	a.stopCh = make(chan struct{})
+
+	// Publish this app to the global Coraza audit-log writer. The writer
+	// is registered by a package init() with no app handle, so it loads
+	// the live app from here. Set last, after all state is initialized.
+	corazaApp.Store(a)
 	return nil
 }
 
@@ -651,12 +656,6 @@ func mixString(h uint64, s string) uint64 {
 // refresher (a ~µs /proc/self/statm read per second).
 func (a *StatsApp) Start() error {
 	a.started.Store(true)
-	// Publish this app to the global Coraza audit-log writer. The writer is
-	// registered by a package init() with no app handle, so it loads the live
-	// app from here. Not at Provision: a reload that fails after that would
-	// detach the live app and keep the rejected one, and its table, in memory.
-	corazaApp.Store(a)
-	metricFoldHostEntries.Set(float64(len(a.FoldHosts)))
 	a.overloadOwner = overloadRetain(a.Overload)
 	a.startShipper()
 	a.wg.Add(1)
@@ -676,7 +675,7 @@ func (a *StatsApp) Stop() error {
 	// Detach from the Coraza audit-log writer first so in-flight Write
 	// calls no-op rather than record into an app that's draining. Only
 	// clear if we're still the published app (a hot-reload may have
-	// already swapped in the replacement app's pointer at its Start).
+	// already swapped in the replacement app's pointer at its Provision).
 	corazaApp.CompareAndSwap(a, nil)
 	start := time.Now()
 	a.stopOnce.Do(func() {
@@ -711,6 +710,9 @@ func (a *StatsApp) Stop() error {
 func (a *StatsApp) Cleanup() error {
 	if !a.started.Load() {
 		a.retireDomainHealth()
+		// corazaApp may keep this app until the next Provision, and the table is
+		// the only part of it that grows with the number of domains.
+		a.FoldHosts = nil
 	}
 	return nil
 }

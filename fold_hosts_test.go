@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -19,7 +21,6 @@ import (
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	_ "github.com/caddyserver/caddy/v2/modules/logging"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -83,6 +84,12 @@ func TestProvisionFoldHostsDropsEntriesInsteadOfFailing(t *testing.T) {
 	require.Equal(t, before+8, counterValue(metricFoldHostsDropped))
 }
 
+func foldHandler(app AppRef, table map[string]uint32) *StatsHandler {
+	h := &StatsHandler{app: app}
+	h.foldHosts.Store(&table)
+	return h
+}
+
 func foldReq(host, vhostVar string) *http.Request {
 	r := newRequestWithReplacer("GET", "http://"+host+"/x", vhostVar, nil)
 	r.Host = host
@@ -114,7 +121,7 @@ func TestStatsHandlerFoldTableOwnsItsHosts(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			app := &fakeApp{}
-			h := &StatsHandler{app: app, foldHosts: table}
+			h := foldHandler(app, table)
 			w := httptest.NewRecorder()
 			require.NoError(t, h.ServeHTTP(w, foldReq(tc.host, ""), tc.next))
 			var got []uint32
@@ -135,18 +142,18 @@ func TestStatsHandlerFoldLookupUsesTheHostTheClientSent(t *testing.T) {
 		}
 	}
 	app := &fakeApp{}
-	h := &StatsHandler{app: app, foldHosts: table}
+	h := foldHandler(app, table)
 	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), foldReq("a.fold.test", ""), rewrite("b.fold.test")))
 	require.EqualValues(t, 42, app.records[0].k.VhostID)
 
 	app = &fakeApp{}
-	h = &StatsHandler{app: app, foldHosts: table}
+	h = foldHandler(app, table)
 	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), foldReq("unknown.test", ""), rewrite("b.fold.test")))
 	require.Empty(t, app.records, "rewriting a Host to a folded one must not claim it")
 }
 
 func TestStatsHandlerFoldCountsConflictsOnlyWhenTheVarDiffers(t *testing.T) {
-	h := &StatsHandler{app: &fakeApp{}, foldHosts: map[string]uint32{"a.fold.test": 42}}
+	h := foldHandler(&fakeApp{}, map[string]uint32{"a.fold.test": 42})
 	before := counterValue(metricFoldHostVarConflicts)
 	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), foldReq("a.fold.test", ""), nextHandler(200)))
 	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), foldReq("a.fold.test", "42"), nextHandler(200)))
@@ -157,7 +164,7 @@ func TestStatsHandlerFoldCountsConflictsOnlyWhenTheVarDiffers(t *testing.T) {
 
 func TestStatsHandlerFoldAttributesBlockedAndChallengedRequests(t *testing.T) {
 	app := &fakeApp{modeV2: true}
-	h := &StatsHandler{app: app, foldHosts: map[string]uint32{"a.fold.test": 42}}
+	h := foldHandler(app, map[string]uint32{"a.fold.test": 42})
 	blocked := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
 		return caddyhttp.Error(http.StatusForbidden, errors.New("interruption triggered: 949110"))
 	})
@@ -170,7 +177,7 @@ func TestStatsHandlerFoldAttributesBlockedAndChallengedRequests(t *testing.T) {
 	require.Equal(t, dispWafBlocked, app.reqEvents[0].Disposition)
 
 	app = &fakeApp{modeV2: true}
-	h = &StatsHandler{app: app, foldHosts: map[string]uint32{"a.fold.test": 42}}
+	h = foldHandler(app, map[string]uint32{"a.fold.test": 42})
 	challenged := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		caddyhttp.SetVar(r.Context(), "apx_challenge_outcome", "issued")
 		return nil
@@ -183,7 +190,7 @@ func TestStatsHandlerFoldAttributesBlockedAndChallengedRequests(t *testing.T) {
 
 func TestFoldedRowCarriesTheRequestIDEvenWhenTheProxyNeverRan(t *testing.T) {
 	app := &fakeApp{modeV2: true}
-	h := &StatsHandler{app: app, foldHosts: map[string]uint32{"a.fold.test": 42}}
+	h := foldHandler(app, map[string]uint32{"a.fold.test": 42})
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "http://a.fold.test/x", nil)
 	r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), w, &caddyhttp.Server{})
@@ -195,7 +202,7 @@ func TestFoldedRowCarriesTheRequestIDEvenWhenTheProxyNeverRan(t *testing.T) {
 
 func TestStatsHandlerFoldSkipsMonitorProbes(t *testing.T) {
 	app := &fakeApp{}
-	h := &StatsHandler{app: app, foldHosts: map[string]uint32{"a.fold.test": 42}}
+	h := foldHandler(app, map[string]uint32{"a.fold.test": 42})
 	r := foldReq("a.fold.test", "")
 	r.Header.Set("apx-monitor", "true")
 	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), r, nextHandler(200)))
@@ -213,6 +220,7 @@ type foldHarness struct {
 // customerHandlers are rules a customer could have, placed ahead of the
 // catch-all, and catch-all proxy options. Each must not move attribution.
 type foldRules struct {
+	listen string
 	early  []any
 	proxy  map[string]any
 	errors []any
@@ -238,7 +246,10 @@ func startFold(t *testing.T, origin, ingest string, table map[string]uint32, rul
 
 func foldConfig(t *testing.T, origin, ingest string, table map[string]uint32, rules foldRules) ([]byte, *foldHarness) {
 	t.Helper()
-	addr := freeLoopbackAddr(t)
+	addr := rules.listen
+	if addr == "" {
+		addr = freeLoopbackAddr(t)
+	}
 	logPath := filepath.Join(t.TempDir(), "access.log")
 	stats := map[string]any{
 		"proxy_server_id": 89,
@@ -545,40 +556,123 @@ func TestFoldHostTableBadEntriesLoadAndServe(t *testing.T) {
 	require.Equal(t, 200, h.ask(t, "ok.test", "/").Status)
 	// Through caddy.Load, so the app's Provision is what dropped them.
 	require.Equal(t, before+3, counterValue(metricFoldHostsDropped))
-	require.EqualValues(t, 1, foldEntriesGauge(t))
 }
 
-func foldEntriesGauge(t *testing.T) float64 {
-	t.Helper()
-	var entries dto.Metric
-	require.NoError(t, metricFoldHostEntries.Write(&entries))
-	return entries.GetGauge().GetValue()
-}
-
-// A reload refused after the stats app provisioned must leave the live app
-// published, count only its table, and hold nothing of the rejected one.
-func TestFoldHostTableRefusedReloadLeavesTheLiveApp(t *testing.T) {
+// A reload refused after the stats app provisioned must not hold its table: the
+// Coraza writer keeps that app published until the next Provision, as it always did.
+func TestFoldHostTableRefusedReloadReleasesTheTable(t *testing.T) {
 	origin, stopOrigin := foldOrigin(t)
 	t.Cleanup(stopOrigin)
-	ingest, posts := captureServer(t, http.StatusOK)
+	ingest, _ := captureServer(t, http.StatusOK)
 	t.Cleanup(ingest.Close)
 	t.Cleanup(func() { _ = caddy.Stop() })
 
 	live := map[string]uint32{"a.fold.test": 42}
 	h := startFold(t, origin, ingest.URL, live, foldRules{})
-	published := corazaApp.Load()
-	require.Equal(t, live, published.FoldHostTable())
-	require.EqualValues(t, 1, foldEntriesGauge(t))
+	liveApp := corazaApp.Load()
 
+	baseline := heapAfterGC()
+	huge := hugeFoldTable()
 	bad := foldRules{early: []any{map[string]any{"handle": []any{map[string]any{"handler": "apx_no_such_handler"}}}}}
-	raw, _ := foldConfig(t, origin, ingest.URL, map[string]uint32{"a.fold.test": 50, "b.fold.test": 51}, bad)
+	raw, _ := foldConfig(t, origin, ingest.URL, huge, bad)
+	huge = nil
 	require.Error(t, caddy.Load(raw, true))
+	raw = nil
+	after := heapAfterGC()
 
-	require.Same(t, published, corazaApp.Load(), "the rejected app must not stay published")
-	require.EqualValues(t, 1, foldEntriesGauge(t), "the gauge describes the table in use")
-	h.ask(t, "a.fold.test", "/")
-	require.Eventually(t, func() bool { return foldCounts(posts)[42] == 1 }, 3*time.Second, 10*time.Millisecond)
-	require.Zero(t, foldCounts(posts)[50])
+	rejected := corazaApp.Load()
+	require.NotSame(t, liveApp, rejected, "the base publishes at Provision, and a refused reload leaves it there")
+	require.Nil(t, rejected.FoldHostTable())
+	t.Logf("heap before the refused load %d KB, after it and a forced GC %d KB", baseline/1024, after/1024)
+	require.Less(t, int64(after)-int64(baseline), int64(4<<20), "100,000 entries retain over 8 MB when kept")
+
+	// The live config still serves and keeps its table.
+	require.Equal(t, live, liveApp.FoldHostTable())
+	require.Equal(t, 200, h.ask(t, "a.fold.test", "/").Status)
+}
+
+func hugeFoldTable() map[string]uint32 {
+	huge := make(map[string]uint32, 100_000)
+	for i := 0; i < 100_000; i++ {
+		huge[fmt.Sprintf("tenant-%06d.example-domain.test", i)] = uint32(i + 1)
+	}
+	return huge
+}
+
+// Caddy starts apps in map order, so the stats app either never started, and Cleanup
+// drops the table, or started and stopped. The second case keeps one table until the
+// next load. It must not grow with the number of refusals.
+func TestFoldHostTableRefusedAtStartKeepsAtMostOneTable(t *testing.T) {
+	origin, stopOrigin := foldOrigin(t)
+	t.Cleanup(stopOrigin)
+	ingest, _ := captureServer(t, http.StatusOK)
+	t.Cleanup(ingest.Close)
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	small := map[string]uint32{"a.fold.test": 42}
+	h := startFold(t, origin, ingest.URL, small, foldRules{})
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer occupied.Close()
+
+	baseline := heapAfterGC()
+	for i := 0; i < 6; i++ {
+		raw, _ := foldConfig(t, origin, ingest.URL, hugeFoldTable(), foldRules{listen: occupied.Addr().String()})
+		require.Error(t, caddy.Load(raw, true))
+		raw = nil
+		after := heapAfterGC()
+		t.Logf("refusal %d: stats app started %v, heap %d KB to %d KB", i, corazaApp.Load() == nil, baseline/1024, after/1024)
+		require.Less(t, int64(after)-int64(baseline), int64(14<<20), "one table is about 9 MB")
+		require.Equal(t, 200, h.ask(t, "a.fold.test", "/").Status)
+	}
+
+	h = startFold(t, origin, ingest.URL, small, foldRules{})
+	after := heapAfterGC()
+	t.Logf("after the next good load, heap %d KB to %d KB", baseline/1024, after/1024)
+	require.Less(t, int64(after)-int64(baseline), int64(4<<20))
+	require.Equal(t, 200, h.ask(t, "a.fold.test", "/").Status)
+}
+
+func TestFoldHostTableRetiredGenerationsDoNotAccumulate(t *testing.T) {
+	origin, stopOrigin := foldOrigin(t)
+	t.Cleanup(stopOrigin)
+	ingest, _ := captureServer(t, http.StatusOK)
+	t.Cleanup(ingest.Close)
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	small := map[string]uint32{"a.fold.test": 42}
+	h := startFold(t, origin, ingest.URL, small, foldRules{})
+	baseline := heapAfterGC()
+	for i := 0; i < 3; i++ {
+		startFold(t, origin, ingest.URL, hugeFoldTable(), foldRules{})
+	}
+	h = startFold(t, origin, ingest.URL, small, foldRules{})
+	after := heapAfterGC()
+	t.Logf("heap %d KB to %d KB after three retired 100,000-entry tables", baseline/1024, after/1024)
+	require.Less(t, int64(after)-int64(baseline), int64(4<<20), "each table retains over 8 MB when kept")
+	require.Equal(t, 200, h.ask(t, "a.fold.test", "/").Status)
+}
+
+func TestStatsHandlerCleanupOnlyDropsANeverStartedTable(t *testing.T) {
+	table := map[string]uint32{"a.fold.test": 42}
+
+	started := &StatsApp{}
+	started.started.Store(true)
+	draining := foldHandler(started, table)
+	require.NoError(t, draining.Cleanup())
+	require.NotNil(t, draining.foldHosts.Load(), "a retiring generation still has requests in flight")
+
+	rejected := foldHandler(&StatsApp{}, table)
+	require.NoError(t, rejected.Cleanup())
+	require.Nil(t, rejected.foldHosts.Load())
+}
+
+func heapAfterGC() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
 }
 
 func TestFoldHostTableReloadSwapsTheTable(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -22,7 +23,7 @@ type StatsHandler struct {
 	HolderOnly bool `json:"holder_only,omitempty"`
 	logger     *zap.Logger
 	app        AppRef
-	foldHosts  map[string]uint32
+	foldHosts  atomic.Pointer[map[string]uint32]
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -53,7 +54,9 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats handler: unexpected app type %T", app)
 	}
 	h.app = sa
-	h.foldHosts = sa.FoldHostTable()
+	if table := sa.FoldHostTable(); len(table) > 0 {
+		h.foldHosts.Store(&table)
+	}
 	return nil
 }
 
@@ -90,7 +93,11 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}
 
 	// Read here, before anything downstream can rewrite the Host.
-	foldID, folded := lookupFoldHost(h.foldHosts, r.Host)
+	var foldID uint32
+	var folded bool
+	if table := h.foldHosts.Load(); table != nil {
+		foldID, folded = lookupFoldHost(*table, r.Host)
+	}
 
 	start := time.Now()
 	if h.app.RequestEventsModeV2() {
@@ -795,4 +802,5 @@ var (
 	_ caddy.Provisioner           = (*StatsHandler)(nil)
 	_ caddyfile.Unmarshaler       = (*StatsHandler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*StatsHandler)(nil)
+	_ caddy.CleanerUpper          = (*StatsHandler)(nil)
 )

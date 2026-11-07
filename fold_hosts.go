@@ -11,11 +11,6 @@ import (
 // maxFoldHostBytes is the longest DNS name. Longer Hosts are not looked up.
 const maxFoldHostBytes = 253
 
-var metricFoldHostEntries = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "apx_stats_fold_host_entries",
-	Help: "Entries in the fold_hosts table of the app that started last",
-})
-
 var metricFoldHostsDropped = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "apx_stats_fold_hosts_dropped_total",
 	Help: "fold_hosts entries ignored at provision because the host or id was not canonical",
@@ -42,6 +37,16 @@ func (a *StatsApp) provisionFoldHosts() {
 
 // FoldHostTable returns the loaded table. It is read-only after Provision.
 func (a *StatsApp) FoldHostTable() map[string]uint32 { return a.FoldHosts }
+
+// Cleanup drops the table from a handler whose app never started. A refused load's
+// handler stays reachable until the next load: a 100,000-entry table stayed on the
+// heap after a forced GC even with nothing published to the Coraza writer.
+func (h *StatsHandler) Cleanup() error {
+	if sa, ok := h.app.(*StatsApp); ok && !sa.started.Load() {
+		h.foldHosts.Store(nil)
+	}
+	return nil
+}
 
 // isCanonicalFoldHost reports whether a table key is a form lookups can produce.
 func isCanonicalFoldHost(host string) bool {
