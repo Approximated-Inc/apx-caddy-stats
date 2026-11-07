@@ -102,8 +102,9 @@ a host in the table:
 - Nothing downstream can read the table. It is not in the vars map or the
   replacer, and it adds no header, so responses and upstream requests don't
   change. A `{http.vars.vhost_id}` placeholder still reads what it read before.
-- A row for a request only the table attributed has no `request_id` unless the
-  proxy ran. Reading Caddy's lazy UUID would add it to the access log.
+- Every row carries a `request_id`. Reading Caddy's lazy UUID after the response
+  adds `uuid` to a configured server log, and generated configs have no server
+  logs block.
 
 A host outside the table behaves as before. The control plane must leave out any
 host a vhost's own route can serve, because the table outranks that route's var.

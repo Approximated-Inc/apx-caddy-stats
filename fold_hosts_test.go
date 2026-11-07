@@ -25,7 +25,7 @@ import (
 )
 
 func TestLookupFoldHost(t *testing.T) {
-	table := map[string]uint32{"a.fold.test": 42, "xn--bcher-kva.fold.test": 43, "under_score.test": 44}
+	table := map[string]uint32{"a.fold.test": 42, "zz.fold.test": 45, "xn--bcher-kva.fold.test": 43, "under_score.test": 44}
 	long := strings.Repeat("a", 254)
 	for raw, want := range map[string]uint32{
 		"a.fold.test":       42,
@@ -38,6 +38,7 @@ func TestLookupFoldHost(t *testing.T) {
 		"a.fold.test:":      42,
 		// Caddy's host matcher strips any port, so these reach the same routes.
 		"a.fold.test:999999999":   42,
+		"ZZ.FOLD.TEST":            45,
 		"xn--bcher-kva.fold.test": 43,
 		"XN--BCHER-KVA.FOLD.TEST": 43,
 		"under_score.test":        44,
@@ -73,16 +74,16 @@ func TestLookupFoldHostDoesNotAllocate(t *testing.T) {
 func TestProvisionFoldHostsDropsEntriesInsteadOfFailing(t *testing.T) {
 	before := counterValue(metricFoldHostsDropped)
 	a := &StatsApp{logger: zap.NewNop(), FoldHosts: map[string]uint32{
-		"a.fold.test": 42, "A.FOLD.TEST": 1, "b.fold.test.": 2, "c.fold.test:443": 3,
+		"a.fold.test": 42, "under_score.test": 9, "A.FOLD.TEST": 1, "b.fold.test.": 2, "c.fold.test:443": 3,
 		"zero.fold.test": 0, "{env.APX_INTERNAL_KEY}": 4, "bücher.test": 5, "": 6,
 		strings.Repeat("a", 254): 7,
 	}}
 	a.provisionFoldHosts()
-	require.Equal(t, map[string]uint32{"a.fold.test": 42}, a.FoldHosts)
+	require.Equal(t, map[string]uint32{"a.fold.test": 42, "under_score.test": 9}, a.FoldHosts)
 	require.Equal(t, before+8, counterValue(metricFoldHostsDropped))
 	var entries dto.Metric
 	require.NoError(t, metricFoldHostEntries.Write(&entries))
-	require.EqualValues(t, 1, entries.GetGauge().GetValue())
+	require.EqualValues(t, 2, entries.GetGauge().GetValue())
 }
 
 func foldReq(host, vhostVar string) *http.Request {
@@ -183,13 +184,16 @@ func TestStatsHandlerFoldAttributesBlockedAndChallengedRequests(t *testing.T) {
 	require.Equal(t, "a.fold.test", app.challenges[0].vhost, "challenge attempts stay keyed by host")
 }
 
-func TestFoldedRowReadsTheRequestIDOnlyAfterTheProxy(t *testing.T) {
+func TestFoldedRowCarriesTheRequestIDEvenWhenTheProxyNeverRan(t *testing.T) {
 	app := &fakeApp{modeV2: true}
 	h := &StatsHandler{app: app, foldHosts: map[string]uint32{"a.fold.test": 42}}
-	r := foldReq("a.fold.test", "")
-	caddyhttp.NewTestReplacer(r)
-	require.NoError(t, h.ServeHTTP(httptest.NewRecorder(), r, nextHandler(200)))
-	require.Empty(t, app.reqEvents[0].RequestID)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "http://a.fold.test/x", nil)
+	r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), w, &caddyhttp.Server{})
+	require.NoError(t, h.ServeHTTP(w, r, nextHandler(403)))
+	rows := app.reqEventSnapshot()
+	require.Len(t, rows, 1)
+	require.NotEmpty(t, rows[0].RequestID)
 }
 
 func TestStatsHandlerFoldSkipsMonitorProbes(t *testing.T) {
@@ -348,9 +352,10 @@ func (h *foldHarness) accessLog(t *testing.T, want int) []map[string]any {
 			}
 			delete(m, "ts")
 			delete(m, "duration")
-			if _, ok := m["uuid"]; ok {
-				m["uuid"] = "set"
-			}
+			// Reading the row's request id creates Caddy's lazy UUID, which a
+			// configured server log then records. Generated configs have no server
+			// logs block, and the read happens after the response.
+			delete(m, "uuid")
 			if req, ok := m["request"].(map[string]any); ok {
 				delete(req, "remote_port")
 			}
@@ -517,6 +522,13 @@ func TestFoldHostTableBlockedRowsThroughCaddy(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 	counts := foldCounts(posts)
 	require.Equal(t, 1, counts[42])
+	for _, p := range posts() {
+		for _, row := range p.rows {
+			if row["_type"] == "request_event" && row["vhost_id"] == float64(42) {
+				require.NotEmpty(t, row["request_id"], "a blocked row correlates like a routed one")
+			}
+		}
+	}
 }
 
 func TestFoldHostTableBadEntriesLoadAndServe(t *testing.T) {
@@ -525,8 +537,11 @@ func TestFoldHostTableBadEntriesLoadAndServe(t *testing.T) {
 	ingest, _ := captureServer(t, http.StatusOK)
 	t.Cleanup(ingest.Close)
 	t.Cleanup(func() { _ = caddy.Stop() })
+	before := counterValue(metricFoldHostsDropped)
 	h := startFold(t, origin, ingest.URL, map[string]uint32{"{env.APX_INTERNAL_KEY}": 1, "A.BAD": 2, "": 3, "ok.test": 4}, foldRules{})
 	require.Equal(t, 200, h.ask(t, "ok.test", "/").Status)
+	// Through caddy.Load, so the app's Provision is what dropped them.
+	require.Equal(t, before+3, counterValue(metricFoldHostsDropped))
 }
 
 func TestFoldHostTableReloadSwapsTheTable(t *testing.T) {

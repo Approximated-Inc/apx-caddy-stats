@@ -160,7 +160,6 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	vhostID, ok := readVhostID(r)
 	// A folded host belongs to the table. Whatever the chain left in the var,
 	// including a customer rule writing it, does not move its attribution.
-	onlyByTable := folded && !ok
 	if folded {
 		if ok && vhostID != foldID {
 			metricFoldHostVarConflicts.Inc()
@@ -178,7 +177,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp, false))
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp))
 		}
 		return
 	}
@@ -246,8 +245,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		row := h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp, onlyByTable)
-		h.app.RecordRequestEvent(row)
+		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp))
 	} else if reason == "" {
 		path := telemetryPath(r)
 		h.app.RecordRequestEvent(requestEventRow{
@@ -288,7 +286,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string, onlyByTable bool) requestEventRow {
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
@@ -315,7 +313,7 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		MachineSeq:            nextMachineSeq(),
 		Disposition:           disposition,
 		Host:                  host,
-		RequestID:             rowRequestID(repl, onlyByTable),
+		RequestID:             readRequestID(repl),
 		V2:                    true,
 		DefenseExempt:         h.defenseExempt(r),
 	}
@@ -334,20 +332,6 @@ func (h *StatsHandler) defenseExempt(r *http.Request) bool {
 	}
 	marker, _ := caddyhttp.GetVar(r.Context(), "apx_l7_header_exempt").(string)
 	return marker == "true"
-}
-
-// rowRequestID leaves the id empty for a request only the table attributed, unless
-// the proxy ran. The UUID is created on first read and Caddy logs it from then
-// on, so reading it for a request that would have had no row would change the
-// access log. The control plane sets X-Apx-Request-Id on every proxy step, so a
-// proxied request already has its id.
-func rowRequestID(repl *caddy.Replacer, onlyByTable bool) string {
-	if onlyByTable && repl != nil {
-		if address, _ := repl.GetString("http.reverse_proxy.upstream.address"); address == "" {
-			return ""
-		}
-	}
-	return readRequestID(repl)
 }
 
 // readRequestID uses the same lazy, per-request Caddy UUID as the upstream
