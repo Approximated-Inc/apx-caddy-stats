@@ -22,6 +22,7 @@ type StatsHandler struct {
 	HolderOnly bool `json:"holder_only,omitempty"`
 	logger     *zap.Logger
 	app        AppRef
+	foldHosts  map[string]uint32
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -52,6 +53,7 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats handler: unexpected app type %T", app)
 	}
 	h.app = sa
+	h.foldHosts = sa.FoldHostTable()
 	return nil
 }
 
@@ -87,6 +89,9 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		return next.ServeHTTP(w, r)
 	}
 
+	// Read here, before anything downstream can rewrite the Host.
+	foldID, folded := lookupFoldHost(h.foldHosts, r.Host)
+
 	start := time.Now()
 	if h.app.RequestEventsModeV2() {
 		var failureTrace *upstreamFailureTrace
@@ -99,7 +104,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr, healthResponseBefore)
+	h.record(r, wrapped, dur, servErr, healthResponseBefore, foldID, folded)
 	return servErr
 }
 
@@ -107,12 +112,14 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // feeds the counters, versioned health, challenge attempts, request events
 // and the unique-clients set.
 //
+// foldID and folded come from the fold_hosts table, read before the chain ran.
+//
 // In legacy mode (mode_v2 off) request_events logs exactly one row per
 // SERVED request (blocked/challenged requests excluded), preserving the
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot) {
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot, foldID uint32, folded bool) {
 	// Keep the original generation authoritative, including early terminal rows.
 	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
 	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
@@ -151,6 +158,15 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	vhostID, ok := readVhostID(r)
+	// A folded host belongs to the table. Whatever the chain left in the var,
+	// including a customer rule writing it, does not move its attribution.
+	onlyByTable := folded && !ok
+	if folded {
+		if ok && vhostID != foldID {
+			metricFoldHostVarConflicts.Inc()
+		}
+		vhostID, ok = foldID, true
+	}
 	if !ok {
 		// No vhost_id — the request didn't match a vhost route. Recording a
 		// counter under vhost_id=0 would pollute aggregates, so skip it.
@@ -162,7 +178,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 		if modeV2 && outcome != "" {
 			reason := blockReason(repl, servErr)
 			disp := deriveDisposition(reason, outcome)
-			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp))
+			h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, telemetryIdentity(r), 0, challengeVhost(r), disp, false))
 		}
 		return
 	}
@@ -230,7 +246,8 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// original wire shape (V2 unset).
 	if modeV2 {
 		disp := deriveDisposition(reason, outcome)
-		h.app.RecordRequestEvent(h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp))
+		row := h.buildRequestEventRow(r, w, dur, servErr, repl, identity, k.VhostID, "", disp, onlyByTable)
+		h.app.RecordRequestEvent(row)
 	} else if reason == "" {
 		path := telemetryPath(r)
 		h.app.RecordRequestEvent(requestEventRow{
@@ -271,7 +288,7 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 // disposition is one of the disp* constants. SampleRate is stamped later by
 // the recorder. Origin/reason are recomputed from the same inputs the
 // counter path used, so the two stay consistent.
-func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string) requestEventRow {
+func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur time.Duration, servErr error, repl *caddy.Replacer, identity requestTelemetryIdentity, vhostID uint32, host, disposition string, onlyByTable bool) requestEventRow {
 	reason := blockReason(repl, servErr)
 	origin := classifyOrigin(repl, servErr, reason)
 	now := time.Now().UTC()
@@ -298,7 +315,7 @@ func (h *StatsHandler) buildRequestEventRow(r *http.Request, w *recorder, dur ti
 		MachineSeq:            nextMachineSeq(),
 		Disposition:           disposition,
 		Host:                  host,
-		RequestID:             readRequestID(repl),
+		RequestID:             rowRequestID(repl, onlyByTable),
 		V2:                    true,
 		DefenseExempt:         h.defenseExempt(r),
 	}
@@ -317,6 +334,20 @@ func (h *StatsHandler) defenseExempt(r *http.Request) bool {
 	}
 	marker, _ := caddyhttp.GetVar(r.Context(), "apx_l7_header_exempt").(string)
 	return marker == "true"
+}
+
+// rowRequestID leaves the id empty for a request only the table attributed, unless
+// the proxy ran. The UUID is created on first read and Caddy logs it from then
+// on, so reading it for a request that would have had no row would change the
+// access log. The control plane sets X-Apx-Request-Id on every proxy step, so a
+// proxied request already has its id.
+func rowRequestID(repl *caddy.Replacer, onlyByTable bool) string {
+	if onlyByTable && repl != nil {
+		if address, _ := repl.GetString("http.reverse_proxy.upstream.address"); address == "" {
+			return ""
+		}
+	}
+	return readRequestID(repl)
 }
 
 // readRequestID uses the same lazy, per-request Caddy UUID as the upstream

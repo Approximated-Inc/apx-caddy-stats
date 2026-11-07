@@ -216,6 +216,12 @@ type StatsApp struct {
 	DefenseExemptionTelemetry bool `json:"defense_exemption_telemetry,omitempty"`
 	DefensePolicyEvidenceV2   bool `json:"defense_policy_evidence_v2,omitempty"`
 
+	// FoldHosts names the vhost of each domain served by the cluster's catch-all
+	// route, which has no vhost_id of its own: canonical host to vhost id. The
+	// table lives here so nothing in the handler chain can read or change it.
+	// Keys are lowercase ASCII with no port or trailing dot.
+	FoldHosts map[string]uint32 `json:"fold_hosts,omitempty"`
+
 	// Ingest is required.
 	Ingest *IngestConfig `json:"ingest,omitempty"`
 
@@ -449,6 +455,7 @@ func (a *StatsApp) Provision(ctx caddy.Context) error {
 	if err := a.Overload.Validate(); err != nil {
 		return err
 	}
+	a.provisionFoldHosts()
 
 	// auth_token from the config blob wins over the env var — same
 	// rotation story as hash_salt: config regen, no machine restart.
