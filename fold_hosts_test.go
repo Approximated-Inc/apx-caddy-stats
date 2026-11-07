@@ -81,9 +81,6 @@ func TestProvisionFoldHostsDropsEntriesInsteadOfFailing(t *testing.T) {
 	a.provisionFoldHosts()
 	require.Equal(t, map[string]uint32{"a.fold.test": 42, "under_score.test": 9}, a.FoldHosts)
 	require.Equal(t, before+8, counterValue(metricFoldHostsDropped))
-	var entries dto.Metric
-	require.NoError(t, metricFoldHostEntries.Write(&entries))
-	require.EqualValues(t, 2, entries.GetGauge().GetValue())
 }
 
 func foldReq(host, vhostVar string) *http.Request {
@@ -234,6 +231,13 @@ func vars(kv ...string) map[string]any {
 // catch-all with an empty vhost_id and an X-Apx-Vhost-Id header.
 func startFold(t *testing.T, origin, ingest string, table map[string]uint32, rules foldRules) *foldHarness {
 	t.Helper()
+	raw, h := foldConfig(t, origin, ingest, table, rules)
+	require.NoError(t, caddy.Load(raw, true))
+	return h
+}
+
+func foldConfig(t *testing.T, origin, ingest string, table map[string]uint32, rules foldRules) ([]byte, *foldHarness) {
+	t.Helper()
 	addr := freeLoopbackAddr(t)
 	logPath := filepath.Join(t.TempDir(), "access.log")
 	stats := map[string]any{
@@ -303,8 +307,7 @@ func startFold(t *testing.T, origin, ingest string, table map[string]uint32, rul
 		},
 	})
 	require.NoError(t, err)
-	require.NoError(t, caddy.Load(raw, true))
-	return &foldHarness{addr: addr, logPath: logPath}
+	return raw, &foldHarness{addr: addr, logPath: logPath}
 }
 
 type foldAnswer struct {
@@ -542,6 +545,40 @@ func TestFoldHostTableBadEntriesLoadAndServe(t *testing.T) {
 	require.Equal(t, 200, h.ask(t, "ok.test", "/").Status)
 	// Through caddy.Load, so the app's Provision is what dropped them.
 	require.Equal(t, before+3, counterValue(metricFoldHostsDropped))
+	require.EqualValues(t, 1, foldEntriesGauge(t))
+}
+
+func foldEntriesGauge(t *testing.T) float64 {
+	t.Helper()
+	var entries dto.Metric
+	require.NoError(t, metricFoldHostEntries.Write(&entries))
+	return entries.GetGauge().GetValue()
+}
+
+// A reload refused after the stats app provisioned must leave the live app
+// published, count only its table, and hold nothing of the rejected one.
+func TestFoldHostTableRefusedReloadLeavesTheLiveApp(t *testing.T) {
+	origin, stopOrigin := foldOrigin(t)
+	t.Cleanup(stopOrigin)
+	ingest, posts := captureServer(t, http.StatusOK)
+	t.Cleanup(ingest.Close)
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	live := map[string]uint32{"a.fold.test": 42}
+	h := startFold(t, origin, ingest.URL, live, foldRules{})
+	published := corazaApp.Load()
+	require.Equal(t, live, published.FoldHostTable())
+	require.EqualValues(t, 1, foldEntriesGauge(t))
+
+	bad := foldRules{early: []any{map[string]any{"handle": []any{map[string]any{"handler": "apx_no_such_handler"}}}}}
+	raw, _ := foldConfig(t, origin, ingest.URL, map[string]uint32{"a.fold.test": 50, "b.fold.test": 51}, bad)
+	require.Error(t, caddy.Load(raw, true))
+
+	require.Same(t, published, corazaApp.Load(), "the rejected app must not stay published")
+	require.EqualValues(t, 1, foldEntriesGauge(t), "the gauge describes the table in use")
+	h.ask(t, "a.fold.test", "/")
+	require.Eventually(t, func() bool { return foldCounts(posts)[42] == 1 }, 3*time.Second, 10*time.Millisecond)
+	require.Zero(t, foldCounts(posts)[50])
 }
 
 func TestFoldHostTableReloadSwapsTheTable(t *testing.T) {

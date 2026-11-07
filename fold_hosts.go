@@ -13,7 +13,7 @@ const maxFoldHostBytes = 253
 
 var metricFoldHostEntries = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "apx_stats_fold_host_entries",
-	Help: "Entries in the loaded fold_hosts table",
+	Help: "Entries in the fold_hosts table of the app that started last",
 })
 
 var metricFoldHostsDropped = promauto.NewCounter(prometheus.CounterOpts{
@@ -38,7 +38,6 @@ func (a *StatsApp) provisionFoldHosts() {
 			}
 		}
 	}
-	metricFoldHostEntries.Set(float64(len(a.FoldHosts)))
 }
 
 // FoldHostTable returns the loaded table. It is read-only after Provision.

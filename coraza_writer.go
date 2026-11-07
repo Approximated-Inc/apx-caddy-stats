@@ -22,7 +22,7 @@ const corazaHeaderExemptionSignature = "APX_HEADER_EXEMPT_TELEMETRY/1"
 // corazaApp is the single live StatsApp the audit-log writer hands
 // detections to. RegisterAuditLogWriter is a GLOBAL factory with no app
 // handle, and there is exactly one apx_stats app per process, so the app
-// publishes itself here at Provision and clears it at Stop. The writer
+// publishes itself here at Start and clears it at Stop. The writer
 // does an atomic load and no-ops if nil (unprovisioned / shutting down).
 var corazaApp atomic.Pointer[StatsApp]
 
