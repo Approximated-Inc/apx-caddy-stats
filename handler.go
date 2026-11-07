@@ -139,12 +139,14 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	// comment): a served challenge is terminal so vhost_id is unset. Read
 	// the outcome once — it also drives the request_event disposition below.
 	// Exempt outcomes stay in raw logs but cannot feed Defense evidence.
+	// The stored outcome adds the handler's reason (issued_document,
+	// failed_proof, ...); the disposition keeps the bare outcome.
 	outcome := readChallengeOutcome(r)
 	if outcome != "" && !defenseExempt {
 		h.app.RecordChallengeAttempt(challengeAttemptKey{
 			vhost:   challengeVhost(r),
 			ip:      securityClientIP(r),
-			outcome: outcome,
+			outcome: challengeAttemptOutcome(outcome, readChallengeReason(r)),
 		})
 	}
 
