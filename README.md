@@ -81,6 +81,50 @@ the current route before using it as current health evidence. This protocol
 does not establish that all serving machines applied one generation and does
 not replace public DNS or TLS verification.
 
+## Domains folded into a catch-all route
+
+A vhost with no per-domain behaviour has no route of its own. It is served by
+the cluster's catch-all route, which sets an empty `vhost_id`, so its traffic
+would have no attribution. `apps.apx_stats.fold_hosts` names those domains:
+
+```json
+{"apps":{"apx_stats":{"fold_hosts":{"a.example.com":42}}}}
+```
+
+The handler looks the Host up when the request arrives, before anything can
+rewrite it. The port and one trailing dot are dropped and ASCII case folds. For
+a host in the table:
+
+- The table decides attribution. A `vhost_id` var left by any handler does not
+  move it, and `apx_stats_fold_host_var_conflicts_total` counts disagreements.
+- Blocked, rate-limited, shed and challenged requests are attributed too. They
+  never reach a route's `vars`.
+- Nothing downstream can read the table. It is not in the vars map or the
+  replacer, and it adds no header, so responses and upstream requests don't
+  change. A `{http.vars.vhost_id}` placeholder still reads what it read before.
+- Every row carries a `request_id`. Reading Caddy's lazy UUID after the response
+  adds `uuid` to a configured server log, and generated configs have no server
+  logs block.
+
+A host outside the table behaves as before. The control plane must leave out any
+host a vhost's own route can serve, because the table outranks that route's var.
+
+An entry with a non-canonical host or a zero id is dropped with a warning and
+counted in `apx_stats_fold_hosts_dropped_total`, so it can't refuse a config. An
+image without this field rejects the config, so the control plane gates it on the
+`fold_host_table` capability.
+
+Cost, measured on real Caddy at the fleet pins on a busy Mac, on top of a small
+config. Each machine holds one copy, and a reload holds the old one until it
+finishes:
+
+| Entries | Config added | `/load` | Peak RSS added | Heap retained |
+|---|---|---|---|---|
+| 5,000 | 210 KB | 21 ms | 5 MB | 1.9 MB |
+| 100,000 | 4.2 MB | 300 ms | 70 MB | 30 MB |
+
+A lookup takes about 26 ns at any size and allocates nothing.
+
 ## Shutdown and reload
 
 Caddy builds a new `apx_stats` app on every config load and stops the old

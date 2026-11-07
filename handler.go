@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -22,6 +23,7 @@ type StatsHandler struct {
 	HolderOnly bool `json:"holder_only,omitempty"`
 	logger     *zap.Logger
 	app        AppRef
+	foldHosts  atomic.Pointer[map[string]uint32]
 }
 
 // CaddyModule registers the handler at "http.handlers.apx_stats".
@@ -52,6 +54,9 @@ func (h *StatsHandler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_stats handler: unexpected app type %T", app)
 	}
 	h.app = sa
+	if table := sa.FoldHostTable(); len(table) > 0 {
+		h.foldHosts.Store(&table)
+	}
 	return nil
 }
 
@@ -87,6 +92,13 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		return next.ServeHTTP(w, r)
 	}
 
+	// Read here, before anything downstream can rewrite the Host.
+	var foldID uint32
+	var folded bool
+	if table := h.foldHosts.Load(); table != nil {
+		foldID, folded = lookupFoldHost(*table, r.Host)
+	}
+
 	start := time.Now()
 	if h.app.RequestEventsModeV2() {
 		var failureTrace *upstreamFailureTrace
@@ -99,7 +111,7 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	servErr := next.ServeHTTP(wrapped, r)
 
 	dur := time.Since(start)
-	h.record(r, wrapped, dur, servErr, healthResponseBefore)
+	h.record(r, wrapped, dur, servErr, healthResponseBefore, foldID, folded)
 	return servErr
 }
 
@@ -107,12 +119,14 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // feeds the counters, versioned health, challenge attempts, request events
 // and the unique-clients set.
 //
+// foldID and folded come from the fold_hosts table, read before the chain ran.
+//
 // In legacy mode (mode_v2 off) request_events logs exactly one row per
 // SERVED request (blocked/challenged requests excluded), preserving the
 // original wire bytes. In mode_v2 every request — served, blocked,
 // rate-limited, or challenged — is logged with a disposition; terminal
 // challenges (no vhost_id) are logged under vhost_id=0 with a host field.
-func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot) {
+func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, servErr error, healthResponseBefore domainHealthResponseSnapshot, foldID uint32, folded bool) {
 	// Keep the original generation authoritative, including early terminal rows.
 	// Delivery completion is optional for test AppRef stubs and never blocks on I/O.
 	if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
@@ -151,6 +165,14 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	vhostID, ok := readVhostID(r)
+	// A folded host belongs to the table. Whatever the chain left in the var,
+	// including a customer rule writing it, does not move its attribution.
+	if folded {
+		if ok && vhostID != foldID {
+			metricFoldHostVarConflicts.Inc()
+		}
+		vhostID, ok = foldID, true
+	}
 	if !ok {
 		// No vhost_id — the request didn't match a vhost route. Recording a
 		// counter under vhost_id=0 would pollute aggregates, so skip it.
@@ -780,4 +802,5 @@ var (
 	_ caddy.Provisioner           = (*StatsHandler)(nil)
 	_ caddyfile.Unmarshaler       = (*StatsHandler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*StatsHandler)(nil)
+	_ caddy.CleanerUpper          = (*StatsHandler)(nil)
 )
