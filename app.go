@@ -756,12 +756,13 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		// Always drain (frees the buffers); ship only with a process-wide
 		// retired slot and under a deadline, so a hung ingest can't pile up
 		// goroutines and bodies across rapid reloads.
-		body, rows, health, ok := a.drainAndEncode(true)
+		body, rows, health, carry, ok := a.drainAndEncodeCarry(true)
 		if !ok {
 			continue
 		}
 		if !acquireRetiredSlot() {
 			health.drop(domainHealthDropDelivery)
+			carry.fail()
 			a.dropRows(rows, "busy", nil)
 			continue
 		}
@@ -776,6 +777,8 @@ func (a *StatsApp) deliverRetiredHTTP() {
 		releaseRetiredSlot()
 		if err != nil {
 			health.drop(domainHealthDropDelivery)
+			// Hand the minutes and loss rows to whichever instance is live.
+			carry.fail()
 			a.dropRows(rows, result, err)
 		} else {
 			health.release()
@@ -1000,6 +1003,10 @@ func (a *StatsApp) Record(k Key, delta CounterDelta) {
 // buckets deterministically.
 func timeNowUnixMin() uint32 { return uint32(time.Now().Unix() / 60) }
 
+// challengeClockMin stamps a challenge key's request minute. A variable so
+// tests can pin it.
+var challengeClockMin = timeNowUnixMin
+
 // RecordL4Sni increments the L4 SNI counter for the given SNI in the
 // current minute bucket. Called once per accepted L4 connection from the
 // `apx_l4_stats` handler.
@@ -1089,20 +1096,35 @@ func (a *StatsApp) RecordRequestEvent(row requestEventRow) {
 // `apx_challenge_outcome` var is set, from the StatsHandler. Nil-safe —
 // no-op (and no allocation) when the map hasn't been initialized.
 //
-// Single mutexed map, mirroring the L4 SNI track. The minute is stamped
-// at drain time, so the key carries no ts dimension and same-minute
-// (vhost, ip, outcome) tuples merge into one row. New keys past
-// challengeMaxKeys are dropped + counted; existing keys keep counting.
+// Single mutexed map, mirroring the L4 SNI track. The key carries the
+// request minute (stamped here unless the caller set it) and the source, so
+// same-minute same-source (vhost, ip, outcome) tuples merge into one row. A
+// new page key past challengeMaxKeys is dropped and counted. Every other
+// outcome may use challengeReserveKeys more, and a drop past that marks the
+// minute in the process-wide loss map. Existing keys keep counting.
 func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
+	if key.tsMin == 0 {
+		key.tsMin = challengeClockMin()
+	}
 	a.challengeMu.Lock()
 	defer a.challengeMu.Unlock()
 	if a.challengeMap == nil {
 		return
 	}
-	if _, ok := a.challengeMap[key]; !ok && len(a.challengeMap) >= challengeMaxKeys {
-		a.challengeOverflow++
-		metricChallengeOverflows.Inc()
-		return
+	if _, ok := a.challengeMap[key]; !ok {
+		limit := challengeMaxKeys
+		page := isChallengePageOutcome(key.outcome, key.source)
+		if !page {
+			limit += challengeReserveKeys
+		}
+		if len(a.challengeMap) >= limit {
+			a.challengeOverflow++
+			metricChallengeOverflows.Inc()
+			if !page {
+				addChallengeLoss(a.ProxyServerIDValue, key.tsMin, 1)
+			}
+			return
+		}
 	}
 	// Own every key string before it enters the long-lived (flush-window)
 	// map. The caller hands us slices of request-owned backings — vhost is
@@ -1114,7 +1136,8 @@ func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
 	// every assignment (needkeyupdate), so a clone-on-insert would be
 	// silently undone by the next increment. Unlike the pointer-valued
 	// SNI/fingerprint maps there is no assignment-free increment here;
-	// three small clones per challenge attempt is acceptable.
+	// three small clones per challenge attempt is acceptable. source is
+	// one of the package-level constants, so it needs none.
 	key.vhost = strings.Clone(key.vhost)
 	key.ip = strings.Clone(key.ip)
 	key.outcome = strings.Clone(key.outcome)
@@ -1564,8 +1587,8 @@ func (a *StatsApp) flushLoop() {
 	for {
 		select {
 		case <-t.C:
-			if body, rows, health, ok := a.drainAndEncode(false); ok {
-				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.maxRetries, health: health})
+			if body, rows, health, carry, ok := a.drainAndEncodeCarry(false); ok {
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.maxRetries, health: health, carry: carry})
 			}
 		case <-a.stopCh:
 			a.tickCancel()
@@ -1580,9 +1603,9 @@ func (a *StatsApp) flushLoop() {
 			// bounded by shutdownDeadline; on process exit Stop waits for
 			// it (Fly's kill_timeout, 5 s, may cut it shorter).
 			a.beginShutdownShipping()
-			body, rows, health, ok := a.drainAndEncode(false)
+			body, rows, health, carry, ok := a.drainAndEncodeCarry(false)
 			if ok {
-				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true, health: health})
+				a.enqueueShip(&shipJob{body: body, rows: rows, retries: a.cfg.shutdownMaxRetries, shutdown: true, health: health, carry: carry})
 			}
 			a.shipQ.close()
 			return
@@ -1609,12 +1632,13 @@ func (a *StatsApp) flushOnce(maxRetries int) {
 // flushBatch is the synchronous drain + encode + ship, used by tests and
 // anything that must see the POST complete before returning.
 func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
-	body, rows, health, ok := a.drainAndEncode(httpOnly)
+	body, rows, health, carry, ok := a.drainAndEncodeCarry(httpOnly)
 	if !ok {
 		return
 	}
 	if err := a.shipWithRetryN(context.Background(), body, maxRetries); err != nil {
 		health.drop(domainHealthDropDelivery)
+		carry.fail()
 		a.dropRows(rows, "", err)
 	} else {
 		health.release()
@@ -1626,6 +1650,13 @@ func (a *StatsApp) flushBatch(maxRetries int, httpOnly bool) {
 // failed (the rows are then counted dropped here). A successful caller owns
 // the returned health lease until delivery or drop, including queue eviction.
 func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, health *domainHealthLease, ok bool) {
+	body, rowCount, health, _, ok = a.drainAndEncodeCarry(httpOnly)
+	return body, rowCount, health, ok
+}
+
+// drainAndEncodeCarry is drainAndEncode plus the challenge carry, which the
+// shipping paths hand back to the loss map if the batch does not arrive.
+func (a *StatsApp) drainAndEncodeCarry(httpOnly bool) (body []byte, rowCount int, health *domainHealthLease, carry *challengeCarry, ok bool) {
 	perShardInitialCap := a.cfg.maxBuffer / (8 * shardCount)
 	if perShardInitialCap < 8 {
 		perShardInitialCap = 8
@@ -1670,6 +1701,8 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 		l4BlockSnap = a.l4BlockSnapshot(flushTs)
 	}
 	challengeSnap := a.challengeSnapshot()
+	challengeLossRows := takeChallengeLoss(a.ProxyServerIDValue)
+	carry = newChallengeCarry(a.ProxyServerIDValue, challengeSnap, challengeLossRows)
 	edgeVerifySnap := a.edgeVerifySnapshot()
 	var healthFrame *domainHealthFrame
 	if a.domainHealthRetired.Load() {
@@ -1716,18 +1749,18 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 		len(ipSnap.topkRows) == 0 && len(ipSnap.sampled) == 0 &&
 		len(ipSnap.prefix) == 0 && len(ipSnap.ipSni) == 0 &&
 		len(fpSnap) == 0 && len(fpIpSnap) == 0 && len(corazaSnap) == 0 &&
-		len(challengeSnap) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 && healthRows == 0 {
-		return nil, 0, nil, false
+		len(challengeSnap) == 0 && len(challengeLossRows) == 0 && len(edgeVerifySnap) == 0 && len(reqEventRows) == 0 && len(l4BlockSnap) == 0 && len(nodeStateRows) == 0 && healthRows == 0 {
+		return nil, 0, nil, nil, false
 	}
 
 	rowCount = len(snap) + len(uniqSnap) + len(l4SniSnap) +
 		len(ipSnap.topkRows) + len(ipSnap.sampled) +
 		len(ipSnap.prefix) + len(ipSnap.ipSni) +
 		len(fpSnap) + len(fpIpSnap) + len(corazaSnap) +
-		len(challengeSnap) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + healthRows
+		len(challengeSnap) + len(challengeLossRows) + len(edgeVerifySnap) + len(reqEventRows) + len(l4BlockSnap) + len(nodeStateRows) + healthRows
 	metricBufferSize.Set(float64(rowCount))
 
-	body, err := encodeBatchFn(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: healthFrame}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
+	body, err := encodeBatchFn(batchParts{machineID: a.machineID, nodeStates: nodeStateRows, domainHealth: healthFrame, challengeLoss: challengeLossRows}, a.ProxyServerIDValue, flushTs, snap, uniqSnap, l4SniSnap, ipSnap, fpSnap, fpIpSnap, corazaSnap, challengeSnap, edgeVerifySnap, reqEventRows, l4BlockSnap)
 	if err != nil {
 		if healthFrame != nil {
 			healthFrame.lease.drop(domainHealthDropEncodeError)
@@ -1737,7 +1770,8 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 		if a.logger != nil {
 			a.logger.Warn("apx_stats: encode batch failed", zap.Error(err))
 		}
-		return nil, 0, nil, false
+		carry.fail()
+		return nil, 0, nil, nil, false
 	}
 	if healthFrame != nil {
 		rowCount += healthFrame.encodedRows - healthRows
@@ -1747,9 +1781,9 @@ func (a *StatsApp) drainAndEncode(httpOnly bool) (body []byte, rowCount int, hea
 		}
 	}
 	if rowCount == 0 {
-		return nil, 0, nil, false
+		return nil, 0, nil, nil, false
 	}
-	return body, rowCount, health, true
+	return body, rowCount, health, carry, true
 }
 
 // dropRows counts a batch that will not ship. result, when set, labels the
@@ -1899,6 +1933,8 @@ type batchParts struct {
 	machineID    string
 	nodeStates   []nodeStateMinute
 	domainHealth *domainHealthFrame
+	// challengeLoss rows ship as challenge_loss, stamped with the lost minute.
+	challengeLoss []challengeLossEntry
 }
 
 // encodeBatchFn is a test seam for encode failures.
@@ -1970,9 +2006,13 @@ func encodeBatchWith(parts batchParts, proxyServerID uint32, flushTs uint32, sna
 		}
 	}
 	for k, count := range challengeSnap {
-		// Minute stamped at flush time (the key carries no ts) — same
-		// convention as the L4 IP / fingerprint-flushTs tracks.
-		if err := encodeChallengeAttemptRow(gz, proxyServerID, flushTs, k, count); err != nil {
+		// Minute the outcome was recorded (k.tsMin), not the flush minute.
+		if err := encodeChallengeAttemptRow(gz, proxyServerID, k, count); err != nil {
+			return nil, err
+		}
+	}
+	for _, e := range parts.challengeLoss {
+		if err := encodeChallengeLossRow(gz, e); err != nil {
 			return nil, err
 		}
 	}

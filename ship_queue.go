@@ -39,6 +39,7 @@ type shipJob struct {
 	retries  int
 	shutdown bool // ship under the shutdown deadline and a retired slot
 	health   *domainHealthLease
+	carry    *challengeCarry // challenge minutes and loss rows this batch carries
 }
 
 // shipQueue is a small FIFO with drop-oldest overflow. One consumer
@@ -172,6 +173,7 @@ var processExiting = caddy.Exiting
 func (a *StatsApp) enqueueShip(j *shipJob) {
 	if dropped := a.shipQ.push(j); dropped != nil {
 		dropped.health.drop(domainHealthDropQueue)
+		dropped.carry.fail()
 		atomic.AddUint64(&a.dropped, uint64(dropped.rows))
 		metricDroppedRows.Add(float64(dropped.rows))
 		metricShipQueueDroppedRows.Add(float64(dropped.rows))
@@ -237,6 +239,7 @@ func (a *StatsApp) shipLoop() {
 			if !slot {
 				if !acquireRetiredSlot() {
 					j.health.drop(domainHealthDropDelivery)
+					j.carry.fail()
 					a.dropRows(j.rows, "busy", nil)
 					a.dropQueued("busy")
 					return
@@ -257,9 +260,12 @@ func (a *StatsApp) shipLoop() {
 			a.shipQ.pushFront(j)
 		case j.shutdown:
 			j.health.drop(domainHealthDropDelivery)
+			// A retired instance's failure hands its loss to the replacement.
+			j.carry.fail()
 			a.dropRows(j.rows, shipFailureResult(ctx, err), err)
 		default:
 			j.health.drop(domainHealthDropDelivery)
+			j.carry.fail()
 			a.dropRows(j.rows, "", err)
 		}
 	}
@@ -273,6 +279,7 @@ func (a *StatsApp) dropQueued(result string) {
 			return
 		}
 		j.health.drop(domainHealthDropDelivery)
+		j.carry.fail()
 		a.dropRows(j.rows, result, nil)
 	}
 }

@@ -51,6 +51,7 @@ func TestRecordChallengeAttempt_OwnsRetainedKeyStrings(t *testing.T) {
 }
 
 func TestRecordChallengeAttempt_MergesPerKey(t *testing.T) {
+	pinChallengeMinute(t, 100)
 	a := newTestApp(t, "http://unused", "secret")
 
 	// Same (vhost, ip, outcome) several times → one merged row.
@@ -67,10 +68,10 @@ func TestRecordChallengeAttempt_MergesPerKey(t *testing.T) {
 
 	snap := a.challengeSnapshot()
 	require.Len(t, snap, 4, "distinct (vhost, ip, outcome) tuples are distinct rows")
-	require.Equal(t, uint64(3), snap[challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "issued"}])
-	require.Equal(t, uint64(2), snap[challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "passed"}])
-	require.Equal(t, uint64(1), snap[challengeAttemptKey{vhost: "example.com", ip: "198.51.100.1", outcome: "failed"}])
-	require.Equal(t, uint64(1), snap[challengeAttemptKey{vhost: "other.com", ip: "203.0.113.7", outcome: "passed_recently"}])
+	require.Equal(t, uint64(3), snap[challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "issued", tsMin: 100}])
+	require.Equal(t, uint64(2), snap[challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "passed", tsMin: 100}])
+	require.Equal(t, uint64(1), snap[challengeAttemptKey{vhost: "example.com", ip: "198.51.100.1", outcome: "failed", tsMin: 100}])
+	require.Equal(t, uint64(1), snap[challengeAttemptKey{vhost: "other.com", ip: "203.0.113.7", outcome: "passed_recently", tsMin: 100}])
 }
 
 func TestChallengeSnapshot_EmptyAfterDrain(t *testing.T) {
@@ -93,8 +94,8 @@ func TestChallengeSnapshot_NilMapNoOp(t *testing.T) {
 func TestEncodeChallengeAttemptRow_JSONShape(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
-	k := challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "issued"}
-	err := encodeChallengeAttemptRow(gz, 42, 33_333_333, k, 17)
+	k := challengeAttemptKey{vhost: "example.com", ip: "203.0.113.7", outcome: "issued", tsMin: 33_333_333}
+	err := encodeChallengeAttemptRow(gz, 42, k, 17)
 	require.NoError(t, err)
 	require.NoError(t, gz.Close())
 

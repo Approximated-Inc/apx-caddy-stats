@@ -89,7 +89,16 @@ func (h *StatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}
 	if r.Header.Get("apx-monitor") == "true" {
 		metricRequestsTotal.WithLabelValues("skipped_monitor").Inc()
-		return next.ServeHTTP(w, r)
+		// Counters, events and every other track skip monitor traffic, but
+		// the header is client-controlled: a verify carrying it must still
+		// leave its challenge outcome, or a pass could vanish beside pages
+		// already recorded.
+		if app, ok := h.app.(interface{ finishHTTPRecord() }); ok {
+			defer app.finishHTTPRecord()
+		}
+		err := next.ServeHTTP(w, r)
+		h.recordChallengeAttempt(r)
+		return err
 	}
 
 	// Read here, before anything downstream can rewrite the Host.
@@ -135,20 +144,11 @@ func (h *StatsHandler) record(r *http.Request, w *recorder, dur time.Duration, s
 	modeV2 := h.app.RequestEventsModeV2()
 	defenseExempt := h.defenseExempt(r)
 
-	// Challenge attempts record independently of vhost_id (see the original
-	// comment): a served challenge is terminal so vhost_id is unset. Read
-	// the outcome once — it also drives the request_event disposition below.
-	// Exempt outcomes stay in raw logs but cannot feed Defense evidence.
-	// The stored outcome adds the handler's reason (issued_document,
-	// failed_proof, ...); the disposition keeps the bare outcome.
+	// Challenge attempts record independently of vhost_id (see
+	// recordChallengeAttempt). The outcome is read again here because it also
+	// drives the request_event disposition below, which keeps the bare outcome.
+	h.recordChallengeAttempt(r)
 	outcome := readChallengeOutcome(r)
-	if outcome != "" && !defenseExempt {
-		h.app.RecordChallengeAttempt(challengeAttemptKey{
-			vhost:   challengeVhost(r),
-			ip:      securityClientIP(r),
-			outcome: challengeAttemptOutcome(outcome, readChallengeReason(r)),
-		})
-	}
 
 	// Edge Verify attempts record independently of vhost_id too: the
 	// Edge Verify edge handler sets `apx_verify_outcome` and, like the
@@ -408,6 +408,25 @@ func readVhostID(r *http.Request) (uint32, bool) {
 		return 0, false
 	}
 	return uint32(n), true
+}
+
+// recordChallengeAttempt records the challenge outcome the apx_challenge
+// handler left in the request vars, if any. Challenge attempts record
+// independently of vhost_id: a served challenge is terminal, so vhost_id is
+// unset. Exempt outcomes stay in raw logs but cannot feed Defense evidence.
+// The stored outcome adds the handler's reason (issued_document,
+// failed_proof, ...), and the key carries the source the handler set beside it.
+func (h *StatsHandler) recordChallengeAttempt(r *http.Request) {
+	outcome := readChallengeOutcome(r)
+	if outcome == "" || h.defenseExempt(r) {
+		return
+	}
+	h.app.RecordChallengeAttempt(challengeAttemptKey{
+		vhost:   challengeVhost(r),
+		ip:      securityClientIP(r),
+		outcome: challengeAttemptOutcome(outcome, readChallengeReason(r)),
+		source:  readChallengeSource(r),
+	})
 }
 
 // readChallengeOutcome reads the `apx_challenge_outcome` request var set

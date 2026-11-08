@@ -280,20 +280,21 @@ func TestBuildCorazaEvents_ShortFieldsUntouched(t *testing.T) {
 // --- challenge map count cap ---
 
 func TestRecordChallengeAttempt_CountCap(t *testing.T) {
+	pinChallengeMinute(t, 100)
 	a := &StatsApp{}
 	a.challengeMap = make(map[challengeAttemptKey]uint64)
 	for i := 0; i < challengeMaxKeys; i++ {
-		a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: strconv.Itoa(i), outcome: "issued"})
+		a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: strconv.Itoa(i), outcome: "issued_document", source: "automatic"})
 	}
 	require.Len(t, a.challengeMap, challengeMaxKeys)
 
 	// New key at cap: dropped + counted.
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new-key", outcome: "issued"})
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new-key", outcome: "issued_document", source: "automatic"})
 	require.Len(t, a.challengeMap, challengeMaxKeys, "new keys must not grow the map past the cap")
 	require.Equal(t, uint64(1), a.challengeOverflow)
 
 	// Existing key at cap: still counts.
-	k := challengeAttemptKey{vhost: "v", ip: "0", outcome: "issued"}
+	k := challengeAttemptKey{vhost: "v", ip: "0", outcome: "issued_document", source: "automatic", tsMin: 100}
 	a.RecordChallengeAttempt(k)
 	require.Equal(t, uint64(2), a.challengeMap[k])
 	require.Equal(t, uint64(1), a.challengeOverflow, "existing-key increments are not overflow")
