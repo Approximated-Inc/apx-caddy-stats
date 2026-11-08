@@ -1113,7 +1113,7 @@ func (a *StatsApp) RecordChallengeAttempt(key challengeAttemptKey) {
 	}
 	if _, ok := a.challengeMap[key]; !ok {
 		limit := challengeMaxKeys
-		page := isChallengePageOutcome(key.outcome)
+		page := isChallengePageOutcome(key.outcome, key.source)
 		if !page {
 			limit += challengeReserveKeys
 		}
@@ -1701,7 +1701,7 @@ func (a *StatsApp) drainAndEncodeCarry(httpOnly bool) (body []byte, rowCount int
 		l4BlockSnap = a.l4BlockSnapshot(flushTs)
 	}
 	challengeSnap := a.challengeSnapshot()
-	challengeLossRows := takeChallengeLoss()
+	challengeLossRows := takeChallengeLoss(a.ProxyServerIDValue)
 	carry = newChallengeCarry(a.ProxyServerIDValue, challengeSnap, challengeLossRows)
 	edgeVerifySnap := a.edgeVerifySnapshot()
 	var healthFrame *domainHealthFrame

@@ -35,9 +35,17 @@ const challengeMaxKeys = 50_000
 // reserve marks the minute in challengeLoss.
 const challengeReserveKeys = 5_000
 
-// isChallengePageOutcome reports the outcomes whose loss is harmless.
-func isChallengePageOutcome(outcome string) bool {
-	return strings.HasPrefix(outcome, "issued") || strings.HasPrefix(outcome, "not_shown_")
+// isChallengePageOutcome reports the rows whose silent loss can never let a
+// raise through: a split page outcome (issued_*, not_shown_*) that carries a
+// source. Bare "issued" (the app counts it as unclassified, which blocks a
+// raise) and any row with an empty source (a legacy row, which also blocks
+// one) are not lenient to lose. They use the reserve at the key cap and mark
+// a loss minute when dropped, as do passes, failures and every other outcome.
+func isChallengePageOutcome(outcome, source string) bool {
+	if source == "" {
+		return false
+	}
+	return strings.HasPrefix(outcome, "issued_") || strings.HasPrefix(outcome, "not_shown_")
 }
 
 // challengeVhostMaxBytes bounds the vhost key width: the Host header is

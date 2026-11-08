@@ -68,18 +68,23 @@ func addChallengeLoss(ps, minute uint32, n uint64) {
 	challengeLoss.m[k] += n
 }
 
-// takeChallengeLoss removes and returns every pending loss entry, ordered.
-func takeChallengeLoss() []challengeLossEntry {
+// takeChallengeLoss removes and returns the pending loss entries of one
+// cluster, ordered. A batch carries one cluster's rows only: the app rejects a
+// mixed-cluster batch permanently, so another cluster's entries stay put.
+func takeChallengeLoss(ps uint32) []challengeLossEntry {
 	challengeLoss.mu.Lock()
 	defer challengeLoss.mu.Unlock()
-	if len(challengeLoss.m) == 0 {
+	var out []challengeLossEntry
+	for k, c := range challengeLoss.m {
+		if k.ps != ps {
+			continue
+		}
+		out = append(out, challengeLossEntry{ps: k.ps, minute: k.minute, count: c})
+		delete(challengeLoss.m, k)
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	out := make([]challengeLossEntry, 0, len(challengeLoss.m))
-	for k, c := range challengeLoss.m {
-		out = append(out, challengeLossEntry{ps: k.ps, minute: k.minute, count: c})
-	}
-	challengeLoss.m = make(map[challengeLossKey]uint64)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ps != out[j].ps {
 			return out[i].ps < out[j].ps
@@ -117,7 +122,7 @@ func (c *challengeCarry) fail() {
 func newChallengeCarry(ps uint32, snap map[challengeAttemptKey]uint64, losses []challengeLossEntry) *challengeCarry {
 	var minutes []challengeLossEntry
 	for k, n := range snap {
-		if isChallengePageOutcome(k.outcome) {
+		if isChallengePageOutcome(k.outcome, k.source) {
 			continue
 		}
 		found := false

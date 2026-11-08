@@ -29,8 +29,13 @@ func pinChallengeMinute(t *testing.T, m uint32) {
 // so no test's loss leaks into another test's batches.
 func resetChallengeLoss(t *testing.T) {
 	t.Helper()
-	takeChallengeLoss()
-	t.Cleanup(func() { takeChallengeLoss() })
+	clearLoss := func() {
+		challengeLoss.mu.Lock()
+		challengeLoss.m = make(map[challengeLossKey]uint64)
+		challengeLoss.mu.Unlock()
+	}
+	clearLoss()
+	t.Cleanup(clearLoss)
 }
 
 func lossSnapshot() map[challengeLossKey]uint64 {
@@ -142,7 +147,7 @@ func TestChallengeRowCarriesRequestMinute(t *testing.T) {
 
 func fillChallengeKeys(a *StatsApp, n int, outcome string, offset int) {
 	for i := 0; i < n; i++ {
-		a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: strconv.Itoa(offset + i), outcome: outcome})
+		a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: strconv.Itoa(offset + i), outcome: outcome, source: "automatic"})
 	}
 }
 
@@ -157,12 +162,41 @@ func TestPageKeysCapSilently(t *testing.T) {
 	pinChallengeMinute(t, minute12)
 	a := newBareChallengeApp()
 	fillChallengeKeys(a, challengeMaxKeys, "issued_document", 0)
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new1", outcome: "issued_other"})
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new2", outcome: "not_shown_api"})
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new3", outcome: "issued"})
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new1", outcome: "issued_other", source: "automatic"})
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "new2", outcome: "not_shown_api", source: "staff"})
 	require.Len(t, a.challengeMap, challengeMaxKeys)
-	require.Equal(t, uint64(3), a.challengeOverflow)
-	require.Empty(t, lossSnapshot(), "dropped page keys must not mark loss")
+	require.Equal(t, uint64(2), a.challengeOverflow)
+	require.Empty(t, lossSnapshot(), "dropped sourced page keys must not mark loss")
+}
+
+// fillToReserve fills the page cap and the reserve with sourced rows.
+func fillToReserve(a *StatsApp) {
+	fillChallengeKeys(a, challengeMaxKeys, "issued_document", 0)
+	fillChallengeKeys(a, challengeReserveKeys, "passed", 1_000_000)
+}
+
+func TestCappedBareIssuedMarksLoss(t *testing.T) {
+	resetChallengeLoss(t)
+	pinChallengeMinute(t, minute12)
+	a := newBareChallengeApp()
+	fillChallengeKeys(a, challengeMaxKeys, "issued_document", 0)
+	// Bare issued is not a lenient page: it uses the reserve and is kept...
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "bare", outcome: "issued", source: "automatic"})
+	require.Len(t, a.challengeMap, challengeMaxKeys+1)
+	require.Empty(t, lossSnapshot())
+	// ...and past the reserve its drop marks the minute.
+	fillChallengeKeys(a, challengeReserveKeys-1, "passed", 1_000_000)
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "bare2", outcome: "issued", source: "automatic"})
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12}: 1}, lossSnapshot())
+}
+
+func TestCappedLegacyEmptySourcePageMarksLoss(t *testing.T) {
+	resetChallengeLoss(t)
+	pinChallengeMinute(t, minute12)
+	a := newBareChallengeApp()
+	fillToReserve(a)
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "legacy", outcome: "issued_document", source: ""})
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12}: 1}, lossSnapshot())
 }
 
 func TestPassKeysUseReserve(t *testing.T) {
@@ -192,18 +226,34 @@ func TestDroppedPassPastReserveMarksLoss(t *testing.T) {
 	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12}: 1}, lossSnapshot())
 
 	// An existing key past the reserve still counts and marks nothing.
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "1000000", outcome: "passed"})
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "1000000", outcome: "passed", source: "automatic"})
 	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12}: 1}, lossSnapshot())
 }
 
-func recordAndDrain(t *testing.T, a *StatsApp, minute uint32, ip, outcome string) *shipJob {
+func drainRows(t *testing.T, a *StatsApp, minute uint32, keys ...challengeAttemptKey) *shipJob {
 	t.Helper()
 	pinChallengeMinute(t, minute)
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: ip, outcome: outcome, source: "automatic"})
+	for _, k := range keys {
+		a.RecordChallengeAttempt(k)
+	}
 	body, rows, health, carry, ok := a.drainAndEncodeCarry(false)
 	require.True(t, ok)
 	t.Cleanup(func() { health.release() })
 	return &shipJob{body: body, rows: rows, health: health, carry: carry}
+}
+
+func recordAndDrain(t *testing.T, a *StatsApp, minute uint32, ip, outcome string) *shipJob {
+	t.Helper()
+	return drainRows(t, a, minute, challengeAttemptKey{vhost: "v", ip: ip, outcome: outcome, source: "automatic"})
+}
+
+// dropViaQueue pushes job into a full queue so it is the one evicted.
+func dropViaQueue(t *testing.T, a *StatsApp, job *shipJob) {
+	t.Helper()
+	a.shipQ = newShipQueue()
+	a.enqueueShip(job)
+	a.enqueueShip(&shipJob{rows: 1})
+	a.enqueueShip(&shipJob{rows: 1})
 }
 
 func TestDroppedBatchMarksLossMinutes(t *testing.T) {
@@ -211,14 +261,12 @@ func TestDroppedBatchMarksLossMinutes(t *testing.T) {
 	srv, _ := captureServer(t, 200)
 	defer srv.Close()
 	a := newTestApp(t, srv.URL, "key")
-	first := recordAndDrain(t, a, minute12+1, "1.1.1.1", "passed")
-	// A page row in the same batch must not be counted as a loss.
-	pinChallengeMinute(t, minute12+1)
-	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "9.9.9.9", outcome: "issued_document"})
-	body, rows, health, carry, ok := a.drainAndEncodeCarry(false)
-	require.True(t, ok)
-	defer health.release()
-	second := &shipJob{body: body, rows: rows, health: health, carry: carry}
+	// The dropped batch holds a pass and a sourced page row in one minute.
+	// Only the pass is a loss: the page is lenient to lose.
+	first := drainRows(t, a, minute12+1,
+		challengeAttemptKey{vhost: "v", ip: "1.1.1.1", outcome: "passed", source: "automatic"},
+		challengeAttemptKey{vhost: "v", ip: "9.9.9.9", outcome: "issued_document", source: "automatic"})
+	second := recordAndDrain(t, a, minute12+2, "2.2.2.2", "passed")
 	third := recordAndDrain(t, a, minute12+3, "3.3.3.3", "failed_proof")
 
 	a.shipQ = newShipQueue()
@@ -228,6 +276,38 @@ func TestDroppedBatchMarksLossMinutes(t *testing.T) {
 	a.enqueueShip(third) // drops first
 
 	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 1}: 1}, lossSnapshot())
+}
+
+func TestDroppedBatchWithLegacyPageRowMarksLoss(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	job := drainRows(t, a, minute12+4, challengeAttemptKey{vhost: "v", ip: "4.4.4.4", outcome: "issued_document", source: ""})
+	dropViaQueue(t, a, job)
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 4}: 1}, lossSnapshot())
+}
+
+func TestDroppedBatchWithBareIssuedMarksLoss(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	job := drainRows(t, a, minute12+5, challengeAttemptKey{vhost: "v", ip: "5.5.5.5", outcome: "issued", source: "automatic"})
+	dropViaQueue(t, a, job)
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 5}: 1}, lossSnapshot())
+}
+
+func TestDroppedBatchWithOnlyAutomaticPageMarksNothing(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	job := drainRows(t, a, minute12+6,
+		challengeAttemptKey{vhost: "v", ip: "6.6.6.6", outcome: "issued_document", source: "automatic"},
+		challengeAttemptKey{vhost: "v", ip: "6.6.6.7", outcome: "not_shown_api", source: "staff"})
+	dropViaQueue(t, a, job)
+	require.Empty(t, lossSnapshot())
 }
 
 func runShipLoopOnce(t *testing.T, a *StatsApp, jobs ...*shipJob) {
@@ -262,7 +342,7 @@ func TestFailedDeliveryMarksLossMinutes(t *testing.T) {
 	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 7}: 1}, lossSnapshot())
 
 	// A delivered batch marks nothing.
-	takeChallengeLoss()
+	takeChallengeLoss(42)
 	ok, _ := captureServer(t, 200)
 	defer ok.Close()
 	b := newTestApp(t, ok.URL, "key")
@@ -418,7 +498,7 @@ func TestChallengeLossConcurrent(t *testing.T) {
 			for i := 0; i < 500; i++ {
 				addChallengeLoss(42, minute12+uint32(i%50), 1)
 				if i%100 == 0 {
-					c := &challengeCarry{losses: takeChallengeLoss()}
+					c := &challengeCarry{losses: takeChallengeLoss(42)}
 					c.fail()
 				}
 			}
@@ -430,4 +510,172 @@ func TestChallengeLossConcurrent(t *testing.T) {
 		sum += v
 	}
 	require.Equal(t, uint64(8*500), sum)
+}
+
+// holdRetiredSlots fills the process-wide retired ship slots so the next
+// acquire fails, and frees them when the test ends.
+func holdRetiredSlots(t *testing.T) {
+	t.Helper()
+	held := 0
+	for {
+		select {
+		case retiredShipSlots <- struct{}{}:
+			held++
+			continue
+		default:
+		}
+		break
+	}
+	t.Cleanup(func() {
+		for i := 0; i < held; i++ {
+			<-retiredShipSlots
+		}
+	})
+}
+
+// runShutdownShipLoop runs shipLoop with every job marked as a shutdown-phase
+// job under a real shutdown deadline, as flushLoop's stop branch does.
+func runShutdownShipLoop(t *testing.T, a *StatsApp, jobs ...*shipJob) {
+	t.Helper()
+	a.shipQ = newShipQueue()
+	a.shipDone = make(chan struct{})
+	a.shutdownReady = make(chan struct{})
+	a.tickCtx, a.tickCancel = context.WithCancel(context.Background())
+	a.attemptCtx, a.attemptCancel = context.WithCancel(context.Background())
+	t.Cleanup(a.tickCancel)
+	t.Cleanup(a.attemptCancel)
+	a.beginShutdownShipping()
+	for _, j := range jobs {
+		j.shutdown = true
+		a.enqueueShip(j)
+	}
+	go a.shipLoop()
+	a.shipQ.close()
+	select {
+	case <-a.shipDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shipLoop did not finish")
+	}
+}
+
+// The Stop-time handoff: a stopping instance's final drain fails delivery,
+// and its minutes go back for the replacement.
+func TestShutdownDeliveryFailureHandsLossToReplacement(t *testing.T) {
+	resetChallengeLoss(t)
+	bad, _ := captureServer(t, 401)
+	defer bad.Close()
+	a := newTestApp(t, bad.URL, "key")
+	job := recordAndDrain(t, a, minute12+10, "10.0.0.1", "passed")
+	runShutdownShipLoop(t, a, job)
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 10}: 1}, lossSnapshot())
+}
+
+// The same handoff through a real Stop, which drives flushLoop's stop branch.
+func TestStopFinalDrainFailureHandsLossToReplacement(t *testing.T) {
+	resetChallengeLoss(t)
+	bad, _ := captureServer(t, 401)
+	defer bad.Close()
+	a := newTestApp(t, bad.URL, "key")
+	a.cfg.flushInterval = time.Hour
+	pinChallengeMinute(t, minute12+11)
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "11.0.0.1", outcome: "passed", source: "automatic"})
+	require.NoError(t, a.Start())
+	require.NoError(t, a.Stop())
+	finishShipper(t, a)
+	awaitHTTPRetirementIdle(t, a)
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 11}: 1}, lossSnapshot())
+}
+
+// No retired slot: the shipLoop drops the job it holds and every job queued
+// behind it, and both must hand their minutes back.
+func TestNoRetiredSlotHandsLossBack(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	first := recordAndDrain(t, a, minute12+20, "20.0.0.1", "passed")
+	second := recordAndDrain(t, a, minute12+21, "21.0.0.1", "passed")
+	holdRetiredSlots(t)
+	runShutdownShipLoop(t, a, first, second)
+	require.Equal(t, map[challengeLossKey]uint64{
+		{ps: 42, minute: minute12 + 20}: 1,
+		{ps: 42, minute: minute12 + 21}: 1,
+	}, lossSnapshot())
+}
+
+func TestRetiredDrainWithoutSlotHandsLossBack(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	pinChallengeMinute(t, minute12+30)
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "30.0.0.1", outcome: "passed", source: "automatic"})
+	holdRetiredSlots(t)
+	a.httpDeliveryPending = true
+	a.httpDeliveryDone = make(chan struct{})
+	a.deliverRetiredHTTP()
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 42, minute: minute12 + 30}: 1}, lossSnapshot())
+}
+
+func TestEncodeFailureHandsLossBack(t *testing.T) {
+	resetChallengeLoss(t)
+	srv, _ := captureServer(t, 200)
+	defer srv.Close()
+	a := newTestApp(t, srv.URL, "key")
+	old := encodeBatchFn
+	encodeBatchFn = func(parts batchParts, ps, ts uint32, snap map[Key]*Counter, uniq map[uniqueKey]map[uint64]struct{}, sni map[L4SniKey]*l4SniCounter, ip l4IpSnap, fp map[fingerprintKey]*fingerprintCounter, fpIP map[fingerprintIpKey]*fingerprintCounter, cz []corazaDetection, ch map[challengeAttemptKey]uint64, ev map[edgeVerifyAttemptKey]uint64, re []requestEventRow, bl ...map[l4BlockKey]uint64) ([]byte, error) {
+		return nil, context.Canceled
+	}
+	t.Cleanup(func() { encodeBatchFn = old })
+	addChallengeLoss(42, minute12+39, 2) // a pending loss row the failed encode must not eat
+	pinChallengeMinute(t, minute12+40)
+	a.RecordChallengeAttempt(challengeAttemptKey{vhost: "v", ip: "40.0.0.1", outcome: "passed", source: "automatic"})
+	_, _, _, ok := a.drainAndEncode(false)
+	require.False(t, ok)
+	require.Equal(t, map[challengeLossKey]uint64{
+		{ps: 42, minute: minute12 + 40}: 1,
+		{ps: 42, minute: minute12 + 39}: 2,
+	}, lossSnapshot())
+}
+
+// At the bound a marker only moves later: every minute that was lost still has
+// a marker at or after it, so a read from its window start through now sees it.
+func TestLossMapCompactionMovesMarkersLater(t *testing.T) {
+	resetChallengeLoss(t)
+	var added []uint32
+	for i := 0; i < challengeLossMaxMinutes; i++ {
+		added = append(added, minute12+uint32(i))
+	}
+	added = append(added, minute12+2000, minute12-10, minute12+3000)
+	for _, m := range added {
+		addChallengeLoss(42, m, 1)
+	}
+	snap := lossSnapshot()
+	require.LessOrEqual(t, len(snap), challengeLossMaxMinutes)
+	for _, m := range added {
+		covered := false
+		for k := range snap {
+			if k.minute >= m {
+				covered = true
+				break
+			}
+		}
+		require.Truef(t, covered, "minute %d has no marker at or after it", m-minute12)
+	}
+	require.Contains(t, snap, challengeLossKey{ps: 42, minute: minute12 + 3000})
+}
+
+func TestBatchTakesOnlyItsOwnClusterLoss(t *testing.T) {
+	resetChallengeLoss(t)
+	good, posts := captureServer(t, 200)
+	defer good.Close()
+	addChallengeLoss(42, minute12+50, 1)
+	addChallengeLoss(43, minute12+51, 1)
+	a := newTestApp(t, good.URL, "key")
+	a.flushBatch(0, false)
+	rows := postedTypes(posts(), "challenge_loss")
+	require.Len(t, rows, 1)
+	require.Equal(t, float64(42), rows[0]["proxy_server_id"])
+	require.Equal(t, map[challengeLossKey]uint64{{ps: 43, minute: minute12 + 51}: 1}, lossSnapshot(),
+		"another cluster's loss stays pending")
 }

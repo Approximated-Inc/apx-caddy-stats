@@ -323,8 +323,9 @@ Each aggregated row is one NDJSON line. `source` sits between `outcome` and
   row without the key came from a stats build before this change.
 - The key is (vhost, ip, outcome, source, minute). `ts` is the minute the
   outcome was recorded, not the flush minute.
-- At 50,000 keys, new page outcomes (`issued_*`, `not_shown_*`) are dropped and
-  only counted in a metric. Every other outcome may use 5,000 more keys. A
+- At 50,000 keys, new page outcomes that carry a source (`issued_*`,
+  `not_shown_*`) are dropped and only counted in a metric. Bare `issued` and any
+  row with an empty source are not lenient to lose, so they use the reserve too. Every other outcome may use 5,000 more keys. A
   drop past that, a dropped ship job, or a failed delivery marks the lost
   minute.
 
@@ -335,7 +336,8 @@ Lost minutes ship as one row each:
 ```
 
 The loss map is process-wide, holds at most 1,440 minutes (the oldest merges
-into a later minute at the bound), and a row leaves it only when the batch
+into a later minute at the bound, so a loss minute can move later and a
+historical read whose end is before now can miss it), and a row leaves it only when the batch
 carrying it is delivered. A retired instance whose delivery fails hands its
 minutes to whichever instance flushes next. A process exit with an undelivered
 batch, and a crash's unflushed map, are not covered.
