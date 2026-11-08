@@ -638,31 +638,77 @@ func TestEncodeFailureHandsLossBack(t *testing.T) {
 	}, lossSnapshot())
 }
 
-// At the bound a marker only moves later: every minute that was lost still has
-// a marker at or after it, so a read from its window start through now sees it.
-func TestLossMapCompactionMovesMarkersLater(t *testing.T) {
-	resetChallengeLoss(t)
-	var added []uint32
+func fillLossMinutes(ps uint32) {
 	for i := 0; i < challengeLossMaxMinutes; i++ {
-		added = append(added, minute12+uint32(i))
+		addChallengeLoss(ps, minute12+uint32(i), 1)
 	}
-	added = append(added, minute12+2000, minute12-10, minute12+3000)
-	for _, m := range added {
-		addChallengeLoss(42, m, 1)
-	}
-	snap := lossSnapshot()
-	require.LessOrEqual(t, len(snap), challengeLossMaxMinutes)
-	for _, m := range added {
-		covered := false
-		for k := range snap {
-			if k.minute >= m {
-				covered = true
-				break
-			}
+}
+
+func lossTotal(snap map[challengeLossKey]uint64, ps uint32) (total uint64, n int, lowest uint32) {
+	lowest = ^uint32(0)
+	for k, v := range snap {
+		if k.ps != ps {
+			continue
 		}
-		require.Truef(t, covered, "minute %d has no marker at or after it", m-minute12)
+		total += v
+		n++
+		if k.minute < lowest {
+			lowest = k.minute
+		}
 	}
-	require.Contains(t, snap, challengeLossKey{ps: 42, minute: minute12 + 3000})
+	return
+}
+
+// At the bound a marker only moves later, to an exact place. A newer minute
+// takes the oldest minute's count.
+func TestLossMapCompactionNewerMinuteTakesOldestCount(t *testing.T) {
+	resetChallengeLoss(t)
+	fillLossMinutes(42)
+	addChallengeLoss(42, minute12+2000, 1)
+	snap := lossSnapshot()
+	total, n, lowest := lossTotal(snap, 42)
+	require.Equal(t, uint64(challengeLossMaxMinutes+1), total)
+	require.Equal(t, challengeLossMaxMinutes, n)
+	require.Equal(t, minute12+1, lowest, "the oldest minute is gone, nothing sits earlier than it")
+	require.Equal(t, uint64(2), snap[challengeLossKey{ps: 42, minute: minute12 + 2000}], "its count moved to the later minute")
+}
+
+// An older minute arriving at the bound folds into the oldest held minute,
+// never into an earlier marker of its own.
+func TestLossMapCompactionOlderMinuteFoldsLater(t *testing.T) {
+	resetChallengeLoss(t)
+	fillLossMinutes(42)
+	addChallengeLoss(42, minute12-10, 1)
+	snap := lossSnapshot()
+	total, n, lowest := lossTotal(snap, 42)
+	require.Equal(t, uint64(challengeLossMaxMinutes+1), total)
+	require.Equal(t, challengeLossMaxMinutes, n)
+	require.Equal(t, minute12, lowest, "no marker earlier than the oldest held minute")
+	require.Equal(t, uint64(2), snap[challengeLossKey{ps: 42, minute: minute12}])
+}
+
+// The bound is per cluster, and one cluster's loss never merges into
+// another cluster's minute.
+func TestLossMapBoundIsPerCluster(t *testing.T) {
+	resetChallengeLoss(t)
+	fillLossMinutes(42)
+	addChallengeLoss(43, minute12+5000, 1)
+	snap := lossSnapshot()
+	total42, n42, _ := lossTotal(snap, 42)
+	require.Equal(t, uint64(challengeLossMaxMinutes), total42)
+	require.Equal(t, challengeLossMaxMinutes, n42, "cluster 42 is untouched")
+	require.Equal(t, uint64(1), snap[challengeLossKey{ps: 43, minute: minute12 + 5000}])
+
+	for i := 1; i < challengeLossMaxMinutes+10; i++ {
+		addChallengeLoss(43, minute12+5000+uint32(i), 1)
+	}
+	snap = lossSnapshot()
+	total43, n43, _ := lossTotal(snap, 43)
+	require.Equal(t, challengeLossMaxMinutes, n43)
+	require.Equal(t, uint64(challengeLossMaxMinutes+10), total43)
+	total42, n42, _ = lossTotal(snap, 42)
+	require.Equal(t, uint64(challengeLossMaxMinutes), total42)
+	require.Equal(t, challengeLossMaxMinutes, n42)
 }
 
 func TestBatchTakesOnlyItsOwnClusterLoss(t *testing.T) {

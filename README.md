@@ -335,7 +335,7 @@ Lost minutes ship as one row each:
 {"_type":"challenge_loss","ts":"2026-11-08T12:00:00Z","proxy_server_id":42,"lost_count":1}
 ```
 
-The loss map is process-wide, holds at most 1,440 minutes (the oldest merges
+The loss map is process-wide, holds at most 1,440 minutes per cluster (the oldest merges
 into a later minute at the bound, so a loss minute can move later and a
 historical read whose end is before now can miss it), and a row leaves it only when the batch
 carrying it is delivered. A retired instance whose delivery fails hands its

@@ -37,10 +37,12 @@ var challengeLoss = struct {
 	m  map[challengeLossKey]uint64
 }{m: make(map[challengeLossKey]uint64)}
 
-// addChallengeLoss records n lost rows for (ps, minute). At the bound the
-// oldest minute of the same cluster is merged into a later one, never
-// dropped: a marker only ever moves later, which keeps more windows
-// unattributed, the safe direction.
+// addChallengeLoss records n lost rows for (ps, minute). Each cluster holds
+// at most challengeLossMaxMinutes minutes (one cluster per process in
+// practice). At that bound the oldest minute of the same cluster is merged
+// into a later one, never dropped: a marker only ever moves later, which keeps
+// more windows unattributed, the safe direction. One cluster's loss is never
+// merged into another cluster's minute.
 func addChallengeLoss(ps, minute uint32, n uint64) {
 	if n == 0 {
 		return
@@ -48,15 +50,20 @@ func addChallengeLoss(ps, minute uint32, n uint64) {
 	challengeLoss.mu.Lock()
 	defer challengeLoss.mu.Unlock()
 	k := challengeLossKey{ps, minute}
-	if _, ok := challengeLoss.m[k]; !ok && len(challengeLoss.m) >= challengeLossMaxMinutes {
+	if _, ok := challengeLoss.m[k]; !ok {
 		var oldest challengeLossKey
 		found := false
+		held := 0
 		for ek := range challengeLoss.m {
-			if ek.ps == ps && (!found || ek.minute < oldest.minute) {
+			if ek.ps != ps {
+				continue
+			}
+			held++
+			if !found || ek.minute < oldest.minute {
 				oldest, found = ek, true
 			}
 		}
-		if found {
+		if held >= challengeLossMaxMinutes {
 			if minute <= oldest.minute {
 				challengeLoss.m[oldest] += n
 				return
@@ -121,21 +128,20 @@ func (c *challengeCarry) fail() {
 // entries taken for the same batch. Returns nil when both are empty.
 func newChallengeCarry(ps uint32, snap map[challengeAttemptKey]uint64, losses []challengeLossEntry) *challengeCarry {
 	var minutes []challengeLossEntry
+	var index map[uint32]int // minute -> position in minutes
 	for k, n := range snap {
 		if isChallengePageOutcome(k.outcome, k.source) {
 			continue
 		}
-		found := false
-		for i := range minutes {
-			if minutes[i].minute == k.tsMin {
-				minutes[i].count += n
-				found = true
-				break
-			}
+		if index == nil {
+			index = make(map[uint32]int)
 		}
-		if !found {
-			minutes = append(minutes, challengeLossEntry{ps: ps, minute: k.tsMin, count: n})
+		if i, ok := index[k.tsMin]; ok {
+			minutes[i].count += n
+			continue
 		}
+		index[k.tsMin] = len(minutes)
+		minutes = append(minutes, challengeLossEntry{ps: ps, minute: k.tsMin, count: n})
 	}
 	if len(minutes) == 0 && len(losses) == 0 {
 		return nil
