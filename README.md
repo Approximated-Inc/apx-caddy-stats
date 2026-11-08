@@ -301,6 +301,45 @@ image containing it. To roll out:
 
 The producer change itself does not publish an image or activate recording.
 
+## Challenge attempts
+
+The `apx_challenge` handler sets the `apx_challenge_outcome` request var (and
+`apx_challenge_reason` beside it), and now `apx_challenge_source`: who asked for
+the challenge. The stats handler reads all three, including on requests that
+carry `apx-monitor: true`. That header is client-controlled, so a verify
+carrying it must still leave its outcome. Counters, request events and every
+other track still skip monitor traffic.
+
+Each aggregated row is one NDJSON line. `source` sits between `outcome` and
+`attempt_count`:
+
+```json
+{"_type":"challenge_attempt","ts":"2026-11-08T12:00:00Z","proxy_server_id":42,"vhost":"example.com","ip":"203.0.113.7","outcome":"failed_proof","source":"automatic","attempt_count":3}
+```
+
+- `source` is one of `automatic`, `staff`, `customer`, `edge_sequence`,
+  `reputation`, `unknown`, or `""` when the challenge plugin sets no var. Any
+  other value in the var is written as `unknown`. It is always written, so a
+  row without the key came from a stats build before this change.
+- The key is (vhost, ip, outcome, source, minute). `ts` is the minute the
+  outcome was recorded, not the flush minute.
+- At 50,000 keys, new page outcomes (`issued_*`, `not_shown_*`) are dropped and
+  only counted in a metric. Every other outcome may use 5,000 more keys. A
+  drop past that, a dropped ship job, or a failed delivery marks the lost
+  minute.
+
+Lost minutes ship as one row each:
+
+```json
+{"_type":"challenge_loss","ts":"2026-11-08T12:00:00Z","proxy_server_id":42,"lost_count":1}
+```
+
+The loss map is process-wide, holds at most 1,440 minutes (the oldest merges
+into a later minute at the bound), and a row leaves it only when the batch
+carrying it is delivered. A retired instance whose delivery fails hands its
+minutes to whichever instance flushes next. A process exit with an undelivered
+batch, and a crash's unflushed map, are not covered.
+
 ## Upstream failure reasons in request logs
 
 With request events enabled in `mode_v2`, failed proxy requests can include
